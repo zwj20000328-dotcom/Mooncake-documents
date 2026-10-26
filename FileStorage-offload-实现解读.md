@@ -2204,12 +2204,391 @@ sequenceDiagram
 | 读：`Client::Get` → `ReadDfsReplica` | [client_service.cpp:1382-1405](../Mooncake/mooncake-store/src/client_service.cpp#L1382)、[5046-5075](../Mooncake/mooncake-store/src/client_service.cpp#L5046) |
 | 选副本 | [replica_selection.h:122-175](../Mooncake/mooncake-store/include/replica_selection.h#L122) |
 
-#### 6.7.6 由流程导出的几条结论
+#### 6.7.6 DFS 代码导读
+
+上面两张图给的是"形状"。这一节按 **接口面 → 控制面 → 分配器 → 写路径 → 读路径 → 适配层 → 失败语义** 的顺序往下走，把 6.7.4 里每个节点落到具体函数，并标出图上看不见的分支。
+
+##### 6.7.6.1 对外暴露了什么：四条互不相通的通道
+
+先给结论：**DFS 没有自己的公开 API**。应用只碰得到一个字段，装配只靠环境变量，真正的数据面接口只在 C++ 库内部可见。
+
+| 通道 | 面向谁 | 接口 | 位置 |
+| --- | --- | --- | --- |
+| 应用读写 | Python / C++ 用户 | `ReplicateConfig.dfs_replica_num`（默认 0）随 `put/put_batch` 下发 | [replica.h:111](../Mooncake/mooncake-store/include/replica.h#L111)、[store_py.cpp:2174](../Mooncake/mooncake-integration/store/store_py.cpp#L2174)、[client_service.h:232](../Mooncake/mooncake-store/include/client_service.h#L232) |
+| 数据面装配 | 部署者 | `MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR=distributed_storage_backend` + `MOONCAKE_DFS_*`；master 侧 `MOONCAKE_ENABLE_DFS` | [file_storage_config.cpp:51](../Mooncake/mooncake-store/src/config/file_storage_config.cpp#L51)、[distributed_storage_config.cpp:127](../Mooncake/mooncake-store/src/config/distributed_storage_config.cpp#L127)、[dfs_enablement_config.cpp:8](../Mooncake/mooncake-store/src/config/dfs_enablement_config.cpp#L8) |
+| 库内接口 | C++ 库使用者 | `Client::SetDfsStorageBackend`、`DfsAllocatorInterface`、`DistributedStorageBackend::BatchWrite/BatchRead`、`FileSystemAdapter` | [client_service.h:650](../Mooncake/mooncake-store/include/client_service.h#L650)、[dfs_allocator_interface.h:45](../Mooncake/mooncake-store/include/storage/distributed/dfs_allocator_interface.h#L45)、[distributed_storage_backend.h:74](../Mooncake/mooncake-store/include/storage/distributed/distributed_storage_backend.h#L74)、[fs_adapter.h:34](../Mooncake/mooncake-store/include/storage/distributed/fs_adapter.h#L34) |
+| 运维 | SRE | `GET/PUT /api/v1/dfs/shard_count`；`master_dfs_allocated_bytes` 等 gauge | [master_admin_service.cpp:1430](../Mooncake/mooncake-store/src/master_admin_service.cpp#L1430)、[master_metric_manager.cpp:54](../Mooncake/mooncake-store/src/master_metric_manager.cpp#L54) |
+
+**（1）应用读写通道：只有一个旋钮**
+
+Python 侧 `dfs_replica_num` 通过 `.def_readwrite` 暴露（[store_py.cpp:2174](../Mooncake/mooncake-integration/store/store_py.cpp#L2174)），随 `ReplicateConfig` 原样进入 `PutStart/BatchPutStart`。C++ 侧是 `Client::Put/BatchPut`（[client_service.cpp:1959](../Mooncake/mooncake-store/src/client_service.cpp#L1959)、[3596](../Mooncake/mooncake-store/src/client_service.cpp#L3596)），DFS 逻辑全部藏在这两个函数内部，`RealClient` 只是 Python 封装（[real_client.cpp:2514](../Mooncake/mooncake-store/src/real_client.cpp#L2514)）。
+
+两个硬限制在这一层就生效，不必等到运行期：`dfs_replica_num > 1` 直接 `INVALID_PARAMS`（[master_service.cpp:5456-5461](../Mooncake/mooncake-store/src/master_service.cpp#L5456)），非 default 租户同样拒绝（[5462-5466](../Mooncake/mooncake-store/src/master_service.cpp#L5462)）。也就是说 **一个 key 最多一段 DFS 区间**，所谓"DFS 多副本"在当前实现里不存在。
+
+**（2）装配通道：名字叫 offload，选的是 DFS**
+
+客户端完全不认识 `MOONCAKE_ENABLE_DFS`，它只认 `MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR`。取到 `distributed_storage_backend` 后，`CreateStorageBackend` 按 `MOONCAKE_DFS_FS_ADAPTER` 造 adapter；只要不是 `oss`/`s3`，`FileStorage` 构造函数就把 backend 判为 DFS 并交给 Client：
+
+```cpp
+// file_storage.cpp:86-93
+if (auto distributed_backend =
+        std::dynamic_pointer_cast<DistributedStorageBackend>(storage_backend_)) {
+    config_.enable_dfs = !distributed_backend->UsesObjectStorage();
+    if (config_.enable_dfs && client_)
+        client_->SetDfsStorageBackend(distributed_backend);
+}
+```
+
+随后 `FileStorage::Init` 检测到 `enable_dfs`，只启动 buffer GC 线程就 `return`（[file_storage.cpp:142-146](../Mooncake/mooncake-store/src/file_storage.cpp#L142)），跳过 `MountLocalDiskSegment`、`ScanMeta` 与 offload 心跳——这就是 6.7 开头说的"同一个 backend 类，两种装配方式"。
+
+三个容易踩的配置事实：
+
+- **`--enable_offload` 不是 DFS 开关**。它只服务 `LOCAL_DISK` offload 队列，而 `PutEnd` 的入队条件显式排除仍处于 PROCESSING 的 DFS 副本（[master_service.cpp:5785-5788](../Mooncake/mooncake-store/src/master_service.cpp#L5785)）。
+- **master 没有任何 `--dfs*` flag**，只认 `MOONCAKE_ENABLE_DFS`（旧名 `MOONCAKE_DFS_ENABLED`，[dfs_enablement_config.cpp:8-18](../Mooncake/mooncake-store/src/config/dfs_enablement_config.cpp#L8)）。
+- **DFS 模式下仍需 `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH` 是存在且可写的绝对目录**（[file_storage_config.cpp:146-210](../Mooncake/mooncake-store/src/config/file_storage_config.cpp#L146)），尽管数据实际写在 `MOONCAKE_DFS_ROOT_DIR`。
+
+**（3）库内接口：类图里真正的方法**
+
+- `Client::SetDfsStorageBackend` 是 **public**，但只对 C++ 可见（RealClient/PyClient 上没有对应方法）。它不只是赋值：还会 `EnsureStorageControlPlaneStarted()`，顺手拉起 storage heartbeat 与 task poll 线程（[client_service.cpp:4275-4279](../Mooncake/mooncake-store/src/client_service.cpp#L4275)）。而 `WriteDfsReplicas` / `ReadDfsReplica` 是 **private**（[client_service.h:924](../Mooncake/mooncake-store/include/client_service.h#L924)、[999](../Mooncake/mooncake-store/include/client_service.h#L999)）。
+- `DfsAllocatorInterface` 是 master 唯一依赖的分配抽象：`Allocate / BatchAllocate / Free / UpdateAccess / GetUsedBytes / GetTotalCapacity / GetFileCount / IsEvictionEnabled / GetEvictionCheckInterval`（[dfs_allocator_interface.h:56-78](../Mooncake/mooncake-store/include/storage/distributed/dfs_allocator_interface.h#L56)）。**`BatchAllocate` 在生产路径没有调用者**，只在测试里出现；`PutStart` 是逐 key 调 `Allocate`。
+- `DistributedStorageBackend::BatchWrite/BatchRead` **不是** `StorageBackendInterface` 的 override，而是 DFS 专有的 public 方法（[distributed_storage_backend.h:74-78](../Mooncake/mooncake-store/include/storage/distributed/distributed_storage_backend.h#L74)）。原因是接口里的 `BatchLoad` 是 key 语义，无法定位分片；DFS 必须由调用方携带 descriptor。
+- `FileSystemAdapter` 的方法分五组，见 6.7.6.6。
+
+**（4）运维通道：只有 shard 模式有扩容口**
+
+`GET/PUT /api/v1/dfs/shard_count` 是唯一的 DFS 专属管理 API（[master_admin_service.cpp:1430](../Mooncake/mooncake-store/src/master_admin_service.cpp#L1430)），且只对 `ShardAllocator` 生效；bucket 模式返回 `UNAVAILABLE_IN_CURRENT_MODE`（[master_service.cpp:491-496](../Mooncake/mooncake-store/src/master_service.cpp#L491)）。容量观测走 `GetStorageUsageSnapshot` → Prometheus gauge，注意它**不是 RPC**（`WrappedMasterService` 里有同名包装但没注册到 `RegisterRpcService`）。
+
+**四个"看着像接口、其实不是"的点：**
+
+1. **描述符是 RPC 的返回值，不是 API 的参数**。客户端永远不能自己指定 `file_path/offset`。
+2. **描述符是单向的**。`PutEnd` 只回 `ObjectMeta{key, object_checksum}`（[rpc_types.h:15](../Mooncake/mooncake-store/include/rpc_types.h#L15)），客户端没有任何描述符缓存。
+3. **C ABI 缺字段**。`mooncake_replicate_config` 只有 `replica_num / with_hard_pin / preferred_segments / soft_pin_*`（[store_c.h:39-54](../Mooncake/mooncake-store/include/store_c.h#L39)），C 用户无法请求 DFS。
+4. **能写不等于能读**。读 DFS 需要本进程也挂了 backend；否则 `ReadDfsReplica` 直接返回 `DFS_SERVICE_UNAVAILABLE`（[client_service.cpp:5052-5059](../Mooncake/mooncake-store/src/client_service.cpp#L5052)）。
+
+##### 6.7.6.2 控制面：master 只是"记账"，不碰数据
+
+`MasterService` 对 DFS 的全部职责是：启动时建 allocator、写时分配区间、完成时改副本状态、删除时归还区间、容量高时淘汰。它从不打开 shard 文件，也不校验客户端是否真的写了。
+
+**（1）启动装配：四道门，两种失败方式**
+
+[InitDfsAllocatorFromEnvironment](../Mooncake/mooncake-store/src/master_service.cpp#L498) 依次过四道：
+
+| 顺序 | 条件 | 行为 | 性质 |
+| --- | --- | --- | --- |
+| 1 | `MOONCAKE_ENABLE_DFS` 关闭 | 直接返回 | 正常 |
+| 2 | `enable_oplog_` 为真（HA + oplog） | `throw std::invalid_argument` | **硬失败，进程起不来** |
+| 3 | `single_tenant=false` | `enable_dfs_=false` 后返回 | 静默降级，只有一条 ERROR 日志 |
+| 4 | allocator `Init` 失败 | reset 指针、`enable_dfs_=false` | 静默降级 |
+
+第 2 条是本层最重要的设计约束：**allocator 的 key→区间映射不落盘**，如果 master 从 oplog/snapshot 恢复出"对象 A 在 shard 3 的 offset 4096"，而 allocator 把这段重新分给对象 B，就会直接覆盖仍在被读的数据。所以宁可拒绝启动。HA 切换同理，`RestoreFromStandbyState` 见到 `enable_dfs_` 就返回 `DFS_SERVICE_UNAVAILABLE`（[master_service.cpp:3763-3767](../Mooncake/mooncake-store/src/master_service.cpp#L3763)）。
+
+第 3、4 条只在 master 侧留日志，客户端要到第一次 `PutStart` 才收到 `-1601`。这是排障时最容易误判"配置生效了"的地方。
+
+**（2）写前校验：四连拒**
+
+`PrepareWriteStart`（[master_service.cpp:5442](../Mooncake/mooncake-store/src/master_service.cpp#L5442)）在分配之前拦掉四类请求：
+
+```text
+三种副本数全 0 / key 为空 / slice_length==0   → INVALID_PARAMS
+dfs_replica_num > 1                            → INVALID_PARAMS
+dfs_replica_num > 0 且非 default tenant         → INVALID_PARAMS
+dfs_replica_num > 0 且 allocator 未就绪         → DFS_SERVICE_UNAVAILABLE (-1601)
+```
+
+**（3）分配顺序：DFS 排在最后**
+
+`AllocateReplicas`（[master_service.cpp:5140](../Mooncake/mooncake-store/src/master_service.cpp#L5140)）的顺序是 `MEMORY → NOF_SSD → 可选 DISK → DFS`。DFS 段在 [5300-5317](../Mooncake/mooncake-store/src/master_service.cpp#L5300)：
+
+```cpp
+auto alloc = dfs_allocator_->Allocate(key, value_length);
+if (!alloc) {
+    if (dfs_allocation_failed != nullptr)
+        *dfs_allocation_failed = (alloc.error() == ErrorCode::NO_AVAILABLE_HANDLE);
+    return tl::make_unexpected(alloc.error());
+}
+replicas.emplace_back(std::move(*alloc), ReplicaStatus::PROCESSING);
+```
+
+两个细节：**只有 `NO_AVAILABLE_HANDLE` 会被记成"DFS 容量不足"**（供后面的强制驱逐用），其它错误不触发；**已分配的内存/NoF 副本没有显式回滚代码**，靠局部 vector 析构经 `AllocatedBuffer::~AllocatedBuffer` 归还。
+
+**（4）下发：descriptor 带 `PROCESSING` 出生**
+
+`InsertMetadata` 用 `get_descriptor()` 把每个副本转成 `Descriptor`，`status` 一起拷进去（[replica.h:869-873](../Mooncake/mooncake-store/include/replica.h#L869)、[911-913](../Mooncake/mooncake-store/include/replica.h#L911)）。所以客户端拿到的 DFS 描述符天生是 `PROCESSING`，读者不可见；`GetReadableReplicaDescriptors` 只放 `COMPLETE`（[master_service.cpp:4716-4719](../Mooncake/mooncake-store/src/master_service.cpp#L4716)）。
+
+**（5）PutEnd：bucket 先提交，再置 COMPLETE**
+
+`PutEnd`（[master_service.cpp:5663](../Mooncake/mooncake-store/src/master_service.cpp#L5663)）分三步：
+
+1. **bucket 模式先 `MarkCommitted`**：把仍是 `PROCESSING` 的 DFS 条目从 `PENDING` 提升为 `COMMITTED`；任一失败返回 `FILE_WRITE_FAIL`，且**不回滚**（[5725-5743](../Mooncake/mooncake-store/src/master_service.cpp#L5725)）。shard 模式没有这一步。
+2. `mark_complete()`，并对 DFS 补一次 `UpdateAccess`（[5748-5763](../Mooncake/mooncake-store/src/master_service.cpp#L5748)）。这次调用是必须的——`Allocate` 从不写 LRU，不补这一下新对象永远进不了淘汰候选。
+3. checksum 只在 `object_checksum` 有值或 `replica_type ∈ {ALL, MEMORY, NOF_SSD}` 时写入（[5772-5777](../Mooncake/mooncake-store/src/master_service.cpp#L5772)）。
+
+`ReplicaType::ALL` 的谓词显式列出三类副本（[5682-5689](../Mooncake/mooncake-store/src/master_service.cpp#L5682)），**新增副本类型必须同步改这里和 `PutRevoke` 的同一段**，否则会被 ALL 语义静默漏掉。
+
+**（6）回收：`FreeDfsReplicas` 是唯一出口**
+
+所有删除路径最终都落到 `EraseMetadata` → `FreeDfsReplicas`（[master_service.cpp:8386](../Mooncake/mooncake-store/src/master_service.cpp#L8386)）：`Remove/RemoveAll`、写失败 `PutRevoke`、被 Upsert 抢占、过期 PROCESSING 丢弃、容量驱逐。它对非 DFS 副本是 no-op。
+
+注意"没有 owner"在这里的含义：客户端断开**不会**释放 DFS 副本。`CleanupStaleHandles` 只匹配失效的 MEMORY/NOF handle 和过期 LOCAL_DISK owner（[master_service.cpp:8328-8348](../Mooncake/mooncake-store/src/master_service.cpp#L8328)），DFS 不在其中。真正兜底的是 `DiscardExpiredProcessingReplicas`：`PutStart` 后超时未 `PutEnd` 的副本被 Pop 并 `FreeDfsReplicas`（[master_service.cpp:10309-10426](../Mooncake/mooncake-store/src/master_service.cpp#L10309)）。
+
+**（7）两级"延迟释放"不是一回事**
+
+| 层 | 保存什么 | 目的 | 位置 |
+| --- | --- | --- | --- |
+| master `discarded_replicas_` | `Replica` 对象 | 让旧 buffer/descriptor 晚点析构；**DFS 区间在入列前就已归还** | [master_service.cpp:5638-5642](../Mooncake/mooncake-store/src/master_service.cpp#L5638) |
+| allocator `pending_free` | offset handle | 让刚 Free 的区间晚 `deferred_free_duration`（默认 30s）再复用，保护仍在读的客户端 | [shard_allocator.cpp:588-611](../Mooncake/mooncake-store/src/storage/distributed/shard_allocator.cpp#L588) |
+
+把两者混为一谈，会误以为 `discarded_replicas_` 在保护 DFS 数据——它保护的是内存。
+
+**（8）驱逐：两套节奏，一句话区别**
+
+- shard 模式：allocator 按**每个 shard 自己的**高/低水位挑 LRU 候选并冻结 → master 逐条校验（非 PROCESSING、非 hard pin、租约已过期）→ `ResolvePreparedEviction` 提交或回滚（[master_service.cpp:8589-8725](../Mooncake/mooncake-store/src/master_service.cpp#L8589)）。
+- bucket 模式：以**整桶**为单位，桶内所有 key 都通过校验才 `CommitEvictionLogical`，再删文件（[master_service.cpp:8410-8578](../Mooncake/mooncake-store/src/master_service.cpp#L8410)）。任一 key 被保护就整桶放弃，并把这个桶挪到 LRU 的 MRU 端，避免"坏桶"每轮被反复选中。
+
+分配失败时还有一条**现场**回收路径：`AdmitWithDfsRecovery` 在 `dfs_bucket_recovery_mutex_` 下重跑 admit，仍失败就 `force_one` 强制删一个通过校验的桶（[master_service.cpp:5562-5587](../Mooncake/mooncake-store/src/master_service.cpp#L5562)）。它只对 bucket 模式生效，shard 模式只能等后台水位驱逐。
+
+##### 6.7.6.3 两个 allocator：可复用区间 vs append-only 桶
+
+同一个 `DfsAllocatorInterface`，两种完全不同的空间模型。
+
+**（1）ShardAllocator：固定分片 + 区间复用**
+
+- **布局**：`root_dir` 下若干 `dfs_shard_<两位数字>.data`，每个容量固定 `shard_capacity`（默认 4 GiB），启动时用 `PreallocateFile` 建好（POSIX `ftruncate` 稀疏文件）。已有文件**不截断不删除**，但大小必须精确等于 `shard_capacity`，否则 `INVALID_PARAMS`。
+- **初始化只恢复布局**：`offset_to_handle` 与 LRU 都是空的（[shard_allocator.cpp:91-93](../Mooncake/mooncake-store/src/storage/distributed/shard_allocator.cpp#L91) 注释写明不支持 snapshot/oplog 恢复）。重启后旧数据仍在文件里，但新分配会把它覆盖掉。
+- **选片**：`hash(key) % shard_count` 取首选，失败后线性探测其余 shard（[shard_allocator.cpp:277-298](../Mooncake/mooncake-store/src/storage/distributed/shard_allocator.cpp#L277)）。这样扩容新增的 shard 能真正缓解写满的 shard。对象**不允许跨 shard**，所以单对象上限就是一个 shard。
+- **两个尺寸**：`aligned_size = align_up(object_size, alignment)`；实际向 `OffsetAllocator` 申请的是 `aligned_size + alignment - 1`（[shard_allocator.cpp:269](../Mooncake/mooncake-store/src/storage/distributed/shard_allocator.cpp#L269)）。多要这一段不是笔误——`OffsetAllocator` 只按内部 quantum 对齐，返回值还要再 `AlignSize(handle->address())` 一次才得到最终 offset（[290](../Mooncake/mooncake-store/src/storage/distributed/shard_allocator.cpp#L290)）。
+- **LRU 只由 `UpdateAccess` 写**：`Allocate` 不插 LRU。调用点只有三处——`GetReplicaList`、`BatchGetReplicaList`、`PutEnd`（[master_service.cpp:4802](../Mooncake/mooncake-store/src/master_service.cpp#L4802)、[4975](../Mooncake/mooncake-store/src/master_service.cpp#L4975)、[5761](../Mooncake/mooncake-store/src/master_service.cpp#L5761)）。用 regex 查询或 admin 接口访问过的对象**不会变热**。
+- **`Free` 是延迟的**：立即从 LRU 与 `offset_to_handle` 摘除，但 handle 进 `pending_free`，等 30s 后由下一次 `Allocate`/`PrepareEviction` 在同一 shard 上惰性回收（[shard_allocator.cpp:398-400](../Mooncake/mooncake-store/src/storage/distributed/shard_allocator.cpp#L398)、[588-611](../Mooncake/mooncake-store/src/storage/distributed/shard_allocator.cpp#L588)）。没有后台回收线程。
+- **水位用 `EffectiveUsage`**：把 `pending_free_bytes` 算作空闲，再做容量裁剪（[613-635](../Mooncake/mooncake-store/src/storage/distributed/shard_allocator.cpp#L613)）；高水位置 `eviction_active`，低于低水位才清，形成滞回。`GetUsedBytes` 则相反，把 pending 仍算已用——指标偏高、淘汰判断偏松，是刻意的。
+
+**（2）ImmutableBucketAllocator：只追加，整桶回收**
+
+- **布局极简**：桶文件里**没有文件头、没有 entry 头、没有 checksum、没有 key 哈希**，只有 `[value bytes][zero padding]`，entry 由 `offset/object_size/aligned_size` 三个整数描述（[bucket_entry_layout.h:12-19](../Mooncake/mooncake-store/include/storage/distributed/bucket_entry_layout.h#L12)）。key→entry 索引只在 master 内存里。
+- **分配即追加**：当前 active 桶装得下就沿 `append_offset` 切一段；装不下就把它 `SEALED` 并放进 LRU，再 `next_bucket_id_++` 新建一个（[immutable_bucket_allocator.cpp:140-166](../Mooncake/mooncake-store/src/storage/distributed/immutable_bucket_allocator.cpp#L140)）。**id 单调递增、永不复用**，这是"旧 descriptor 不会读到新数据"的物理前提。
+- **两阶段提交**：分配出的 entry 是 `PENDING`，`PutEnd` 调 `MarkCommitted` 才转 `COMMITTED`（[342-354](../Mooncake/mooncake-store/src/storage/distributed/immutable_bucket_allocator.cpp#L342)）。`pending_entries != 0` 的桶完全不允许被淘汰。
+- **`Free` 只打墓碑**：状态置 `TOMBSTONE`、摘掉 `key_index_`，但 `append_offset` 永不回退，字节仍计入 `GetUsedBytes`（[356-363](../Mooncake/mooncake-store/src/storage/distributed/immutable_bucket_allocator.cpp#L356)）。同 key 反复覆盖会持续消耗同一个桶——这是预期行为，不是泄漏。
+- **`shard_idx` 就是 bucket id**：`MakeBucketDescriptor` 把 `bucket_id` 截成 `int` 写进 `shard_idx`（[bucket_entry_layout.h:57-62](../Mooncake/mooncake-store/include/storage/distributed/bucket_entry_layout.h#L57)），上限 `INT32_MAX`，超限返回 `INTERNAL_ERROR`。接口注释明确这是"保持 wire-compatible"的字段复用（[dfs_allocator_interface.h:39-44](../Mooncake/mooncake-store/include/storage/distributed/dfs_allocator_interface.h#L39)）。任何按"shard 序号"理解这个字段的新代码都会在 bucket 模式下读错。
+- **重启不友好**：`Init` 看到 root 里已有任何 `bucket_*.data/.meta` 就直接拒绝（[101-109](../Mooncake/mooncake-store/src/storage/distributed/immutable_bucket_allocator.cpp#L101)），因为元数据不落盘、无法判断这些文件属于谁。master 侧随后静默降级 `enable_dfs_=false`。
+
+**（3）对照**
+
+| 维度 | ShardAllocator | ImmutableBucketAllocator |
+| --- | --- | --- |
+| 分配单位 | 对齐后的区间（可复用） | 桶内 append 的一段 |
+| 回收单位 | 单个区间（延迟 30s） | 整个桶 |
+| 覆盖写 | 允许（新分配覆盖旧区间） | 不允许原地写，master 走 Case C 重新分配（[master_service.cpp:6370-6374](../Mooncake/mooncake-store/src/master_service.cpp#L6370)） |
+| 元数据 | 内存，重启只恢复容量布局 | 内存，重启直接拒绝 |
+| 满容量 | 所有 shard 探测失败 → `NO_AVAILABLE_HANDLE` | 桶数达 `max_bucket_count` → `NO_AVAILABLE_HANDLE` |
+| 淘汰 | per-shard 水位 + LRU 两阶段 | 整桶 LRU + 全 key 校验 |
+| 扩容 | `ExpandShards` 在线可扩 | 无（受 `max_bucket_count` 约束） |
+| 单对象上限 | `shard_capacity` | `bucket_capacity` |
+
+##### 6.7.6.4 写路径：DFS 排在内存之后，且是同步的
+
+**（1）`Client::Put` 的真实顺序**
+
+```text
+PutStart(ALL) ──► ① DISK 副本（异步投递 write_thread_pool_，自己 PutEnd(DISK)）
+                ② MEMORY / NOF_SSD 副本（TransferWrite，同步等待）
+                ③ DFS 副本（仅当 ② 全部成功）──► BatchWrite
+                ④ PutEnd(ALL) 或 PutRevoke(ALL)
+```
+
+对应 [client_service.cpp:2020-2099](../Mooncake/mooncake-store/src/client_service.cpp#L2020)。三个容易画错的点：
+
+- **DISK 排在最前，而且是异步的**。`PutToLocalFile` 只同步做拷贝，`StoreObject` 被丢进 `write_thread_pool_`，由异步任务自己 `PutEnd(DISK)`（[4647-4692](../Mooncake/mooncake-store/src/client_service.cpp#L4647)）。所以"DISK 已写完"与"Put 返回"不是同一时刻。
+- **DFS 的门禁是"非 DFS 副本全成功"**：条件是 `allocated_dfs_replicas > 0 && NonDfsTransfersSucceeded(...)`（[2048-2049](../Mooncake/mooncake-store/src/client_service.cpp#L2048)）。而 `NonDfsTransfersSucceeded` 只统计 memory 与 NoF（[308-315](../Mooncake/mooncake-store/src/client_service.cpp#L308)），**不含 DISK/LOCAL_DISK**——本地盘写失败不会阻止 DFS 写。
+- **被跳过时不是静默的**：代码专门记 `dfs_writes_skipped`（[2069-2084](../Mooncake/mooncake-store/src/client_service.cpp#L2069)），否则这次"消失的写"在指标上完全不可见。
+
+**（2）`WriteDfsReplicas`：三个等长向量，一次 BatchWrite**
+
+签名是 `(keys, vector<const vector<Slice>*>, descriptors)`（[2884](../Mooncake/mooncake-store/src/client_service.cpp#L2884)）。它做三件事：
+
+1. **设备指针 D2H**：`FindDeviceForPointer` 命中就向 pinned pool 借暂存 buffer，`Copy(kDeviceToHost)`，再把 slice 换成 host 地址（[2941-2965](../Mooncake/mooncake-store/src/client_service.cpp#L2941)）。暂存 buffer 活到 `BatchWrite` 返回。
+2. **拼请求**：`DfsWriteRequest{key, descriptor, host_slices}`（[2978-2980](../Mooncake/mooncake-store/src/client_service.cpp#L2978)）。
+3. **一次调用**：`dfs_storage_backend_->BatchWrite(requests)`（[2988](../Mooncake/mooncake-store/src/client_service.cpp#L2988)），返回条数不符则整批记 `INTERNAL_ERROR`。
+
+注意 **`aligned_size` 的尾部 padding 客户端不写**。backend 强制 `sum(slices) == object_size`（[distributed_storage_backend.cpp:698-704](../Mooncake/mooncake-store/src/storage/distributed/distributed_storage_backend.cpp#L698)），尾部零来自预分配留下的稀疏零页。`aligned_size` 只用于分配与 Free 粒度。
+
+**（3）backend `BatchWrite`：三次短路 + 两个正交开关**
+
+[distributed_storage_backend.cpp:634](../Mooncake/mooncake-store/src/storage/distributed/distributed_storage_backend.cpp#L634) 的结构非常规整：
+
+```text
+UsesObjectStorage()  → 整批 NOT_SUPPORTED
+!initialized_        → 整批 DFS_SERVICE_UNAVAILABLE
+逐请求：descriptor 几何校验 → slice 归一化 → 构造 DfsIoOp
+batch_io ? 收集后批量执行 : 立即 ExecuteSingleIo
+```
+
+两个开关**互不影响**：
+
+| 开关 | 取值来源 | 决定什么 |
+| --- | --- | --- |
+| `bucket_mode` | 本地 `allocator_type == "bucket"`（[324-326](../Mooncake/mooncake-store/src/storage/distributed/distributed_storage_backend.cpp#L324)） | 用哪套容量校验、短 I/O 是否续传、开桶还是开 shard |
+| `batch_io` | `fs_adapter_->SupportsBatchIo()`（[657](../Mooncake/mooncake-store/src/storage/distributed/distributed_storage_backend.cpp#L657)） | 逐条执行还是收集后一次提交、是否持 shard 锁 |
+
+**（4）执行器分派**
+
+| | `batch_io=false`（POSIX） | `batch_io=true`（3FS） |
+| --- | --- | --- |
+| shard | `ExecuteSingleIo`：持 `shard.mutex`，单次 `WriteAt`，硬失败可 reopen 重试一次 | `ExecuteShardBatchIo`：复用缓存 fd，**不持锁**，短写判失败 |
+| bucket | `ExecuteSingleIo`：每请求 open → 传 → close，短写用 `TransferAll` 续传 | `ExecuteBucketBatchIo`：按 `(file_path, shard_idx)` 分组，每批最多 64 个 fd，提交后关闭 |
+
+短 I/O 的两种语义是这一层最容易忽略的差异：**shard 布局视为损坏（直接失败），bucket 布局视为可续传**（`complete_short_io`）。
+
+**（5）没有 fsync**
+
+整条 DFS 写路径只到 `BatchWriteAt`/`pwritev`（[600-601](../Mooncake/mooncake-store/src/storage/distributed/distributed_storage_backend.cpp#L600)），没有 `fsync/fdatasync`。所以 `Put` 返回表示"数据已交给内核/文件系统"，不是"已持久化"。对比本地文件 offload 路径是有 `datasync()` 的。
+
+**（6）BatchPut：DFS 写被推迟到整批末尾**
+
+`BatchPut` 的顺序是 `StartBatchPut` → `StageWriteBuffersForRemoteReplicas` → `SubmitTransfers/WaitForTransfers`（所有 key 的 memory/NoF）→ **`SubmitDfsWrites`**（[3625](../Mooncake/mooncake-store/src/client_service.cpp#L3625)）→ `FinalizeBatchPut`。`SubmitDfsWrites` 收集所有合格 key，只调一次 `WriteDfsReplicas`（[3035-3092](../Mooncake/mooncake-store/src/client_service.cpp#L3035)）。所以批量场景下 DFS 写不是"每个 key 之后立刻做"，而是整批一次。
+
+**（7）失败 = 整条 Put 失败**
+
+`dfs_replica_num > 0` 会把写模式强制成 `RELIABLE_MULTI_REPLICA`（[replica.h:226-237](../Mooncake/mooncake-store/include/replica.h#L226)）。`DetermineFinalizeDecision` 要求"分配数 == 请求数且全部传输成功"才发 `PutEnd(ALL)`，否则 `PutRevoke(ALL)`（[client_service.cpp:365-388](../Mooncake/mooncake-store/src/client_service.cpp#L365)）。DFS 不能像 `FLEXIBLE_DUAL_REPLICA` 那样"另一侧成功就算成功"。
+
+还有两个不对称：
+
+- **`PutEnd` 自身失败时不会再 revoke**（[2092-2100](../Mooncake/mooncake-store/src/client_service.cpp#L2092)），副本留在 PROCESSING，只能等 master 的 `put_start_discard_timeout`。
+- **客户端从不 Free**。它只发 `PutRevoke`，区间由 master 的 `FreeDfsReplicas` 归还。
+
+##### 6.7.6.5 读路径：选副本发生在 RealClient，不在 Client
+
+**（1）两层选副本，别混**
+
+```text
+RealClient::get_*  → Query/BatchQuery → SelectBestReplica() → FilterQueryResult() → Client::Get/BatchGet
+Client::Get/BatchGet → FindFirstCompleteReplica() → is_dfs? ReadDfsReplica : TransferRead
+```
+
+- `SelectBestReplica` 定义在 [replica_selection.h:122](../Mooncake/mooncake-store/include/replica_selection.h#L122)，由 **RealClient** 调用；优先级是 `local MEMORY > local NOF > remote MEMORY > remote NOF > LOCAL_DISK > DFS > DISK`，全程跳过非 `COMPLETE`。
+- `Client::Get/BatchGet` 内部用的是 `FindFirstCompleteReplica`（[client_service.cpp:5459](../Mooncake/mooncake-store/src/client_service.cpp#L5459)），取"列表里第一个 COMPLETE"。所以 RealClient 必须先调 `FilterQueryResult` 把 `QueryResult` 裁成只含选中那一个副本（[real_client.cpp:493-500](../Mooncake/mooncake-store/src/real_client.cpp#L493)），否则下层可能改选到 DFS。
+- 直接调 `Client` 层 API 而不经过 RealClient，就会退化成"master 返回顺序里的第一个 COMPLETE"。
+
+**（2）单 key 与批量的分叉**
+
+- **单 key**：`Client::Get` → `ReadDfsReplica`（[5046](../Mooncake/mooncake-store/src/client_service.cpp#L5046)）。它只校验副本类型与 backend，把 `slices` 原样塞进一个单元素 `DfsReadRequest`，同步调 `BatchRead`。**不切 buffer，也不校验 checksum**。
+- **批量**：`BatchGet` 不调用 `ReadDfsReplica`。它把 DFS key 攒进 `dfs_read_requests`（[1746-1760](../Mooncake/mooncake-store/src/client_service.cpp#L1746)），循环结束后一次性 `BatchRead`（[1795-1798](../Mooncake/mooncake-store/src/client_service.cpp#L1795)），并与已提交的 RDMA transfer future 重叠执行。
+
+**（3）backend `BatchRead`：读契约比写宽松**
+
+读只要求 `slice` 总容量 **≥** `object_size`，多余部分按 `min()` 截断（[766-797](../Mooncake/mooncake-store/src/storage/distributed/distributed_storage_backend.cpp#L766)）；不足才 `INVALID_PARAMS`。读路径**没有暂存 buffer**，`slice.ptr` 直接组成 iovec 交给 `preadv`/USRBIO，是真正的零额外拷贝。
+
+**（4）checksum：默认是空操作**
+
+`VerifyObjectChecksum` 在 `ReadDfsReplica` 之外，由 `Client::Get`（[1425-1435](../Mooncake/mooncake-store/src/client_service.cpp#L1425)）与 `BatchGet`（[1837-1847](../Mooncake/mooncake-store/src/client_service.cpp#L1837)）调用。但 `ClientObjectChecksumConfig::enabled` **默认 false**（[client_object_checksum_config.h:6](../Mooncake/mooncake-store/src/config/client_object_checksum_config.h#L6)），函数首行就返回。时序图把 `VerifyObjectChecksum` 画成必经步骤时，要注明 `MOONCAKE_STORE_CHECKSUM=true`。
+
+另外 checksum 是**对象级**的（`ObjectMeta` / `ObjectPart`），既不在 `DistributedFSDescriptor` 里，也不在 `Replica` 上。
+
+**（5）range read 的真实拒绝点**
+
+`Client::Get(..., src_offset)` 直接要求 memory 副本，否则 `INVALID_REPLICA`（[client_service.cpp:1470-1474](../Mooncake/mooncake-store/src/client_service.cpp#L1470)）。`TransferSubmitter::submitRangeRead` 只有 memory / nof / disk 三个分支：`1928-1929` 拒绝 NoF、`1930-1933` 拒绝 DISK/LOCAL_DISK，**DFS 根本没有分支**，会静默落到 `nullopt` 再由上层变成 `TRANSFER_FAIL`（[transfer_task.cpp:1907-1941](../Mooncake/mooncake-store/src/transfer_task.cpp#L1907)）。
+
+RealClient 层的"DFS 部分读"是有的，但实现是**整对象读进临时 buffer 再 scatter**（[real_client.cpp:4813-4833](../Mooncake/mooncake-store/src/real_client.cpp#L4813)），不省 I/O。
+
+**（6）失败没有降级**
+
+描述符里没有 owner、没有 endpoint，也没有 liveness。所以 DFS 读失败：
+
+- 没有 `LOCAL_DISK` 那样的 verify → evict → retry 修复链；
+- 没有"换下一个副本"的循环——`FilterQueryResult` 已经把列表裁成一个；
+- 错误直接透传（`FILE_NOT_FOUND` / `FILE_READ_FAIL` / `DFS_SERVICE_UNAVAILABLE`）。
+
+master 侧的回收只由容量/LRU 驱动，与客户端读失败没有因果关系。
+
+##### 6.7.6.6 适配层：两个能力开关决定四种执行形状
+
+`FileSystemAdapter` 的方法分五组，读代码时先认清哪组是"必须实现"、哪组是"可选钩子"：
+
+| 组 | 方法 | 默认行为 |
+| --- | --- | --- |
+| 文件管理（纯虚） | `DeleteFile / FileExists / ListFiles / Init / Shutdown / GetName` | 必须实现 |
+| 便利默认实现 | `GetFileSize / DeleteFiles / ListFilesWithInfo` | 可直接用 |
+| fd 钩子 | `OpenFile / OpenExistingFile / CloseFile / PreallocateFile / WriteAt / ReadAt` | 全部 `NOT_SUPPORTED` |
+| 能力查询 | `SupportsFdReopen / SupportsBatchIo` | 均 `false` |
+| 批量钩子 | `BatchWriteAt / BatchReadAt` | 逐条调 `WriteAt/ReadAt` |
+
+**（1）PosixFsAdapter：plain fd 缓存器**
+
+`OpenFile` 用 `O_RDWR|O_CREAT|O_CLOEXEC`，`OpenExistingFile` 用 `O_RDWR|O_CLOEXEC` 且对 EINTR 重试；读写是 `pwritev/preadv` + EINTR 重试，并**返回真实短传输字节数**。没有 `O_DIRECT`，也不检查对齐。它只声明 `SupportsFdReopen()=true`（[posix_fs_adapter.h:37](../Mooncake/mooncake-store/include/storage/distributed/posix_fs_adapter.h#L37)），于是 backend 在硬失败时可以关掉旧 fd、重新校验打开、原地重试一次。
+
+**（2）Hf3fsAdapter：USRBIO + bounce buffer，且没有真正并行**
+
+- `OpenFile` 是"普通 `open()`（FUSE 命名空间）+ `hf3fs_reg_fd` 注册"；注册失败会 `close`，不泄漏。
+- `WriteAt/ReadAt` 先把用户 iovec **memcpy 进线程私有的注册 iov**，再按 `iov_size` 分块 `prep → submit → wait(1)` 同步完成（[hf3fs_adapter.cpp:186-220](../Mooncake/mooncake-store/src/storage/distributed/hf3fs_adapter.cpp#L186)）。未传满直接返回 `FILE_*_FAIL`，**不返回短计数**。
+- 它只声明 `SupportsBatchIo()=true`（[hf3fs_adapter.h:43](../Mooncake/mooncake-store/include/storage/distributed/hf3fs_adapter.h#L43)），**没有重写 `BatchWriteAt/BatchReadAt`**。所以"批量"带来的收益是：一次适配器调用、不持 shard 锁、bucket fd 数量受限——**不是**单批内部并行。`Hf3fsConfig` 里的 `io_depth` 在当前调用模式下基本不生效。
+- `Init` 永远返回成功（挂载点反推失败就退回原路径），配置错误要等第一次 I/O 才暴露。
+
+**（3）两个标志的正交性**
+
+| `SupportsBatchIo` | `SupportsFdReopen` | 谁 | 后果 |
+| --- | --- | --- | --- |
+| false | true | POSIX | 逐条执行 + 持 shard 锁；失败可 close/reopen 重试一次 |
+| true | false | 3FS | 收集后批量提交 + 不持 shard 锁；失败不重试 |
+| true | true | 目前没有 | **危险组合**：批量路径下无锁，reopen 会 close 掉别人正在用的 fd |
+| false | false | 新适配器默认 | 逐条执行，无自愈 |
+
+这条不变量的依据在 `distributed_storage_backend.h` 的注释里（[144-151](../Mooncake/mooncake-store/include/storage/distributed/distributed_storage_backend.h#L144)）：批量路径依赖"fd 只在 open 时改变，batch adapter 永不 reopen"。
+
+**（4）新增一个适配器的最小工作集**
+
+实现 6 个纯虚 + 至少 `OpenFile/OpenExistingFile/CloseFile/PreallocateFile/WriteAt/ReadAt`，按需覆盖两个能力标志；再改四处：config 白名单（[distributed_storage_config.cpp:43-48](../Mooncake/mooncake-store/src/config/distributed_storage_config.cpp#L43)）、三个工厂点（[storage_backend.cpp:5622](../Mooncake/mooncake-store/src/storage_backend.cpp#L5622)、[shard_allocator.cpp:69](../Mooncake/mooncake-store/src/storage/distributed/shard_allocator.cpp#L69)、[immutable_bucket_allocator.cpp:82](../Mooncake/mooncake-store/src/storage/distributed/immutable_bucket_allocator.cpp#L82)）。注意第三个工厂有 `else` 兜底，第二个**没有**——漏改会得到空指针解引用。
+
+##### 6.7.6.7 一串失败会走到哪
+
+| 阶段 | 错误 | 处理者 | 最终状态 |
+| --- | --- | --- | --- |
+| 配置/装配 | adapter 未编译、未知 `MOONCAKE_DFS_FS_ADAPTER` | `CreateStorageBackend` → `FileStorage` 抛 `runtime_error` | `setup()` 抛异常 |
+| master 启动 | DFS + oplog/snapshot | `InitDfsAllocatorFromEnvironment` `throw` | 进程起不来 |
+| master 启动 | 多租户 / allocator `Init` 失败 | 静默 `enable_dfs_=false` | DFS 写返回 `-1601` |
+| `PutStart` | 容量不足 `NO_AVAILABLE_HANDLE` | `AdmitWithDfsRecovery`（仅 bucket 强制驱逐一次） | 仍失败则 `PutStart` 失败 |
+| 客户端写 | 内存/NoF 传输失败 | 跳过 DFS 写，记 `dfs_writes_skipped` | `PutRevoke(ALL)` |
+| 客户端写 | `BatchWrite` 部分失败 | `DetermineFinalizeDecision` | 整个 `Put` 失败 + `PutRevoke(ALL)` |
+| `PutEnd` | bucket `MarkCommitted` 失败 | 返回 `FILE_WRITE_FAIL`，**不回滚** | 副本停在 PROCESSING，等 TTL 丢弃 |
+| `PutEnd` | RPC 本身失败 | 客户端直接返回，**不再 revoke** | 同上 |
+| 客户端消失 | 无 owner 可清理 | `DiscardExpiredProcessingReplicas` | 超时后 `FreeDfsReplicas` |
+| 读 | 未挂载 / 文件被删 / 短读 | 客户端直接返回错误 | 无重试、无换副本 |
+| 驱逐 | 物理删桶失败 | 记 `failed_deletions_`，桶停在 EVICTING | 容量继续占用，下轮 `RetryFailedEvictions` |
+
+一句话：**DFS 的失败处理是"各段自扫门前雪"**，没有跨阶段的补偿事务。能自愈的只有 POSIX 的 reopen 一次和 bucket 的续传/删桶重试。
+
+##### 6.7.6.8 与 6.7.4 / 6.7.5 两图不符的地方
+
+读代码后需要修正的几处，按重要性排：
+
+1. **`SelectBestReplica` 不在 `Client` 里**。时序图把它画成"读取方 Client"的一步；实际它定义在 [replica_selection.h:122](../Mooncake/mooncake-store/include/replica_selection.h#L122)，由 **RealClient** 调用（[real_client.cpp:3767](../Mooncake/mooncake-store/src/real_client.cpp#L3767)）。`Client::Get/BatchGet` 内部用的是 `FindFirstCompleteReplica`。类图上应把它移到 RealClient 层，或标注为"RealClient 选完、裁剪后再下传"。
+2. **`ReadDfsReplica` 只服务单 key**（唯一调用点 [client_service.cpp:1403](../Mooncake/mooncake-store/src/client_service.cpp#L1403)）。`BatchGet` 不走它，而是攒批后直接 `BatchRead`。时序图的"读"分支要画成两条。
+3. **`BatchAllocate` 在生产路径没有调用者**。`PutStart` 每 key 调一次 `Allocate`，即使 `BatchPutStart` 也是逐 key 转 `PutStart`（[rpc_service.cpp:561-568](../Mooncake/mooncake-store/src/rpc_service.cpp#L561)）。时序图若画成"批量分配"要改。
+4. **`DistributedStorageBackend::BatchWrite/BatchRead` 不是接口 override**，而是 DFS 专有的 public 方法；`StorageBackendInterface::BatchLoad` 是 key 语义，无法定位分片。
+5. **`Put` 时序漏了 DISK**。真实顺序是 `DISK（异步）→ MEMORY/NOF → DFS → PutEnd`，且 DISK 早于内存写、完成于异步线程。
+6. **`VerifyObjectChecksum` 默认为空操作**，需要 `MOONCAKE_STORE_CHECKSUM=true` 才是必经步骤。
+7. **`transfer_task.cpp:1929` 拒绝的是 NoF，不是 DFS**。DFS 在 `submitRangeRead` 里没有分支，静默落 `nullopt`；显式拒绝在 [client_service.cpp:1470-1474](../Mooncake/mooncake-store/src/client_service.cpp#L1470)。
+8. **类图把两个方法的可见性画反了**：`WriteDfsReplicas` 与 `ReadDfsReplica` 都在 `private:` 区（[client_service.h:874](../Mooncake/mooncake-store/include/client_service.h#L874) 起），只有 `SetDfsStorageBackend` 是 public（[650](../Mooncake/mooncake-store/include/client_service.h#L650)）。外部能注入 backend，但不能直接调这两个方法。
+
+（第 7 条同时修正 6.7.7 结论第 4 条的引用。）
+
+##### 6.7.6.9 部署前必查：客户端与 master 的配置一致性
+
+DFS 的 descriptor 里**没有布局模式字段**，客户端完全用本地环境变量判断 bucket/shard、用本地容量做校验。所以下面几项必须逐项一致，否则表现是"合法 descriptor 在本地被判 `INVALID_PARAMS`"，错误信息不会提示"配置不一致"：
+
+| 项 | 用在哪 | 不一致的后果 |
+| --- | --- | --- |
+| `MOONCAKE_DFS_ROOT_DIR` | `GetOrOpenShard` 要求 descriptor 的父目录等于本地 root | 全部 I/O `INVALID_PARAMS`（词法路径不同也算） |
+| `MOONCAKE_DFS_ALLOCATOR` | 决定 `UsesBucketAllocator()` | 用错文件名规则/容量校验 |
+| `MOONCAKE_DFS_ALIGNMENT` | descriptor 对齐校验 | 合法 descriptor 被判未对齐 |
+| `MOONCAKE_DFS_SHARD_CAPACITY` / `BUCKET_CAPACITY` | 要求文件大小**精确等于**容量 | 全部 I/O `INVALID_PARAMS` |
+| `MOONCAKE_DFS_FS_ADAPTER` | 选 adapter | 打不开文件或走错实现 |
+
+另外两条部署事实：环境变量解析非法值时只打 warning 用默认值（[environ.h:79-97](../Mooncake/mooncake-common/src/environ.h#L79)），所以"写错了也能启动"；未挂载共享文件系统时，`Init` 的 `create_directories` 可能先在本地盘建出同名目录，把故障推迟到首次读。
+
+#### 6.7.7 由流程导出的几条结论
 
 1. **`LOCAL_DISK` 是"归属语义"，`DFS` 是"位置语义"**。前者说"这条副本由某个 Client 代读"，后者说"数据在共享文件的这一段，谁都能读"。
 2. **DFS 省掉了两跳**：owner 进程和 TE 搬运。代价是所有参与者必须挂载同一共享文件系统，且 master 的 allocator 状态不可恢复（与 snapshot/oplog 互斥）。
 3. **两者的 `Put` 语义不同**：NVMe KV 的 `Put` 只保证内存写完，落盘是后台事；DFS 的 `Put` 等到 `WriteAt` 返回才成功，但也不是 `fsync` 级持久化。
-4. **都只支持整对象**：range read 对 disk/DFS 副本直接拒绝（[transfer_task.cpp:1929-1931](../Mooncake/mooncake-store/src/transfer_task.cpp#L1929)、[client_service.cpp:1466-1470](../Mooncake/mooncake-store/src/client_service.cpp#L1466)）。
+4. **都只支持整对象**：range read 只允许 memory 副本（[client_service.cpp:1470-1474](../Mooncake/mooncake-store/src/client_service.cpp#L1470)），`submitRangeRead` 只处理 memory / NoF / disk 三类（[transfer_task.cpp:1926-1933](../Mooncake/mooncake-store/src/transfer_task.cpp#L1926)），DFS 没有分支、静默落空。RealClient 层的"DFS 部分读"实际是整对象读回后再 scatter（[real_client.cpp:4813-4833](../Mooncake/mooncake-store/src/real_client.cpp#L4813)）。
 5. **失败处理不对称**：NVMe KV 有 `verify_disk_replica` + 条件删除的悬空副本修复（4.6）；DFS 没有 owner，读失败直接返回错误，由 master 侧 allocator 负责回收。
 
 ### 6.8 后端实现 → 副本类型对照
