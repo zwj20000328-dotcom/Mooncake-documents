@@ -1942,6 +1942,278 @@ eviction_handler(pending.keys) → CommitPreparedEviction → FinalizeEviction; 
 
 ---
 
+### 6.7 NVMe KV 与 DFS 的对照
+
+两者都"扩容量但不加 `MEMORY` 副本"，但控制面和数据面完全不同：
+
+- **NVMe KV** 是 `StorageBackendInterface` 的一个实现，挂在 `FileStorage` 的 offload 链路上。Master 登记的是 `LOCAL_DISK` 副本（owner = 落盘的 RealClient）；读要靠 owner 代读，数据再多走一跳 TE。
+- **DFS** 是独立的副本类型。Master 只分配一段共享文件里的区间并下发 `DistributedFSDescriptor`；任何挂载了同一共享文件系统的 Client 都能直接做 positional I/O。没有 owner、没有 offload 心跳、没有 TE 搬运。
+
+两者共用 `StorageBackendInterface` 工厂，所以 `DistributedStorageBackend` 由 `FileStorage` 构造（[file_storage.cpp:86-93](../Mooncake/mooncake-store/src/file_storage.cpp#L86)），但构造完立刻交给 `Client::SetDfsStorageBackend`（[client_service.cpp:4275-4278](../Mooncake/mooncake-store/src/client_service.cpp#L4275)）；`FileStorage::Init` 检测到 `enable_dfs` 后**只起 GC 线程就返回**（[file_storage.cpp:142-146](../Mooncake/mooncake-store/src/file_storage.cpp#L142)），不挂 `LOCAL_DISK` segment、不跑 offload 心跳。这是理解两条路径的关键：**同一个 backend 类，两种装配方式**。
+
+#### 6.7.1 差异速查
+
+| 维度 | NVMe KV（`LOCAL_DISK`） | DFS（`DFS`） |
+| --- | --- | --- |
+| 副本类型 | `LOCAL_DISK` | `DFS` |
+| Master 元数据 | owner client id + key→owner 索引 + 已用字节 | `DistributedFSDescriptor{file_path, offset, object_size, aligned_size, shard_idx}` |
+| 空间分配者 | owner 的后端自己（物理 key 槽、root/chunk 记录） | Master 的 `DfsAllocatorInterface`（`ShardAllocator` / `ImmutableBucketAllocator`） |
+| 谁能读 | 只有 owner 进程；它读设备后把数据推给读者 | 任何挂载同一共享文件系统的 Client |
+| 数据面 | reader → offload RPC → owner 读盘进 `ClientBuffer` → TE READ | reader → `pread`/USRBIO 直接写进调用方 slices |
+| `Put` 完成时机 | 异步：`Put` 返回时还没落盘，等心跳 | 同步：`WriteAt` 返回后才 `PutEnd` |
+| 介质 | 节点本地 NVMe KV namespace（`/dev/...`，io_uring 或 ioctl） | 共享 DFS（3FS / CephFS / JuiceFS…） |
+| 故障单位 | owner 进程 + 心跳租约；悬空副本靠 verify RPC 修复 | 共享文件系统 + master 侧 allocator 状态，无 owner |
+| 重启恢复 | `ScanMeta` + `NotifyOffloadSuccess`（NVMe KV 的 `ScanMeta` 目前为空实现，不自动恢复） | 无 allocator 恢复；与 snapshot/oplog 互斥（[master_service.cpp:503-508](../Mooncake/mooncake-store/src/master_service.cpp#L503)） |
+| 容量淘汰 | 后端水位淘汰（NVMe KV 未实现该钩子，由设备/上层负责） | master 侧水位 + deferred free |
+| 多租户 | 支持 | 不支持；`single_tenant=false` 时 master 直接关闭 DFS（[master_service.cpp:512-517](../Mooncake/mooncake-store/src/master_service.cpp#L512)） |
+| 读优先级 | 高于 DFS | 高于 legacy `DISK`，低于 `LOCAL_DISK`（[replica_selection.h:122-175](../Mooncake/mooncake-store/include/replica_selection.h#L122)） |
+
+#### 6.7.2 NVMe KV 类图
+
+```mermaid
+classDiagram
+    direction LR
+    class Client {
+        +Put()
+        +PutToLocalFile()
+        +OffloadObjectHeartbeat()
+        +NotifyOffloadSuccess()
+    }
+    class FileStorage {
+        -storage_backend_ StorageBackendInterface
+        -client_buffer_allocator_
+        -heartbeat_thread_
+        +Init()
+        +Heartbeat()
+        +OffloadObjects()
+        +BatchGet()
+        +BatchGetLocal()
+    }
+    class StorageBackendInterface {
+        <<interface>>
+        +Init()
+        +BatchOffload()
+        +BatchLoad()
+        +ScanMeta()
+        +EvictAboveDiskWatermark()
+    }
+    class NvmeKvStorageBackend {
+        -connector_ NvmeKvConnector
+        -manifest_cache_
+        +BatchOffload()
+        +BatchLoad()
+    }
+    class NvmeKvConnector {
+        -executor_ NvmeKvCommandExecutor
+        +Store()
+        +StoreBatch()
+        +Retrieve()
+        +RetrieveIntoBatch()
+        +Delete()
+    }
+    class NvmeKvCommandExecutor {
+        <<interface>>
+        +Store()
+        +Retrieve()
+        +Delete()
+    }
+    class NvmeKvIoUringExecutor
+    class NvmeKvIoctlExecutor
+    class NvmeKvStubExecutor
+
+    Client --> FileStorage
+    FileStorage --> StorageBackendInterface
+    StorageBackendInterface <|-- NvmeKvStorageBackend
+    NvmeKvStorageBackend --> NvmeKvConnector
+    NvmeKvConnector --> NvmeKvCommandExecutor
+    NvmeKvCommandExecutor <|-- NvmeKvIoUringExecutor
+    NvmeKvCommandExecutor <|-- NvmeKvIoctlExecutor
+    NvmeKvCommandExecutor <|-- NvmeKvStubExecutor
+```
+
+图中节点 → 代码：
+
+| 节点 | 代码 |
+| --- | --- |
+| `NvmeKvStorageBackend` | [backend.h:21](../Mooncake/mooncake-store/include/nvme_kv/backend.h#L21)；`BatchOffload` [backend.cpp:479](../Mooncake/mooncake-store/src/nvme_kv/backend.cpp#L479)；`BatchLoad` [backend.cpp:1167](../Mooncake/mooncake-store/src/nvme_kv/backend.cpp#L1167) |
+| `NvmeKvConnector` | [connector.h:16](../Mooncake/mooncake-store/include/nvme_kv/connector.h#L16)；`Init` 选 executor [connector.cpp:26](../Mooncake/mooncake-store/src/nvme_kv/connector.cpp#L26)、[47](../Mooncake/mooncake-store/src/nvme_kv/connector.cpp#L47) |
+| `NvmeKvCommandExecutor` | [executor.h:19](../Mooncake/mooncake-store/include/nvme_kv/executor.h#L19) |
+| io_uring / ioctl / stub 实现 | [executor_io_uring.cpp:377](../Mooncake/mooncake-store/src/nvme_kv/executor_io_uring.cpp#L377)、[executor_ioctl.cpp:22](../Mooncake/mooncake-store/src/nvme_kv/executor_ioctl.cpp#L22)、[executor_stub.cpp:14](../Mooncake/mooncake-store/src/nvme_kv/executor_stub.cpp#L14) |
+| `StorageBackendInterface` | [storage_backend.h:262](../Mooncake/mooncake-store/include/storage_backend.h#L262) |
+| `FileStorage` | [file_storage.h:12](../Mooncake/mooncake-store/include/file_storage.h#L12) |
+
+#### 6.7.3 NVMe KV 全链路时序
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant App as 应用
+    participant W as 写入方 RealClient
+    participant M as Master
+    participant FS as FileStorage (owner)
+    participant BE as NvmeKvStorageBackend
+    participant Dev as NVMe KV namespace
+    participant R as 请求方 RealClient
+
+    App->>W: put(key, value)
+    W->>M: PutStart
+    M-->>W: 只有 MEMORY / NoF 副本
+    W->>M: PutEnd
+    M->>M: PushOffloadingQueue + inc_refcnt(源副本)
+    W-->>App: Put 返回（此时尚未落盘）
+    Note over M: 源副本被 refcnt 钉住，等待下一个心跳
+
+    FS->>M: OffloadObjectHeartbeat(enable_offloading=true)
+    M-->>FS: OffloadTaskItem[{tenant, key, size}]
+    FS->>FS: BatchQuerySegmentSlices（本机内存地址，零拷贝）
+    FS->>BE: BatchOffload(host slices)
+    BE->>Dev: Store / StoreBatch（16 字节物理 key + chunk/root）
+    FS->>M: NotifyOffloadSuccess(tasks, metadatas)
+    M->>M: dec_refcnt(源副本) + AddReplica(LOCAL_DISK, COMPLETE)
+
+    R->>M: BatchGetReplicaList(keys)
+    M-->>R: LOCAL_DISK{endpoint, object_size} + 读租约
+    R->>FS: batch_get_offload_object(keys, sizes) [offload RPC]
+    FS->>BE: BatchLoad
+    BE->>Dev: Retrieve / RetrieveIntoBatch
+    Dev-->>FS: 数据写入 ClientBuffer
+    FS-->>R: {batch_id, pointers[], owner_TE_addr, gc_ttl_ms}
+    R->>FS: TE READ（从 owner ClientBuffer 拉数据）
+    R->>FS: release_offload_buffer(batch_id)
+```
+
+图中节点 → 代码：
+
+| 阶段 | 代码 |
+| --- | --- |
+| `PutStart/PutEnd` 触发入队 + `inc_refcnt` | [master_service.cpp:5785-5811](../Mooncake/mooncake-store/src/master_service.cpp#L5785) |
+| 心跳取任务 | [file_storage.cpp:702-716](../Mooncake/mooncake-store/src/file_storage.cpp#L702) → [master_service.cpp:8887-8929](../Mooncake/mooncake-store/src/master_service.cpp#L8887) |
+| `BatchQuerySegmentSlices` 取本机内存 | [file_storage.cpp:1047-1073](../Mooncake/mooncake-store/src/file_storage.cpp#L1047) |
+| `BatchOffload` → NVMe KV 写 | [file_storage.cpp:501-505](../Mooncake/mooncake-store/src/file_storage.cpp#L501) → [backend.cpp:479](../Mooncake/mooncake-store/src/nvme_kv/backend.cpp#L479) |
+| `NotifyOffloadSuccess` 登记 | [master_service.cpp:8973-9159](../Mooncake/mooncake-store/src/master_service.cpp#L8973) |
+| 查询 + 选副本 | [client_service.cpp:1240](../Mooncake/mooncake-store/src/client_service.cpp#L1240)、[replica_selection.h:122](../Mooncake/mooncake-store/include/replica_selection.h#L122) |
+| offload RPC 读 | [real_client.cpp:8694-8722](../Mooncake/mooncake-store/src/real_client.cpp#L8694) → [file_storage.cpp:267-300](../Mooncake/mooncake-store/src/file_storage.cpp#L267) |
+| TE 拉取 / 释放 | [transfer_task.cpp:1614-1694](../Mooncake/mooncake-store/src/transfer_task.cpp#L1614)、[real_client.cpp:586-636](../Mooncake/mooncake-store/src/real_client.cpp#L586) |
+
+#### 6.7.4 DFS 类图
+
+```mermaid
+classDiagram
+    direction LR
+    class MasterService {
+        -dfs_allocator_ DfsAllocatorInterface
+        +PutStart()
+        +ExpandDfsShards()
+        +GetStorageUsageSnapshot()
+    }
+    class DfsAllocatorInterface {
+        <<interface>>
+        +Allocate()
+        +BatchAllocate()
+        +Free()
+        +UpdateAccess()
+    }
+    class ShardAllocator
+    class ImmutableBucketAllocator
+    class Client {
+        -dfs_storage_backend_ DistributedStorageBackend
+        -WriteDfsReplicas()
+        +ReadDfsReplica()
+        +SetDfsStorageBackend()
+    }
+    class DistributedStorageBackend {
+        -fs_adapter_ FileSystemAdapter
+        +BatchWrite()
+        +BatchRead()
+    }
+    class FileSystemAdapter {
+        <<interface>>
+        +OpenExistingFile()
+        +WriteAt()
+        +ReadAt()
+        +BatchWriteAt()
+        +BatchReadAt()
+    }
+    class PosixFsAdapter
+    class Hf3fsAdapter
+
+    MasterService --> DfsAllocatorInterface
+    DfsAllocatorInterface <|-- ShardAllocator
+    DfsAllocatorInterface <|-- ImmutableBucketAllocator
+    Client --> DistributedStorageBackend
+    DistributedStorageBackend --> FileSystemAdapter
+    FileSystemAdapter <|-- PosixFsAdapter
+    FileSystemAdapter <|-- Hf3fsAdapter
+    Client ..> MasterService : PutStart / Query
+```
+
+图中节点 → 代码：
+
+| 节点 | 代码 |
+| --- | --- |
+| `MasterService` + `dfs_allocator_` | 初始化 [master_service.cpp:498-545](../Mooncake/mooncake-store/src/master_service.cpp#L498)；分配 [5293](../Mooncake/mooncake-store/src/master_service.cpp#L5293)（另见 5300-5315 的 `dfs_replica_num` 分支） |
+| `DfsAllocatorInterface` | [dfs_allocator_interface.h:45](../Mooncake/mooncake-store/include/storage/distributed/dfs_allocator_interface.h#L45) |
+| `ShardAllocator` / `ImmutableBucketAllocator` | [shard_allocator.h:27](../Mooncake/mooncake-store/include/storage/distributed/shard_allocator.h#L27)、[immutable_bucket_allocator.h:46](../Mooncake/mooncake-store/include/storage/distributed/immutable_bucket_allocator.h#L46) |
+| `DistributedStorageBackend` | [distributed_storage_backend.h:44](../Mooncake/mooncake-store/include/storage/distributed/distributed_storage_backend.h#L44) |
+| `FileSystemAdapter` 及实现 | [fs_adapter.h:34](../Mooncake/mooncake-store/include/storage/distributed/fs_adapter.h#L34)、[posix_fs_adapter.h:7](../Mooncake/mooncake-store/include/storage/distributed/posix_fs_adapter.h#L7)、[hf3fs_adapter.h:13](../Mooncake/mooncake-store/include/storage/distributed/hf3fs_adapter.h#L13) |
+| `Client` 侧 | `SetDfsStorageBackend` [client_service.cpp:4275](../Mooncake/mooncake-store/src/client_service.cpp#L4275)；`WriteDfsReplicas` [2884](../Mooncake/mooncake-store/src/client_service.cpp#L2884)；`ReadDfsReplica` [5046](../Mooncake/mooncake-store/src/client_service.cpp#L5046) |
+
+#### 6.7.5 DFS 全链路时序
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant App as 应用
+    participant C as 写入方 Client
+    participant M as Master
+    participant A as DFS allocator
+    participant BE as DistributedStorageBackend
+    participant FS as 共享文件系统
+    participant R as 读取方 Client
+
+    App->>C: put(key, value)
+    C->>M: PutStart(dfs_replica_num=1)
+    M->>A: Allocate(key, size)
+    A-->>M: DistributedFSDescriptor{path, offset, size, shard_idx}
+    M-->>C: replicas + DFS(PROCESSING)
+    C->>C: 先写 MEMORY / NoF
+    C->>BE: WriteDfsReplicas → BatchWrite(descriptor, slices)
+    BE->>FS: GetOrOpenShard + BatchWriteAt
+    C->>M: PutEnd(ALL)
+    M->>M: DFS 副本 → COMPLETE
+    C-->>App: 返回（WriteAt 已完成，但不是 fsync）
+
+    App->>R: get(key)
+    R->>M: Query / BatchQuery
+    M-->>R: replicas（含 DFS descriptor）
+    R->>R: SelectBestReplica
+    R->>BE: ReadDfsReplica → BatchRead(descriptor, slices)
+    BE->>FS: BatchReadAt 直接写入调用方 slices
+    R->>R: VerifyObjectChecksum
+    R-->>App: bytes
+```
+
+图中节点 → 代码：
+
+| 阶段 | 代码 |
+| --- | --- |
+| `PutStart` 分配 DFS 区间 | [master_service.cpp:5300-5315](../Mooncake/mooncake-store/src/master_service.cpp#L5300)（`DfsAllocatorInterface::Allocate`） |
+| 客户端写 DFS | [client_service.cpp:2048-2068](../Mooncake/mooncake-store/src/client_service.cpp#L2048) → `WriteDfsReplicas` [2884](../Mooncake/mooncake-store/src/client_service.cpp#L2884) → `BatchWrite` [2988](../Mooncake/mooncake-store/src/client_service.cpp#L2988) |
+| backend 内部分发 | [distributed_storage_backend.cpp:600](../Mooncake/mooncake-store/src/storage/distributed/distributed_storage_backend.cpp#L600)（`BatchWriteAt` / `BatchReadAt`）、[634](../Mooncake/mooncake-store/src/storage/distributed/distributed_storage_backend.cpp#L634)、[722](../Mooncake/mooncake-store/src/storage/distributed/distributed_storage_backend.cpp#L722) |
+| `PutEnd(ALL)` 含 DFS | [master_service.cpp:5683-5688](../Mooncake/mooncake-store/src/master_service.cpp#L5683) |
+| 读：`Client::Get` → `ReadDfsReplica` | [client_service.cpp:1382-1405](../Mooncake/mooncake-store/src/client_service.cpp#L1382)、[5046-5075](../Mooncake/mooncake-store/src/client_service.cpp#L5046) |
+| 选副本 | [replica_selection.h:122-175](../Mooncake/mooncake-store/include/replica_selection.h#L122) |
+
+#### 6.7.6 由流程导出的几条结论
+
+1. **`LOCAL_DISK` 是"归属语义"，`DFS` 是"位置语义"**。前者说"这条副本由某个 Client 代读"，后者说"数据在共享文件的这一段，谁都能读"。
+2. **DFS 省掉了两跳**：owner 进程和 TE 搬运。代价是所有参与者必须挂载同一共享文件系统，且 master 的 allocator 状态不可恢复（与 snapshot/oplog 互斥）。
+3. **两者的 `Put` 语义不同**：NVMe KV 的 `Put` 只保证内存写完，落盘是后台事；DFS 的 `Put` 等到 `WriteAt` 返回才成功，但也不是 `fsync` 级持久化。
+4. **都只支持整对象**：range read 对 disk/DFS 副本直接拒绝（[transfer_task.cpp:1929-1931](../Mooncake/mooncake-store/src/transfer_task.cpp#L1929)、[client_service.cpp:1466-1470](../Mooncake/mooncake-store/src/client_service.cpp#L1466)）。
+5. **失败处理不对称**：NVMe KV 有 `verify_disk_replica` + 条件删除的悬空副本修复（4.6）；DFS 没有 owner，读失败直接返回错误，由 master 侧 allocator 负责回收。
+
+---
+
 ## 7. 按调用链速查
 
 这一节是**索引**：按"从上到下"的顺序把关键函数列一遍，便于对照源码跳转；每个环节的详细代码与解释见第 2–5 节。7.12 是错误语义速查表。
@@ -2139,10 +2411,15 @@ start client_buffer_gc_thread_
 1. 进程内组件位置（1.1）
 2. 启动装配（2.1）
 3. offload 触发点（3.1）
-4. 心跳循环（3.2）
-5. `OffloadObjects` 流程（3.3）
-6. 读路径副本选择（4.1）
-7. 跨进程读时序（4.2）
-8. 同进程 GPU 读（4.3）
-9. 悬空副本修复（4.6）
-10. 两阶段淘汰时序（5.1）
+4. 完整时序：默认模式（3.1.8）
+5. 心跳循环（3.2）
+6. `OffloadObjects` 流程（3.3）
+7. 读路径副本选择（4.1）
+8. 跨进程读时序（4.2）
+9. 同进程 GPU 读（4.3）
+10. 悬空副本修复（4.6）
+11. 两阶段淘汰时序（5.1）
+12. NVMe KV 类图（6.7.2）
+13. NVMe KV 全链路时序（6.7.3）
+14. DFS 类图（6.7.4）
+15. DFS 全链路时序（6.7.5）
