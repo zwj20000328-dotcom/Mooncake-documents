@@ -2212,6 +2212,38 @@ sequenceDiagram
 4. **都只支持整对象**：range read 对 disk/DFS 副本直接拒绝（[transfer_task.cpp:1929-1931](../Mooncake/mooncake-store/src/transfer_task.cpp#L1929)、[client_service.cpp:1466-1470](../Mooncake/mooncake-store/src/client_service.cpp#L1466)）。
 5. **失败处理不对称**：NVMe KV 有 `verify_disk_replica` + 条件删除的悬空副本修复（4.6）；DFS 没有 owner，读失败直接返回错误，由 master 侧 allocator 负责回收。
 
+### 6.8 后端实现 → 副本类型对照
+
+工厂 `CreateStorageBackend`（[storage_backend.cpp:5579-5661](../Mooncake/mooncake-store/src/storage_backend.cpp#L5579)）根据 `MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR` 选实现；**同一个 `DistributedStorageBackend` 类会因 adapter 不同而产出两种副本类型**。判据是 `UsesObjectStorage()`（`fs_adapter_type` 为 `oss`/`s3`）：
+
+```cpp
+// file_storage.cpp:86-93
+if (auto distributed_backend =
+        std::dynamic_pointer_cast<DistributedStorageBackend>(storage_backend_)) {
+    config_.enable_dfs = !distributed_backend->UsesObjectStorage();   // 文件系统模式 → DFS
+    if (config_.enable_dfs && client_)
+        client_->SetDfsStorageBackend(distributed_backend);           // 交给 Client 直接读写
+}
+```
+
+| # | descriptor 取值 | 实现类 | 副本类型 | 写入方 / 时机 | 读取方 | Master 描述符 | 备注 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 | `bucket_storage_backend`（默认） | `BucketStorageBackend` | `LOCAL_DISK` | owner 心跳 `BatchOffload`，异步 | owner offload RPC 代读 | `LocalDiskDescriptor{client_id, object_size, transport_endpoint}`（[replica.h:294](../Mooncake/mooncake-store/include/replica.h#L294)） | 一个 `storage_path` 只允许一个活 Client（flock） |
+| 2 | `file_per_key_storage_backend` | `StorageBackendAdaptor` | `LOCAL_DISK` | 同上 | 同上 | 同上 | 一 key 一文件，读时整文件读入内存再拷贝 |
+| 3 | `offset_allocator_storage_backend` | `OffsetAllocatorStorageBackend` | `LOCAL_DISK` | 同上 | 同上 | 同上 | 单文件 + 区间分配；重启截断，旧对象不可恢复 |
+| 4 | `nvme_kv_storage_backend` | `NvmeKvStorageBackend` | `LOCAL_DISK` | 同上（设备侧 `Store`/`StoreBatch`） | 同上 | 同上 | 物理 key 16 字节；`ScanMeta` 当前为空实现，重启不自动恢复 |
+| 5 | `distributed_storage_backend` + `MOONCAKE_DFS_FS_ADAPTER=oss`/`s3` | `DistributedStorageBackend`（`kObjectStorage`） | `LOCAL_DISK` | 同上（adapter HTTP PUT） | 同上（owner 读回暂存区） | 同上 | 底层是对象存储，但**仍登记为 LOCAL_DISK** |
+| 6 | `distributed_storage_backend` + `MOONCAKE_DFS_FS_ADAPTER=posix`/`hf3fs` | `DistributedStorageBackend`（`kFileSystem`） | **`DFS`** | 请求端 `Client::WriteDfsReplicas`，`Put` 内**同步**（[client_service.cpp:2884](../Mooncake/mooncake-store/src/client_service.cpp#L2884)） | 任意挂载同一共享文件系统的 Client（`ReadDfsReplica`，[client_service.cpp:5046](../Mooncake/mooncake-store/src/client_service.cpp#L5046)） | `DistributedFSDescriptor{file_path, offset, object_size, aligned_size, shard_idx}`（[replica.h:264](../Mooncake/mooncake-store/include/replica.h#L264)） | 不挂 `LOCAL_DISK` segment、不跑 offload 心跳；空闲区间由 master 的 `DfsAllocatorInterface` 分配 |
+| 7 | （非 backend）master `--root_fs_dir` | 无（master 生成路径，client 用 `StorageBackend` 写） | `DISK` | 任意 client `PutToLocalFile`，异步（[client_service.cpp:4599](../Mooncake/mooncake-store/src/client_service.cpp#L4599)） | 任意 client 本地读（依赖共享挂载） | `DiskDescriptor{file_path, object_size}`（[replica.h:288](../Mooncake/mooncake-store/include/replica.h#L288)） | legacy 路径，与 `--enable_offload` 互斥 |
+
+几点需要单独说明：
+
+- **第 5 行容易被误解**：`distributed_storage_backend` 这个名字同时覆盖对象存储和共享文件系统两种模式，但只有文件系统模式会走 `SetDfsStorageBackend`。对象存储模式仍然由 `FileStorage` 心跳驱动、仍然登记 `LOCAL_DISK`，读仍依赖 owner 进程（见 6.6）。
+- **一个 `FileStorage` 实例只能选一个 backend**：对象存储不与本地文件 / NVMe KV 在同一实例内并存，也不构成"SSD → OSS"的层级缓存。
+- **第 6 行的 `PutEnd` 语义**：`PutStart` 时 master 就返回 `PROCESSING` 的 DFS 描述符；客户端写完共享文件后才 `PutEnd(ALL)`，而 `ALL` 包含 DFS（[master_service.cpp:5683-5688](../Mooncake/mooncake-store/src/master_service.cpp#L5683)），副本此时才变 `COMPLETE`。
+- **第 7 行不是 `StorageBackendInterface` 实现**：它由 master 启动参数 `--root_fs_dir` 打开（[master_service.cpp:462-472](../Mooncake/mooncake-store/src/master_service.cpp#L462)），路径在 `PutStart` 时生成（[master_service.cpp:5293-5297](../Mooncake/mooncake-store/src/master_service.cpp#L5293)）。列在这里是为了和 `LOCAL_DISK` 区分：`LOCAL_DISK` 是 owner 代读，`DISK` 是谁都能直接读共享文件。
+- `MEMORY` 和 `NOF_SSD` **不来自这些后端**：它们由 segment 分配器（DRAM / NVMe-oF segment）产生，与本表无关。
+
 ---
 
 ## 7. 按调用链速查
