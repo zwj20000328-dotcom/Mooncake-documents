@@ -2057,45 +2057,488 @@ sequenceDiagram
 
     App->>W: put(key, value)
     W->>M: PutStart
-    M-->>W: 只有 MEMORY / NoF 副本
-    W->>M: PutEnd
-    M->>M: PushOffloadingQueue + inc_refcnt(源副本)
-    W-->>App: Put 返回（此时尚未落盘）
-    Note over M: 源副本被 refcnt 钉住，等待下一个心跳
+    M-->>W: 只有 MEMORY / NoF_SSD，状态 PROCESSING（LOCAL_DISK 永不出现，见 6.7.4.7）
+    W->>M: PutEnd(ALL)（此前已用 TE 把数据写进 MEMORY / NoF buffer）
+    M->>M: 对每个 completed MEMORY 副本 PushOffloadingQueue；首个成功的源副本 inc_refcnt
+    W-->>App: Put 返回（内存已写；NVMe KV 尚未落盘）
+    Note over M: 只有那一个源副本被 refcnt 钉住，直到 NotifyOffloadSuccess / NACK / TTL reaper 之一
 
-    FS->>M: OffloadObjectHeartbeat(enable_offloading=true)
-    M-->>FS: OffloadTaskItem[{tenant, key, size}]
-    FS->>FS: BatchQuerySegmentSlices（本机内存地址，零拷贝）
+    FS->>M: OffloadObjectHeartbeat(enable_offloading_)
+    M-->>FS: OffloadTaskItem[{tenant_id, key, size}]
+    FS->>M: BatchQuery(keys, tenant_id)（= BatchGetReplicaList）
+    M-->>FS: replicas[]
+    FS->>FS: 取第一个本机内存副本，用 buffer_address_ 组成 Slice（CPU 零拷贝；GPU 先 D2H）
     FS->>BE: BatchOffload(host slices)
-    BE->>Dev: Store / StoreBatch（16 字节物理 key + chunk/root）
-    FS->>M: NotifyOffloadSuccess(tasks, metadatas)
-    M->>M: dec_refcnt(源副本) + AddReplica(LOCAL_DISK, COMPLETE)
+    BE->>Dev: StoreBatch：chunk 先写、root 最后提交（16 字节物理 key）
+    FS->>M: NotifyOffloadSuccess(tasks, metadatas)（在 BatchOffload 回调内，按 bucket 逐次）
+    M->>M: dec_refcnt(源副本)；无 LOCAL_DISK 副本时才登记，已有则只更新 endpoint/size
 
     R->>M: BatchGetReplicaList(keys)
-    M-->>R: LOCAL_DISK{endpoint, object_size} + 读租约
-    R->>FS: batch_get_offload_object(keys, sizes) [offload RPC]
+    M-->>R: 全部可读副本（含 LOCAL_DISK{client_id, transport_endpoint, object_size}）+ lease_ttl_ms
+    R->>FS: batch_get_offload_object(tenant:key[], restore_sizes[]) [owner 的 offload RPC]
     FS->>BE: BatchLoad
-    BE->>Dev: Retrieve / RetrieveIntoBatch
-    Dev-->>FS: 数据写入 ClientBuffer
-    FS-->>R: {batch_id, pointers[], owner_TE_addr, gc_ttl_ms}
-    R->>FS: TE READ（从 owner ClientBuffer 拉数据）
-    R->>FS: release_offload_buffer(batch_id)
+    BE->>Dev: root 1 次（多槽探测）+ manifest 的 N 个 chunk（inline 到此为止）
+    Dev-->>FS: 对齐 chunk 直写 ClientBuffer；非对齐 / 尾块走 buffer + memcpy
+    FS-->>R: {batch_id, pointers[], transfer_engine_addr, gc_ttl_ms}
+    R->>FS: 对 owner segment 发 one-sided RDMA READ（同进程走 memcpy）
+    R->>FS: release_offload_buffer(batch_id)（OffloadRestoreLease 析构时）
 ```
 
 图中节点 → 代码：
 
 | 阶段 | 代码 |
 | --- | --- |
-| `PutStart/PutEnd` 触发入队 + `inc_refcnt` | [master_service.cpp:5785-5811](../Mooncake/mooncake-store/src/master_service.cpp#L5785) |
+| `PutStart` 只分配 MEMORY / NoF_SSD | [master_service.cpp:5140-5315](../Mooncake/mooncake-store/src/master_service.cpp#L5140)（见 6.7.4.7） |
+| `PutEnd` 触发入队 + `inc_refcnt` | [master_service.cpp:5785-5811](../Mooncake/mooncake-store/src/master_service.cpp#L5785) |
 | 心跳取任务 | [file_storage.cpp:702-716](../Mooncake/mooncake-store/src/file_storage.cpp#L702) → [master_service.cpp:8887-8929](../Mooncake/mooncake-store/src/master_service.cpp#L8887) |
-| `BatchQuerySegmentSlices` 取本机内存 | [file_storage.cpp:1047-1073](../Mooncake/mooncake-store/src/file_storage.cpp#L1047) |
+| `BatchQuerySegmentSlices` 取本机内存 | 先 [client_service.cpp:1259-1263](../Mooncake/mooncake-store/src/client_service.cpp#L1259)（master RPC），再 [file_storage.cpp:1047-1073](../Mooncake/mooncake-store/src/file_storage.cpp#L1047) |
 | `BatchOffload` → NVMe KV 写 | [file_storage.cpp:501-505](../Mooncake/mooncake-store/src/file_storage.cpp#L501) → [backend.cpp:479](../Mooncake/mooncake-store/src/nvme_kv/backend.cpp#L479) |
 | `NotifyOffloadSuccess` 登记 | [master_service.cpp:8973-9159](../Mooncake/mooncake-store/src/master_service.cpp#L8973) |
-| 查询 + 选副本 | [client_service.cpp:1240](../Mooncake/mooncake-store/src/client_service.cpp#L1240)、[replica_selection.h:122](../Mooncake/mooncake-store/include/replica_selection.h#L122) |
+| 查询 + 选副本 | [client_service.cpp:1259-1263](../Mooncake/mooncake-store/src/client_service.cpp#L1259)、[real_client.cpp:4110-4154](../Mooncake/mooncake-store/src/real_client.cpp#L4110)（批量）/ [3744-3767](../Mooncake/mooncake-store/src/real_client.cpp#L3744)（单 key）、[replica_selection.h:122](../Mooncake/mooncake-store/include/replica_selection.h#L122) |
+| 对象级读租约（`lease_ttl_ms`） | [master_service.cpp:5006](../Mooncake/mooncake-store/src/master_service.cpp#L5006)（`GrantReadLease`）；它**不保护** offload 数据，offload buffer 的租约是第 22 步的 `gc_ttl_ms` |
 | offload RPC 读 | [real_client.cpp:8694-8722](../Mooncake/mooncake-store/src/real_client.cpp#L8694) → [file_storage.cpp:267-300](../Mooncake/mooncake-store/src/file_storage.cpp#L267) |
 | TE 拉取 / 释放 | [transfer_task.cpp:1614-1694](../Mooncake/mooncake-store/src/transfer_task.cpp#L1614)、[real_client.cpp:586-636](../Mooncake/mooncake-store/src/real_client.cpp#L586) |
 
-#### 6.7.4 DFS 类图
+> **读图注意**：第 3 步只回 MEMORY / NoF_SSD 的原因、第 5 步为什么只钉一个源副本、第 9–11 步为什么是一次 master RPC 加一次本地取址、第 14 步为什么说"在回调内"、第 20 步为什么是"root 1 次 + chunk N 次"、第 24 步为什么是 RAII 释放 —— 逐条代码依据见 6.7.4.6；第 3 步的完整推导见 6.7.4.7。
+
+#### 6.7.4 NVMe KV 代码导读
+
+上面两张图给的是"形状"。这一节按 **接口面 → 对象模型 → 语义层 → 设备绑定 → 命令层 → 与图不符的地方 → 第 3 步的解释** 的顺序往下走，把 6.7.2 / 6.7.3 里的每个节点落到具体函数，并标出图上看不见的分支。
+
+##### 6.7.4.1 对外暴露了什么：三层接口 + 一组环境变量
+
+先给结论：**NVMe KV 没有自己的公开 API**。对上层它是 `StorageBackendInterface` 的第五个实现；对设备它只有 Store / Retrieve / Delete 三个动作；运维只有环境变量。
+
+| 通道 | 面向谁 | 接口 | 位置 |
+| --- | --- | --- | --- |
+| 落盘 / 读回 | `FileStorage` | `StorageBackendInterface` 的 6 个纯虚函数 | [storage_backend.h:262](../Mooncake/mooncake-store/include/storage_backend.h#L262) |
+| 设备绑定 | `NvmeKvStorageBackend` | `NvmeKvConnector::Init/Store/StoreBatch/Retrieve/RetrieveBufferBatch/RetrieveIntoBatch/Delete/GetCapabilities` | [connector.h:16](../Mooncake/mooncake-store/include/nvme_kv/connector.h#L16) |
+| 命令下发 | `NvmeKvConnector` | `NvmeKvCommandExecutor` 的同名方法 + `Capabilities` | [executor.h:19](../Mooncake/mooncake-store/include/nvme_kv/executor.h#L19) |
+| 装配 / 调优 | 部署者 | `MOONCAKE_NVME_KV_*` 环境变量 | 见本节（4） |
+
+**（1）`StorageBackendInterface`：6 个实现 + 3 个默认空实现**
+
+| 方法 | 语义 | NVMe KV 实现 |
+| --- | --- | --- |
+| `Init()` | 打开设备、建线程池 | [backend.cpp:461](../Mooncake/mooncake-store/src/nvme_kv/backend.cpp#L461) |
+| `BatchOffload(map, complete_handler, eviction_handler)` | 把一批本机内存 slices 落盘；**真正的成功集合靠回调上报** | [backend.cpp:479](../Mooncake/mooncake-store/src/nvme_kv/backend.cpp#L479) |
+| `BatchLoad(map&)` | 把数据读进调用方给的切片；map 是 in/out | [backend.cpp:1167](../Mooncake/mooncake-store/src/nvme_kv/backend.cpp#L1167) |
+| `IsExist(key)` | 只答存在性，不分配读 buffer | [backend.cpp:1487](../Mooncake/mooncake-store/src/nvme_kv/backend.cpp#L1487) |
+| `IsEnableOffloading()` | 后端自己的容量判断 | [backend.cpp:1503](../Mooncake/mooncake-store/src/nvme_kv/backend.cpp#L1503) |
+| `ScanMeta(handler)` | 重启后重建目录 | [backend.cpp:1516](../Mooncake/mooncake-store/src/nvme_kv/backend.cpp#L1516) —— 空实现 |
+
+未覆盖的钩子：`EvictAboveDiskWatermark()`（[storage_backend.h:311](../Mooncake/mooncake-store/include/storage_backend.h#L311)，返回空 vector）、`RemoveAll()`、`ResetScanIterator()`、`SetTestFailurePredicate()`。
+
+三条必须记住的契约：
+
+1. **`BatchOffload` 的返回值不等于成功集合**。`complete_handler(keys, metadatas)` 只对真正落盘的 key 调用，而函数本身仍可能返回 `first_error`（[backend.cpp:963-972](../Mooncake/mooncake-store/src/nvme_kv/backend.cpp#L963)）。`FileStorage` 用"回调里没出现的 key"做 NACK，`data_size=-1`（[file_storage.cpp:511-520](../Mooncake/mooncake-store/src/file_storage.cpp#L511)、[558-571](../Mooncake/mooncake-store/src/file_storage.cpp#L558)）。
+2. **`BatchLoad` 是 all-or-nothing**。任何一个 key 的 chunk 失败，整批返回该错误（[backend.cpp:1470-1475](../Mooncake/mooncake-store/src/nvme_kv/backend.cpp#L1470)），没有部分成功。
+3. **`eviction_handler` 被直接丢弃**（[backend.cpp:485](../Mooncake/mooncake-store/src/nvme_kv/backend.cpp#L485)）。所以"后端会在容量高时淘汰旧对象"这个假设在这里不成立。
+
+**（2）`NvmeKvConnector`：`Init` 之外都是纯转发**
+
+`Store/StoreBatch/Retrieve/RetrieveBufferBatch/RetrieveIntoBatch/Delete/GetCapabilities` 都只是 executor 的同名调用，附一层 `executor_ == nullptr` 的兜底（每个请求填 `INTERNAL_ERROR`，[connector.cpp:97-157](../Mooncake/mooncake-store/src/nvme_kv/connector.cpp#L97)）。唯一有决策的是 `Init()`，见 6.7.4.4。
+
+**（3）`NvmeKvCommandExecutor`：16 字节 key + 同步批量**
+
+```cpp
+using PhysicalKey = std::array<uint8_t, 16>;
+
+virtual tl::expected<void, ErrorCode> Store(const PhysicalKey&, std::string);
+virtual void StoreBatch(std::vector<StoreRequest>&);                          // 默认实现是串行 for
+virtual tl::expected<std::string, ErrorCode> Retrieve(const PhysicalKey&,
+                                                      uint32_t size_hint = 0) const;
+virtual void RetrieveBufferBatch(std::vector<RetrieveBufferRequest>&) const;   // 默认实现是串行 for
+virtual void RetrieveIntoBatch(std::vector<RetrieveIntoRequest>&) const;      // 默认先 Buffer 再 memcpy
+virtual tl::expected<void, ErrorCode> Delete(const PhysicalKey&);
+virtual const Capabilities& GetCapabilities() const;
+```
+
+三条约定：
+
+- **固定 16 字节**：设备 key 上限，编码方式见 6.7.4.2。
+- **批量是同步的**：注释写死在 [executor.h:65-66](../Mooncake/mooncake-store/include/nvme_kv/executor.h#L65)，实现返回前必须停止访问所有 request-owned buffer。所以 `StoreRequest::value` 是 `string_view` 而不需要生命周期管理；改成异步会立刻悬垂。
+- **默认实现就是串行**（[executor.h:67-119](../Mooncake/mooncake-store/include/nvme_kv/executor.h#L67)）：stub 与 ioctl 都走它，只有 io_uring 重写成真正的批量提交。
+
+**（4）环境变量**
+
+| 变量 | 默认 | 作用 |
+| --- | --- | --- |
+| `MOONCAKE_NVME_KV_DEVICE_PATH` | 必填 | 设备 / generic char device 路径，空值直接 `INVALID_PARAMS`（[connector_config.cpp:59](../Mooncake/mooncake-store/src/nvme_kv/config/connector_config.cpp#L59)） |
+| `MOONCAKE_NVME_KV_NSID` | 1 | 写进每条命令的 `cmd.nsid` |
+| `MOONCAKE_NVME_KV_TRANSPORT` | `auto` | `auto` / `io_uring` / `ioctl`（[connector_config.cpp:24](../Mooncake/mooncake-store/src/nvme_kv/config/connector_config.cpp#L24)） |
+| `MOONCAKE_NVME_KV_QUEUE_DEPTH` | 256 | io_uring 环深度、攒批大小、并发预算的共同输入 |
+| `MOONCAKE_NVME_KV_RUNTIME_TRANSFER_LIMIT` | 270336 | 与协议上限共同决定 `effective_max_value_size` |
+| `MOONCAKE_NVME_KV_TRANSFER_ALIGNMENT_BYTES` | 4096 | DMA buffer 的对齐单位 |
+| `MOONCAKE_NVME_KV_VALUE_BLOCK_UNIT_BYTES` | 512 | 命令 `cdw12` 的块计数单位 |
+| `MOONCAKE_NVME_KV_PROTOCOL_MAX_VALUE_SIZE` | 512 KiB | 协议层单值上限 |
+| `MOONCAKE_NVME_KV_READ_PLAN_BATCH_SIZE` | 8 | 读路径每个流水线分组的对象数 |
+| `MOONCAKE_NVME_KV_{IO,BATCH_SUBMIT,ROOT_SUBMIT,PREPARE,MAX_IO}_CONCURRENCY` | 18 / 6 / 1 / 12 / 256 | 后端三级线程池规模（[io_concurrency_config.cpp:43](../Mooncake/mooncake-store/src/nvme_kv/config/io_concurrency_config.cpp#L43)） |
+| `MOONCAKE_NVME_KV_DRIVER=stub` | 无 | 仅在 `MOONCAKE_ENABLE_NVME_KV_TEST_STUB` 编译开启时生效（[connector.cpp:30-41](../Mooncake/mooncake-store/src/nvme_kv/connector.cpp#L30)） |
+
+**四个"看着像接口、其实不是"的点：**
+
+1. `ScanMeta` 存在，但不重建目录（代码位置 [backend.cpp:1516](../Mooncake/mooncake-store/src/nvme_kv/backend.cpp#L1516)）。
+2. `EvictAboveDiskWatermark` 存在，但用基类默认实现。
+3. `eviction_handler` 是接收后忽略的参数。
+4. `Delete` 存在，但只在写失败清理时被调用（[backend.cpp:832-856](../Mooncake/mooncake-store/src/nvme_kv/backend.cpp#L832)、[1010-1036](../Mooncake/mooncake-store/src/nvme_kv/backend.cpp#L1010)）。没有"按 key 删设备数据"的公开路径 —— 这是覆盖写不回收旧槽（6.7.4.2）的根因。
+
+##### 6.7.4.2 对象模型：三个无状态模块
+
+这一层不持有状态，全是 `key → bytes` 的确定性变换，可以脱离并发单独读懂。
+
+**（1）`key_codec`：逻辑 key → 16 字节物理 key**
+
+```
+derivation_input = version(1) | u32(key_len) | logical_key | role | u32(slot) | has_chunk [| u32(chunk_index)]
+physical_key     = XXH64(input, seed=0) || XXH64(input, seed=1)     // 各 8 字节
+```
+
+- `role = 1` 是 root，`role = 2` 是 chunk（[key_codec.cpp:10-12](../Mooncake/mooncake-store/src/nvme_kv/key_codec.cpp#L10)）；
+- 两组种子拼成 16 字节，正好一个设备 key；
+- 输入里包含 slot 和 chunk_index，**同一对象的不同槽 / 不同分块天然落在不同物理 key 上**；
+- `ComputeNvmeKvVerifyHash` 用种子 0..3 生成 32 字节，写进 header，读时用它确认"这个物理 key 里装的确实是这个逻辑 key"（[key_codec.cpp:82](../Mooncake/mooncake-store/src/nvme_kv/key_codec.cpp#L82)）。
+
+多租户不是命名空间，而是 key 本身：`FileStorage` 传下来的是 `TenantId::MakeScopedKey()` 之后的字符串（[file_storage.cpp:316-321](../Mooncake/mooncake-store/src/file_storage.cpp#L316)），物理 key 由它派生。
+
+**（2）`object_layout`：header + identity + payload**
+
+| 字段 | 类型 | 用途 |
+| --- | --- | --- |
+| `magic` | u32 = `0x4e564b56` | 快速识别 |
+| `object_type` | u32 | 1 = inline，2 = manifest |
+| `payload_size` | u32 | payload 长度 |
+| `verify_hash` | u8[32] | 逻辑 key 的 4×XXH64 |
+| `payload_checksum` | u32 | payload 的 XXH32 |
+| `header_checksum` | u32 | header 自身 XXH32（计算时先清零本字段） |
+| `identity_metadata_size` | u32 | 紧随 header 的 identity 区长度 |
+
+identity 区 = `{resolved_physical_key, resolved_slot}` + canonical identity（[object_layout.cpp:62](../Mooncake/mooncake-store/src/nvme_kv/object_layout.cpp#L62)）。它把"我是谁、我在哪个槽"写进对象本身，所以读路径不需要任何外部元数据就能自证。
+
+```
+inline:   [header][identity][payload]
+manifest: [header][identity][manifest_payload]
+manifest_payload = {logical_payload_size, chunk_count} + N × {physical_key(16), payload_size(4), payload_checksum(4)}
+chunk:    设备里裸存 payload（没有 header）
+```
+
+`ValidateNvmeKvHeader`（[object_layout.cpp:95](../Mooncake/mooncake-store/src/nvme_kv/object_layout.cpp#L95)）把 6 项校验串起来：magic、type、payload_size、identity_size、header_checksum、verify_hash。
+
+**（3）`key_conflict_policy`：切块与槽位决策**
+
+`BuildWritePlan`（[key_conflict_policy.cpp:32](../Mooncake/mooncake-store/src/nvme_kv/key_conflict_policy.cpp#L32)）是唯一决定"inline 还是 manifest"的地方：
+
+```cpp
+fixed_overhead = sizeof(NvmeKvObjectHeader) + identity_metadata_size;   // 56 + (25 + keylen)
+inline_limit   = max_value_size - fixed_overhead;
+store_inline   = payload.size() <= inline_limit;
+
+chunk_limit    = max_value_size;          // 默认 270336 = 66 × 4096
+chunk_count    = ceil(payload / chunk_limit);
+// 且要求：8 + 24 * chunk_count + 56 + identity_metadata_size <= max_value_size
+```
+
+三个容易漏的量化结论（默认参数、64 字节 key）：
+
+- **inline 上限** = 270336 − 56 − 89 = 270191 字节；
+- **单对象上限**不是无限，受"manifest 自己要塞进一个 value"约束：`N ≤ (270336 − 56 − 89 − 8) / 24 ≈ 11257`，即 payload 约 **2.8 GiB** 封顶（另受 `payload ≤ UINT32_MAX` 约束）；
+- 每个 chunk 是 **raw payload 切片**，没有独立 header；长度和校验和只存在 manifest 里。
+
+`ValidateResolvedRootPlacement`（[key_conflict_policy.cpp:23](../Mooncake/mooncake-store/src/nvme_kv/key_conflict_policy.cpp#L23)）是读路径的"防串槽"检查：stored identity 里记的物理 key、实际读到的 key、`Encode(logical_key, stored_slot)` 三者必须一致。
+
+**（4）冲突策略：`store-if-not-exists` + 字节比较 + 64 槽**
+
+设备侧所有写都是 store-if-not-exists（`cdw11[15:8] = 0x02`）。命中已存在时，`ResolveExistingObject` 把已有值读回来与本次要写的 blob 做 `memcmp`（[key_conflict_policy.cpp:125](../Mooncake/mooncake-store/src/nvme_kv/key_conflict_policy.cpp#L125)）：
+
+- 相同 → `kSameObject`，视为"上次其实写成功了"，返回 `{stored=true, inserted=false}`，不占新槽；
+- 不同 → `kDifferentObject`，说明两个不同逻辑 key 的物理 key 相撞（或同 key 内容变了），换下一个槽（最多 64 个，[key_codec.h:18](../Mooncake/mooncake-store/include/nvme_kv/key_codec.h#L18)）。
+
+两个隐含后果：
+
+1. **root 是提交标记**。chunk 先写、root 后写，所以"读到合法 manifest 却读不到 chunk"只可能来自设备静默丢数据。
+2. **覆盖写不回收旧槽**。批量快路径只试 slot 0，内容不同则换槽；`Delete` 只清理本次失败写入。同一逻辑 key 的多份内容会各占一槽，空间只增不减 —— 与"没有淘汰钩子"是一致的。
+
+##### 6.7.4.3 语义层：`NvmeKvStorageBackend`
+
+**（1）`Init`：先设备，再线程**
+
+[backend.cpp:461](../Mooncake/mooncake-store/src/nvme_kv/backend.cpp#L461) 用 `compare_exchange_strong` 保证只初始化一次；失败时复位 `initialized_`，允许重试。顺序是 `InitDevice()`（new Connector + `Init()`）→ `InitIoWorkers()`。
+
+并发度不是拍脑袋定的（[io_concurrency_config.cpp:43-84](../Mooncake/mooncake-store/src/nvme_kv/config/io_concurrency_config.cpp#L43)）：
+
+```
+io_concurrency       = min(queue_depth, 18, max_io_concurrency)
+batch_submit ≤ io_concurrency - 1
+prepare      ≤ io_concurrency - batch_submit
+```
+
+只有大于 1 才创建对应的 `ThreadPool`（[backend.cpp:192-214](../Mooncake/mooncake-store/src/nvme_kv/backend.cpp#L192)）。`submit_workers_` 与 `root_submit_workers_` 是**成对创建**的，这条约束决定了 `BatchOffload` 走不走流水线。
+
+**（2）`BatchOffload` 的四个阶段**
+
+[backend.cpp:479](../Mooncake/mooncake-store/src/nvme_kv/backend.cpp#L479)，约 500 行，但结构清晰：
+
+1. **准入**：累加 payload 并检查 `int64_t` 溢出；`total_keys_ / total_size_` 对上限；`IsEnableOffloading()`。`slices.empty()` 的对象被静默跳过（[backend.cpp:501-504](../Mooncake/mooncake-store/src/nvme_kv/backend.cpp#L501)），所以返回值是"实际处理的对象数"。
+2. **prepare**（[backend.cpp:560-574](../Mooncake/mooncake-store/src/nvme_kv/backend.cpp#L560)）：`BuildPayloadView` **单 slice 零拷贝**指向 segment 内存，多 slice 才拼接（[backend.cpp:78-92](../Mooncake/mooncake-store/src/nvme_kv/backend.cpp#L78)）；然后 `BuildWritePlan(..., slot = 0, ...)` —— **批量路径只试 0 号槽**。
+3. **写**：两条流水线，见下。
+4. **收尾**：失败的槽位清理本轮写入 → 未走流水线的对象补写 root → 成功的对象计入 `total_*` 并进回调 → 仍需回落的走 `OffloadOne`。
+
+**两条写流水线**（[backend.cpp:598-830](../Mooncake/mooncake-store/src/nvme_kv/backend.cpp#L598)）：
+
+```cpp
+if (io_workers_ == nullptr || submit_workers_ == nullptr ||
+    root_submit_workers_ == nullptr || batch_submit_concurrency_ <= 1) {
+    // 串行版：prepare 并行 → 汇总所有 chunk → StoreBatchParallel → 汇总 root → StoreBatchParallel
+}
+// 流水线版：
+//   producer            → chunk lane（轮询入队）
+//   chunk lane 消费者    → 按 queue_depth 攒批 StoreBatch
+//                        最后一个 chunk 成功 → root_queue.Push(plan)
+//   root lane 消费者     → 按 queue_depth 攒批 StoreBatch(root_blob)
+```
+
+关键点：
+
+- **root 只在最后一个 chunk 成功后才入 root 队列**（[backend.cpp:746-755](../Mooncake/mooncake-store/src/nvme_kv/backend.cpp#L746)）；
+- 攒批单位是 `queue_depth`（[backend.cpp:733-734](../Mooncake/mooncake-store/src/nvme_kv/backend.cpp#L733)），因为底下一次 `StoreBatch` 最多塞满一个 io_uring 环；
+- 异常路径用 `set_consumer_error()` 关闭所有队列，producer 的 `Push` 返回 false → 该对象填 `INTERNAL_ERROR`，不会死锁（[backend.cpp:639-654](../Mooncake/mooncake-store/src/nvme_kv/backend.cpp#L639)）；
+- `StoreBatchParallel`（[backend.cpp:409-447](../Mooncake/mooncake-store/src/nvme_kv/backend.cpp#L409)）把请求按 `worker_index, worker_index+k, …` **交错分片**给 `batch_submit_concurrency_` 个 worker，让每个 worker 的批次更均匀。
+
+**（3）`OffloadOne`：逐槽位重试**
+
+[backend.cpp:976](../Mooncake/mooncake-store/src/nvme_kv/backend.cpp#L976)。槽 0..63 依次尝试 `BuildWritePlan` → 写 chunk → 写 root。三条细节：
+
+- 每个 chunk 撞车都要单独判定；只要有一个 chunk 属于别的对象，整个对象换槽（[backend.cpp:1068-1093](../Mooncake/mooncake-store/src/nvme_kv/backend.cpp#L1068)）；
+- `cleanup_new_writes` 只删本次尝试创建的 key（[backend.cpp:1010-1036](../Mooncake/mooncake-store/src/nvme_kv/backend.cpp#L1010)），从不删已存在的老对象；
+- 64 槽用尽仍冲突，返回 `{stored=false, inserted=false}`（[backend.cpp:1164](../Mooncake/mooncake-store/src/nvme_kv/backend.cpp#L1164)），该 key 既不上报也不报错，由 FileStorage 当失败 NACK。
+
+**（4）`BatchLoad` 的三个阶段**
+
+[backend.cpp:1167](../Mooncake/mooncake-store/src/nvme_kv/backend.cpp#L1167)。
+
+1. **准备**（[backend.cpp:1198-1277](../Mooncake/mooncake-store/src/nvme_kv/backend.cpp#L1198)）：`ResolveRoot` 从槽 0 线性探测（[backend.cpp:147-184](../Mooncake/mooncake-store/src/nvme_kv/backend.cpp#L147)）；解析并校验 header；inline → `memcpy` 后结束；manifest → 解析 chunk 记录并 `CacheManifest`。**命中 manifest 缓存的对象跳过整个准备阶段**（[backend.cpp:1300-1307](../Mooncake/mooncake-store/src/nvme_kv/backend.cpp#L1300)）。
+2. **读**（[backend.cpp:1336-1431](../Mooncake/mooncake-store/src/nvme_kv/backend.cpp#L1336)）：按 `READ_PLAN_BATCH_SIZE`（默认 8 个对象）分组。每个 chunk 选路：`CanRetrieveDirectlyInto(dest, size)` 为真走 `RetrieveIntoBatch`（设备直写目标 buffer），否则走 `RetrieveBufferBatch` + 拷贝。
+3. **校验**（[backend.cpp:1433-1467](../Mooncake/mooncake-store/src/nvme_kv/backend.cpp#L1433)）：buffer 路径已在拷贝前校验；这一阶段只复核直读 chunk 的 checksum。两阶段通过 `RunPipelinedIo` 重叠（[backend.cpp:1469](../Mooncake/mooncake-store/src/nvme_kv/backend.cpp#L1469)）。
+
+**"设备直读"不是无条件的**：`CanRetrieveDirectlyInto` 要求长度是 4096 的整数倍且目标地址 4 KiB 对齐（[backend.cpp:69-76](../Mooncake/mooncake-store/src/nvme_kv/backend.cpp#L69)）。chunk 只有"满块"（270336 = 66×4096）满足，**尾块必然走 buffer + memcpy**。
+
+**root 读取的往返次数**：`ResolveRoot` 用 `size_hint = 0`，首读固定 4096 字节（[executor_util.cpp:84-92](../Mooncake/mooncake-store/src/nvme_kv/executor_util.cpp#L84)）：
+
+- root blob ≤ 4096 → **一次读完**。默认参数下这覆盖到 payload 约 **42 MiB**（manifest 记录数 ≤ 164）；
+- root blob 在 (4096, 270336] → 设备对 4 KiB 请求报 `0x85`，走最大 buffer 重试，**共两次**；
+- 更大则 `BUFFER_OVERFLOW`（实际不会发生，因为 manifest 在写入时就受限）。
+
+**（5）`IsExist` / `IsEnableOffloading` / `ScanMeta`**
+
+- `IsExist` 复用 `ResolveRoot`（[backend.cpp:1496](../Mooncake/mooncake-store/src/nvme_kv/backend.cpp#L1496)）："存在" = "有一个 header 合法且 identity 匹配的 root"。这是悬空副本校验的基础。
+- `IsEnableOffloading` 就是两个计数器与两个限制的比较（[backend.cpp:1510-1513](../Mooncake/mooncake-store/src/nvme_kv/backend.cpp#L1510)）。
+- `ScanMeta` 返回空（[backend.cpp:1516](../Mooncake/mooncake-store/src/nvme_kv/backend.cpp#L1516)）。配合 `Init` 把计数器清零，得到两个后果：**重启后 Master 侧的 `LOCAL_DISK` 记录不会重建，配额从 0 起算**。
+
+##### 6.7.4.4 设备绑定：`NvmeKvConnector`
+
+只有 `Init` 有决策（[connector.cpp:26-95](../Mooncake/mooncake-store/src/nvme_kv/connector.cpp#L26)）：
+
+```cpp
+#ifdef MOONCAKE_ENABLE_NVME_KV_TEST_STUB
+    if (getenv("MOONCAKE_NVME_KV_DRIVER") == "stub") { ... }
+#endif
+    return InitRealExecutor();
+
+// InitRealExecutor：auto 策略
+#ifdef MOONCAKE_HAVE_NVME_URING_CMD
+    io_uring 先试，失败只 LOG(WARNING) 后继续
+#endif
+    ioctl 兜底
+```
+
+- `MOONCAKE_HAVE_NVME_URING_CMD` 是**编译期**开关；未定义时 `CreateNvmeKvIoUringExecutor` 直接返回 `INVALID_PARAMS`（[executor_io_uring.cpp:784-788](../Mooncake/mooncake-store/src/nvme_kv/executor_io_uring.cpp#L784)）。
+- 显式指定 `io_uring` 而编译不支持时直接失败，**不静默降级**；只有 `auto` 会回退。
+- `storage_path_`（`<storage_filepath>/nvme_kv_blobs`）只在 stub 模式使用，真实 executor 不碰文件系统。
+
+##### 6.7.4.5 命令层：executor 与 NVMe 命令编码
+
+**（1）`Capabilities` 向上决定对象布局**
+
+[executor_util.cpp:116-129](../Mooncake/mooncake-store/src/nvme_kv/executor_util.cpp#L116)：
+
+```cpp
+effective_max_value_size = RoundDownToNvmeKvTransferBytes(min(protocol_max_value_size, runtime_transfer_limit));
+queue_depth              = queue_depth ?: 256;
+```
+
+默认 270336。它同时是**单值设备上限**和**后端切块大小**，所以改这个环境变量会改变磁盘上的对象布局；`queue_depth` 同时是环深度、攒批大小和并发预算的输入。
+
+**（2）一条命令的每个字段从哪来**
+
+[executor_util.h:80-122](../Mooncake/mooncake-store/include/nvme_kv/executor_util.h#L80)：
+
+| 字段 | store | retrieve | delete |
+| --- | --- | --- | --- |
+| `opcode` | `0x01` | `0x02` | `0x10` |
+| `nsid` | `config.nsid` | 同 | 同 |
+| `addr` / `data_len` | DMA buffer / 传输字节 | 同 | — |
+| `cdw10` | 传输字节 | 传输字节 | — |
+| `cdw11[7:0]` | key 长度（16） | 16 | 16 |
+| `cdw11[15:8]` | `0x02` = store-if-not-exists | — | — |
+| `cdw12` | `ceil(RoundUp(bytes) / 512) − 1` | 同 | — |
+| `cdw2 / cdw3 / cdw14 / cdw15` | 16 字节物理 key | 同 | 同 |
+| `timeout_ms` | 30000 | 同 | 同 |
+
+key 打包（[executor_util.cpp:142-151](../Mooncake/mooncake-store/src/nvme_kv/executor_util.cpp#L142)）：
+
+```cpp
+cdw2  = LE32(key[0..3]);
+cdw3  = LE32(key[4..7]);
+cdw14 = (0x01 << 24) | (LE32(key[8..11]) & 0x00FFFFFF);   // 高 8 位是 Command Set Identifier
+cdw15 = LE32(key[12..15]);
+```
+
+第 12 个字节的高 8 位被 CSI 占用，实际可用 120 bit，由两组 XXH64 拼成。
+
+**（3）对齐与补零**
+
+设备要求传输长度按 4096 对齐、块计数按 512 计算：
+
+- 写：`ResolveNvmeKvStoreSubmissionBytes(size)` 向上取整到 4096，buffer `memset 0` 后只拷逻辑长度（[executor_ioctl.cpp:64-69](../Mooncake/mooncake-store/src/nvme_kv/executor_ioctl.cpp#L64)）。**设备里存的是补齐后的值**，真实长度靠 header 反推。
+- 读：`RoundUpToNvmeKvTransferBytes` 分配对齐 buffer；`AllocateNvmeKvAlignedBuffer` 用 `posix_memalign(4096)`（[executor_util.cpp:39-47](../Mooncake/mooncake-store/src/nvme_kv/executor_util.cpp#L39)）。
+
+**写路径的零拷贝是机会性的**：`CanSubmitCallerBufferDirectly` 要求"长度本来就对齐"且"源地址 4 KiB 对齐"（[executor_io_uring.cpp:36-44](../Mooncake/mooncake-store/src/nvme_kv/executor_io_uring.cpp#L36)）。满块 chunk（270336）满足长度条件，尾块和 inline root 永远不满足，必然补零拷贝；源地址是否对齐取决于 segment 分配器，代码在这里不做假设。
+
+**（4）io_uring executor**
+
+`NvmeKvIoUringExecutor` 自己不持有 ring，而是用 `SharedNvmeUringRing::Instance(queue_depth)`（[executor_io_uring.cpp:85-93](../Mooncake/mooncake-store/src/nvme_kv/executor_io_uring.cpp#L85)）——**每线程一个 `thread_local` ring**，队列深度变化时重建。所以并发模型是：`io_parallelism_` 个线程 → 最多同样多的环 → 每个环一次最多 `queue_depth` 条在途。
+
+ring 初始化必须 `IORING_SETUP_SQE128`（必要时加 `CQE32`，[executor_io_uring.cpp:287-309](../Mooncake/mooncake-store/src/nvme_kv/executor_io_uring.cpp#L287)）：`struct nvme_uring_cmd` 72 字节，超过标准 64 字节 SQE 的 16 字节 `cmd[]` 区。`CQE32` 用来读回 32 位 result（retrieve 的实际长度）；不支持时 `has_observed_result = false`，直读路径退回 `request.size`，buffer 路径退回 header 解析 / `size_hint` 推断。
+
+`SubmitBatch`（[executor_io_uring.cpp:97-278](../Mooncake/mooncake-store/src/nvme_kv/executor_io_uring.cpp#L97)）是一个带窗口的提交-收割循环：
+
+```
+while (completed < n):
+    填 SQE 直到 inflight + prepared == queue_depth
+    io_uring_submit_and_wait(1) / io_uring_submit()
+    标记 submitted、inflight_ops++
+    wait_and_drain(1)：尽可能多地 peek 已完成 CQE
+```
+
+`user_data = (token << 32) | (index + 1)`（[executor_io_uring.cpp:346-360](../Mooncake/mooncake-store/src/nvme_kv/executor_io_uring.cpp#L346)），每次 `SubmitBatch` 换 token。上次调用残留的 CQE 会被识别为 stale token 而不是错记到本次请求；无法归属时按 `complete_unknown_inflight` 逐个补 `INTERNAL_ERROR` 并计数，防止 `inflight_ops` 永远清零不了。协议错误后 `ResetRing()` 重建环。
+
+**（5）ioctl executor**
+
+[NvmeKvIoctlExecutor](../Mooncake/mooncake-store/src/nvme_kv/executor_ioctl.cpp#L22) 是"一次系统调用一条命令"：
+
+```cpp
+int ret = ::ioctl(fd_, NVME_IOCTL_IO_CMD, &cmd);
+// ret < 0  → MapNvmeKvTransportError(errno)
+// ret > 0  → MapNvmeKvStatus(ret)        ← NVMe status code
+// ret == 0 → 成功；retrieve 时 cmd.result 是设备报告的字节数
+```
+
+批量方法全部用基类的串行默认实现，所以单线程没有并行度；它的价值是兼容性（不要求内核 5.19+ / generic char device）。后端线程池会把不同对象分到不同线程，多少补回并发。
+
+**（6）读时的长度发现**
+
+两个 executor 都实现同一套三段式（[executor_util.cpp:84-114](../Mooncake/mooncake-store/src/nvme_kv/executor_util.cpp#L84)）：
+
+1. **首读按 `size_hint`**：`size_hint == 0` 时取 `max(sizeof(header), 4096) = 4096`；否则 `RoundUp(size_hint)`，上限 `effective_max_value_size`。
+2. **从前缀反推长度**：`ResolveNvmeKvObjectBlobSize` 读 header 的 `payload_size + identity_metadata_size + 56`（[object_layout.cpp:160-171](../Mooncake/mooncake-store/src/nvme_kv/object_layout.cpp#L160)）。
+3. **按需重读**：设备报 `0x85`（buffer 太小）且 `size_hint == 0` → 用最大 buffer 重试一次；header 说更大 → 用精确长度重试一次；超过上限 → `BUFFER_OVERFLOW`。
+
+**（7）stub executor**
+
+[NvmeKvStubExecutor](../Mooncake/mooncake-store/src/nvme_kv/executor_stub.cpp#L14)：内存 map + `<hex>.blob` 文件，先查内存再查文件；`Store` 用"查 map + `filesystem::exists`"模拟 store-if-not-exists。批量走基类默认实现。它让整条链路（冲突策略、manifest、pipeline）能在没有 NVMe KV 设备时跑测试。
+
+**（8）错误映射**
+
+[executor_util.cpp:163-206](../Mooncake/mooncake-store/src/nvme_kv/executor_util.cpp#L163)：
+
+| NVMe status | ErrorCode | 语义 |
+| --- | --- | --- |
+| `0x81` capacity exceeded | `KEYS_ULTRA_LIMIT` | 设备满 → FileStorage 关闭 offloading（[file_storage.cpp:532-536](../Mooncake/mooncake-store/src/file_storage.cpp#L532)） |
+| `0x85` invalid value size | `INVALID_PARAMS` | 读 buffer 太小，触发最大 buffer 重试 |
+| `0x86` invalid key size | `INVALID_PARAMS` | 编码 bug |
+| `0x87` key not found | `OBJECT_NOT_FOUND` | 槽位探测继续 / `IsExist` 为假 |
+| `0x88` unrecovered read | `FILE_READ_FAIL` | 介质错误 |
+| `0x89` key exists | `OBJECT_ALREADY_EXISTS` | **控制流**，不是错误（`IsNvmeKvControlFlowError`） |
+
+`errno` 侧：`ENOSPC → KEYS_ULTRA_LIMIT`、`ENOENT → OBJECT_NOT_FOUND`、`EINVAL → INVALID_PARAMS`、`ENOMEM → BUFFER_OVERFLOW`。
+
+##### 6.7.4.6 与 6.7.2 / 6.7.3 两图不符的地方
+
+6.7.3 的图已按本节结论修正；下面按重要性记录**改了什么、为什么**。第 1–3 条是 6.7.2 类图的结构性错误（图本身未改，按图阅读时需自行修正），第 7、12 条会直接误导实现，其余是步骤精度。
+
+1. **类图的所有权方向画反了**。图中是 `Client --> FileStorage`，但 `FileStorage` 由 `PyClient/RealClient` 持有（[pyclient.h:578](../Mooncake/mooncake-store/include/pyclient.h#L578)），而 `FileStorage` 反过来持有 `std::shared_ptr<Client>`（[file_storage.h:228](../Mooncake/mooncake-store/include/file_storage.h#L228)）。`Client` 本身没有 `FileStorage` 成员。正确关系是 `PyClient/RealClient --> FileStorage --> Client`（后者仅用于 RPC）。
+2. **`PutToLocalFile` 不是 public**。它在 `Client` 的 private 区（[client_service.h:931](../Mooncake/mooncake-store/include/client_service.h#L931)），类图上的 `+` 应改 `-`。`OffloadObjectHeartbeat` / `NotifyOffloadSuccess` 确实是 `Client` 的 public 方法（[client_service.h:557](../Mooncake/mooncake-store/include/client_service.h#L557)、[644](../Mooncake/mooncake-store/include/client_service.h#L644)），但它们由 `FileStorage` 调用，不在 `Client → FileStorage` 方向上。
+3. **同一张类图漏了 `IsExist` / `IsEnableOffloading`**，却把 `EvictAboveDiskWatermark` 画成接口方法。后者是基类的**非纯虚默认实现**（返回空 vector），NVMe KV 并没有 override 它；前两个才是它真正实现的纯虚函数。
+4. **第 20 步不是一次读**（原文写的是"Retrieve / RetrieveIntoBatch"）。对 manifest 对象是 **1 次 root + N 次 chunk**；对 inline 对象才是 1 次。而且 root 读在 64 个槽上逐个探测，miss 是正常控制流（[backend.cpp:147-184](../Mooncake/mooncake-store/src/nvme_kv/backend.cpp#L147)）。
+5. **第 5 步不是"给一个副本入队"**。`PutEnd` 对**每个** completed MEMORY 副本调 `PushOffloadingQueue`；`inc_refcnt` 只发生在**第一个成功入队**的源副本上，任务标记里记下全部 `mirror_clients`（[master_service.cpp:5792-5810](../Mooncake/mooncake-store/src/master_service.cpp#L5792)、[9161-9246](../Mooncake/mooncake-store/src/master_service.cpp#L9161)）。入队本身是**尽力而为**：owner 未 serving、未挂 LOCAL_DISK、队列满都会失败，`PutEnd` 静默忽略，`Put` 仍成功。入队还有三个门：`replica_type != DFS`、`enable_offload_`、`!offload_on_evict_`（[master_service.cpp:5785-5788](../Mooncake/mooncake-store/src/master_service.cpp#L5785)）；`offload_on_evict_ = true` 时改为淘汰路径入队（[10701-10735](../Mooncake/mooncake-store/src/master_service.cpp#L10701)）。
+6. **第 6 步"尚未落盘"只对 NVMe KV 成立**。若本次还分配并写成功了 `NoF_SSD` 副本，那份副本在 `PutEnd` 之前就已经同步写到 Nvme-oF SSD 上了；"尚未落盘"指的是还没有 `LOCAL_DISK` 副本。
+7. **第 9–11 步不是 FS 内部一步**。`BatchQuerySegmentSlices` 先发一次 `BatchQuery`（即 `BatchGetReplicaList`）到 master（[client_service.cpp:1259-1263](../Mooncake/mooncake-store/src/client_service.cpp#L1259)、[file_storage.cpp:1050](../Mooncake/mooncake-store/src/file_storage.cpp#L1050)），再在本地取**第一个** `IsReplicaOnLocalMemory()` 为真的副本地址（[file_storage.cpp:1054-1069](../Mooncake/mooncake-store/src/file_storage.cpp#L1054)）。它是 best-effort：找不到本机内存副本的 key 直接进失败集合（[file_storage.cpp:399-411](../Mooncake/mooncake-store/src/file_storage.cpp#L399)）。"零拷贝"也只对 CPU 内存成立，GPU 指针在同一函数里 D2H 拷到 pinned buffer（[file_storage.cpp:426-453](../Mooncake/mooncake-store/src/file_storage.cpp#L426)）。
+8. **第 13 步必须区分"chunk 先、root 后"**，而不是笼统的"chunk/root"。大对象如果 chunk 写失败，root 根本不会写；批量快路径还只试 0 号槽，冲突才回落 `OffloadOne` 逐槽重试（[backend.cpp:746-755](../Mooncake/mooncake-store/src/nvme_kv/backend.cpp#L746)、[976](../Mooncake/mooncake-store/src/nvme_kv/backend.cpp#L976)）。
+9. **第 14 步比图上更早发生**。`NotifyOffloadSuccess` 是在 `BatchOffload` 内部的 `complete_handler` 里同步调用的（[file_storage.cpp:342-367](../Mooncake/mooncake-store/src/file_storage.cpp#L342)），而且**按 bucket 逐次**上报，不是整批一次；失败的 key 走同一个 RPC、`data_size = -1` 作 NACK（[file_storage.cpp:558-571](../Mooncake/mooncake-store/src/file_storage.cpp#L558)）。
+10. **第 15 步不是无条件 `AddReplica`**。只有存在 `offloading_task` 标记、LOCAL_DISK 段仍挂载、且对象**还没有** LOCAL_DISK 副本时才新增；已有副本时只就地更新同 client 的 `transport_endpoint / object_size`；NACK（`data_size < 0`）只 `dec_refcnt` + 清任务（[master_service.cpp:9003-9021](../Mooncake/mooncake-store/src/master_service.cpp#L9003)、[9046-9107](../Mooncake/mooncake-store/src/master_service.cpp#L9046)）。
+11. **第 17 步的描述符有三个字段**，图上原来只写了两个：`LocalDiskDescriptor{client_id, object_size, transport_endpoint}`（[replica.h:294](../Mooncake/mooncake-store/include/replica.h#L294)）。这里的 `transport_endpoint` 是 **owner 的 offload RPC 地址**（写入时由 FileStorage 改成 `local_rpc_addr_`，[file_storage.cpp:347-349](../Mooncake/mooncake-store/src/file_storage.cpp#L347)），不是 TE 地址；TE 地址在第 22 步的回包里。
+12. **第 17 步的 `lease_ttl_ms` 保护的不是 offload 数据**。它来自 `metadata.GrantReadLease(default_kv_lease_ttl_)`（[master_service.cpp:5006](../Mooncake/mooncake-store/src/master_service.cpp#L5006)），是**对象级**租约，用于防止 MEMORY 副本在读期间被淘汰；它不会阻止 master 用 `BatchEvictDiskReplica` 删掉 `LOCAL_DISK` 副本。offload 数据的租约是第 22 步回包里的 `gc_ttl_ms`（[rpc_types.h:313-330](../Mooncake/mooncake-store/include/rpc_types.h#L313)），而且它只是**读者侧**的截止时间：超过后判据在 [real_client.cpp:625-627](../Mooncake/mooncake-store/src/real_client.cpp#L625)，读完再检查、返回 `OBJECT_HAS_LEASE`（[9015-9016](../Mooncake/mooncake-store/src/real_client.cpp#L9015)）。
+13. **第 23 步只在跨进程时是 RDMA READ**。读者就是 owner 时走 `OffloadBufferAccess::kLocalAddress`，最终退化为本地 memcpy（[real_client.cpp:8997-9001](../Mooncake/mooncake-store/src/real_client.cpp#L8997)、[transfer_task.cpp:1625-1629](../Mooncake/mooncake-store/src/transfer_task.cpp#L1625)）。跨进程时它是一条 one-sided READ，但要注意 `TransferRequest` 的字段命名：`source` 是**读者本地的落点 slice**，`target_id / target_offset` 才指向 owner segment 的 `pointers[i] + offset`（[transfer_task.cpp:1681-1687](../Mooncake/mooncake-store/src/transfer_task.cpp#L1681)）；owner 进程不参与拷贝。
+14. **第 24 步不是显式调用**。释放由 `OffloadRestoreLease` 的析构函数完成（[real_client.cpp:600-607](../Mooncake/mooncake-store/src/real_client.cpp#L600)）；而且它是**带返回值的 RPC**（`invoke_rpc` 内部 `syncAwait`），只是调用点不检查结果。local batch 路径没有这个 RPC；读者异常退出时靠 `client_buffer_gc_ttl_ms` 到期的 GC 线程兜底（[file_storage.cpp:1202-1214](../Mooncake/mooncake-store/src/file_storage.cpp#L1202)）。
+
+##### 6.7.4.7 第 3 步为什么只有 MEMORY / NoF
+
+结论先说：**`PutStart` 返回的副本完全由 `AllocateReplicas` 决定，而这个函数没有任何分支会产生 `LOCAL_DISK`；`LOCAL_DISK` 只在落盘成功后被"登记"出来。**
+
+**（1）`AllocateReplicas` 的全部产出**
+
+[master_service.cpp:5140-5315](../Mooncake/mooncake-store/src/master_service.cpp#L5140) 只有四个分支：
+
+| 分支 | 条件 | 产物 |
+| --- | --- | --- |
+| MEMORY | `config.replica_num > 0` | `allocation_strategy_->Allocate(..., ReplicaType::MEMORY)`（[5197-5217](../Mooncake/mooncake-store/src/master_service.cpp#L5197)） |
+| NOF_SSD | **三个条件同时成立**：编译时 `-DUSE_NOF=ON`（默认 OFF，[CMakeLists.txt:38](../Mooncake/CMakeLists.txt#L38)）、`nof_replica_num > 0`、NoF segment 已挂载 | `Allocate(..., ReplicaType::NOF_SSD)`（[5215-5249](../Mooncake/mooncake-store/src/master_service.cpp#L5215)） |
+| legacy DISK | `use_disk_replica_`（只有 master 带 `--root_fs_dir` 时置位，[462-463](../Mooncake/mooncake-store/src/master_service.cpp#L462)；该参数默认空串） | `Replica(file_path, size, PROCESSING)`（[5292-5296](../Mooncake/mooncake-store/src/master_service.cpp#L5292)） |
+| DFS | `config.dfs_replica_num > 0`，且 master 的 `enable_dfs_` 与 `dfs_allocator_` 已初始化（否则 `DFS_SERVICE_UNAVAILABLE`） | `dfs_allocator_->Allocate(key, size)`（[5297-5315](../Mooncake/mooncake-store/src/master_service.cpp#L5297)） |
+
+**没有第五个分支。** `LOCAL_DISK` 不会被 `PutStart` 分配。分配出的副本状态统一是 `PROCESSING`（[replica_allocator.cpp:189](../Mooncake/mooncake-store/src/placement/replica_allocator.cpp#L189)、[201](../Mooncake/mooncake-store/src/placement/replica_allocator.cpp#L201)）。
+
+**（2）默认配置下就是 1 个 MEMORY**
+
+`ReplicateConfig` 的默认值是 `replica_num = 1`、`nof_replica_num = 0`、`dfs_replica_num = 0`（[replica.h:110-112](../Mooncake/mooncake-store/include/replica.h#L110)）。所以在默认的 NVMe KV 部署里，第 3 步返回的列表恰好是**一个 MEMORY 描述符（PROCESSING）**。要出现第二个类型，必须显式改配置：
+
+- `NOF_SSD`：`USE_NOF` 构建 + `nof_replica_num > 0` + 有 NoF segment 挂载；
+- `DFS`：`dfs_replica_num = 1`（上限就是 1）+ master 开启 DFS；
+- `DISK`：master 配了 `--root_fs_dir`（与 offload 部署互斥）。
+
+另外一条容易忽略的短路：`PutStart` 返回 `OBJECT_ALREADY_EXISTS` 时，`Client::Put` **直接把它当成功返回**（[client_service.cpp:1993-1997](../Mooncake/mooncake-store/src/client_service.cpp#L1993)），根本不会拿到描述符列表 —— 所以第 3 步在幂等重复 Put 上不会发生。
+
+**（3）为什么设计成"不给写目标"**
+
+`PutStart` 的职责是回答一个问题：**"把数据写到哪里？"** 答案必须是客户端此刻能直接寻址的 buffer：
+
+- MEMORY / NOF_SSD 是 segment 分配器给的现成地址，客户端用 TE 直接写；
+- DFS 也是（master 分配共享文件区间，客户端 positional write）；
+- legacy DISK 也是（master 生成路径，客户端写共享盘）。
+
+而 `LOCAL_DISK` **不是写目标，是读结果**。NVMe KV 的数据布局（16 字节物理 key、chunk/manifest、槽位冲突处理）全部由 owner 的 `FileStorage` 在后端内部完成，客户端既没有设备写接口，也不该知道物理 key 怎么算。所以 `LOCAL_DISK` 只能等落盘成功后由 `NotifyOffloadSuccess` 登记：
+
+```cpp
+// master_service.cpp:9023-9025
+Replica replica(client_id, metadata.data_size,
+                metadata.transport_endpoint, ReplicaStatus::COMPLETE, record);
+```
+
+这个构造函数是 LOCAL_DISK 专用的（[replica.h:321-325](../Mooncake/mooncake-store/include/replica.h#L321)），`transport_endpoint` 就是 owner 的 RPC 地址，读请求据此找到代读进程。
+
+**（4）由此得到一条读图规则**
+
+> `PutStart` 的返回列表里出现 `LOCAL_DISK`，意味着 master 认为数据**已经在盘上**。
+
+当前实现里这不会发生在 Put 的同步路径上，只会发生在之后的 `BatchGetReplicaList`（[master_service.cpp:4905](../Mooncake/mooncake-store/src/master_service.cpp#L4905)）。Put 的完整顺序因此是：
+
+1. `PutStart` → 拿到 MEMORY/NoF 描述符；
+2. 客户端按类型分支写数据：MEMORY / NoF 走 `TransferWrite`（[client_service.cpp:2033-2046](../Mooncake/mooncake-store/src/client_service.cpp#L2033)），DISK 走 `PutToLocalFile`（[2018-2031](../Mooncake/mooncake-store/src/client_service.cpp#L2018)），DFS 走 `WriteDfsReplicas`（[2048-2068](../Mooncake/mooncake-store/src/client_service.cpp#L2048)）—— **`LOCAL_DISK` 没有写分支**，因为客户端没有它的写接口；
+3. `PutEnd(ALL)` → 副本置 COMPLETE，并触发 offload 入队。`ALL` 在 `is_target_replica` 里展开为 memory | nof | dfs（[master_service.cpp:5683-5688](../Mooncake/mooncake-store/src/master_service.cpp#L5683)），所以 DFS 副本也在这一步置 COMPLETE —— 这与 NVMe KV 的"写内存完成即 PutEnd、落盘另算"是同一条 RPC 的两种语义。
+
+这也解释了 6.7.3 第 6 步的"Put 返回但尚未落盘"：`Put` 的同步语义只覆盖到 MEMORY/NoF 的传输完成，不覆盖后端写入。
+
+#### 6.7.5 DFS 类图
 
 ```mermaid
 classDiagram
@@ -2158,7 +2601,7 @@ classDiagram
 | `FileSystemAdapter` 及实现 | [fs_adapter.h:34](../Mooncake/mooncake-store/include/storage/distributed/fs_adapter.h#L34)、[posix_fs_adapter.h:7](../Mooncake/mooncake-store/include/storage/distributed/posix_fs_adapter.h#L7)、[hf3fs_adapter.h:13](../Mooncake/mooncake-store/include/storage/distributed/hf3fs_adapter.h#L13) |
 | `Client` 侧 | `SetDfsStorageBackend` [client_service.cpp:4275](../Mooncake/mooncake-store/src/client_service.cpp#L4275)；`WriteDfsReplicas` [2884](../Mooncake/mooncake-store/src/client_service.cpp#L2884)；`ReadDfsReplica` [5046](../Mooncake/mooncake-store/src/client_service.cpp#L5046) |
 
-#### 6.7.5 DFS 全链路时序
+#### 6.7.6 DFS 全链路时序
 
 ```mermaid
 sequenceDiagram
@@ -2204,11 +2647,11 @@ sequenceDiagram
 | 读：`Client::Get` → `ReadDfsReplica` | [client_service.cpp:1382-1405](../Mooncake/mooncake-store/src/client_service.cpp#L1382)、[5046-5075](../Mooncake/mooncake-store/src/client_service.cpp#L5046) |
 | 选副本 | [replica_selection.h:122-175](../Mooncake/mooncake-store/include/replica_selection.h#L122) |
 
-#### 6.7.6 DFS 代码导读
+#### 6.7.7 DFS 代码导读
 
-上面两张图给的是"形状"。这一节按 **接口面 → 控制面 → 分配器 → 写路径 → 读路径 → 适配层 → 失败语义** 的顺序往下走，把 6.7.4 里每个节点落到具体函数，并标出图上看不见的分支。
+上面两张图给的是"形状"。这一节按 **接口面 → 控制面 → 分配器 → 写路径 → 读路径 → 适配层 → 失败语义** 的顺序往下走，把 6.7.5 里每个节点落到具体函数，并标出图上看不见的分支。
 
-##### 6.7.6.1 对外暴露了什么：四条互不相通的通道
+##### 6.7.7.1 对外暴露了什么：四条互不相通的通道
 
 先给结论：**DFS 没有自己的公开 API**。应用只碰得到一个字段，装配只靠环境变量，真正的数据面接口只在 C++ 库内部可见。
 
@@ -2252,7 +2695,7 @@ if (auto distributed_backend =
 - `Client::SetDfsStorageBackend` 是 **public**，但只对 C++ 可见（RealClient/PyClient 上没有对应方法）。它不只是赋值：还会 `EnsureStorageControlPlaneStarted()`，顺手拉起 storage heartbeat 与 task poll 线程（[client_service.cpp:4275-4279](../Mooncake/mooncake-store/src/client_service.cpp#L4275)）。而 `WriteDfsReplicas` / `ReadDfsReplica` 是 **private**（[client_service.h:924](../Mooncake/mooncake-store/include/client_service.h#L924)、[999](../Mooncake/mooncake-store/include/client_service.h#L999)）。
 - `DfsAllocatorInterface` 是 master 唯一依赖的分配抽象：`Allocate / BatchAllocate / Free / UpdateAccess / GetUsedBytes / GetTotalCapacity / GetFileCount / IsEvictionEnabled / GetEvictionCheckInterval`（[dfs_allocator_interface.h:56-78](../Mooncake/mooncake-store/include/storage/distributed/dfs_allocator_interface.h#L56)）。**`BatchAllocate` 在生产路径没有调用者**，只在测试里出现；`PutStart` 是逐 key 调 `Allocate`。
 - `DistributedStorageBackend::BatchWrite/BatchRead` **不是** `StorageBackendInterface` 的 override，而是 DFS 专有的 public 方法（[distributed_storage_backend.h:74-78](../Mooncake/mooncake-store/include/storage/distributed/distributed_storage_backend.h#L74)）。原因是接口里的 `BatchLoad` 是 key 语义，无法定位分片；DFS 必须由调用方携带 descriptor。
-- `FileSystemAdapter` 的方法分五组，见 6.7.6.6。
+- `FileSystemAdapter` 的方法分五组，见 6.7.7.6。
 
 **（4）运维通道：只有 shard 模式有扩容口**
 
@@ -2265,7 +2708,7 @@ if (auto distributed_backend =
 3. **C ABI 缺字段**。`mooncake_replicate_config` 只有 `replica_num / with_hard_pin / preferred_segments / soft_pin_*`（[store_c.h:39-54](../Mooncake/mooncake-store/include/store_c.h#L39)），C 用户无法请求 DFS。
 4. **能写不等于能读**。读 DFS 需要本进程也挂了 backend；否则 `ReadDfsReplica` 直接返回 `DFS_SERVICE_UNAVAILABLE`（[client_service.cpp:5052-5059](../Mooncake/mooncake-store/src/client_service.cpp#L5052)）。
 
-##### 6.7.6.2 控制面：master 只是"记账"，不碰数据
+##### 6.7.7.2 控制面：master 只是"记账"，不碰数据
 
 `MasterService` 对 DFS 的全部职责是：启动时建 allocator、写时分配区间、完成时改副本状态、删除时归还区间、容量高时淘汰。它从不打开 shard 文件，也不校验客户端是否真的写了。
 
@@ -2347,7 +2790,7 @@ replicas.emplace_back(std::move(*alloc), ReplicaStatus::PROCESSING);
 
 分配失败时还有一条**现场**回收路径：`AdmitWithDfsRecovery` 在 `dfs_bucket_recovery_mutex_` 下重跑 admit，仍失败就 `force_one` 强制删一个通过校验的桶（[master_service.cpp:5562-5587](../Mooncake/mooncake-store/src/master_service.cpp#L5562)）。它只对 bucket 模式生效，shard 模式只能等后台水位驱逐。
 
-##### 6.7.6.3 两个 allocator：可复用区间 vs append-only 桶
+##### 6.7.7.3 两个 allocator：可复用区间 vs append-only 桶
 
 同一个 `DfsAllocatorInterface`，两种完全不同的空间模型。
 
@@ -2383,7 +2826,7 @@ replicas.emplace_back(std::move(*alloc), ReplicaStatus::PROCESSING);
 | 扩容 | `ExpandShards` 在线可扩 | 无（受 `max_bucket_count` 约束） |
 | 单对象上限 | `shard_capacity` | `bucket_capacity` |
 
-##### 6.7.6.4 写路径：DFS 排在内存之后，且是同步的
+##### 6.7.7.4 写路径：DFS 排在内存之后，且是同步的
 
 **（1）`Client::Put` 的真实顺序**
 
@@ -2454,7 +2897,7 @@ batch_io ? 收集后批量执行 : 立即 ExecuteSingleIo
 - **`PutEnd` 自身失败时不会再 revoke**（[2092-2100](../Mooncake/mooncake-store/src/client_service.cpp#L2092)），副本留在 PROCESSING，只能等 master 的 `put_start_discard_timeout`。
 - **客户端从不 Free**。它只发 `PutRevoke`，区间由 master 的 `FreeDfsReplicas` 归还。
 
-##### 6.7.6.5 读路径：选副本发生在 RealClient，不在 Client
+##### 6.7.7.5 读路径：选副本发生在 RealClient，不在 Client
 
 **（1）两层选副本，别混**
 
@@ -2498,7 +2941,7 @@ RealClient 层的"DFS 部分读"是有的，但实现是**整对象读进临时 
 
 master 侧的回收只由容量/LRU 驱动，与客户端读失败没有因果关系。
 
-##### 6.7.6.6 适配层：两个能力开关决定四种执行形状
+##### 6.7.7.6 适配层：两个能力开关决定四种执行形状
 
 `FileSystemAdapter` 的方法分五组，读代码时先认清哪组是"必须实现"、哪组是"可选钩子"：
 
@@ -2536,7 +2979,7 @@ master 侧的回收只由容量/LRU 驱动，与客户端读失败没有因果�
 
 实现 6 个纯虚 + 至少 `OpenFile/OpenExistingFile/CloseFile/PreallocateFile/WriteAt/ReadAt`，按需覆盖两个能力标志；再改四处：config 白名单（[distributed_storage_config.cpp:43-48](../Mooncake/mooncake-store/src/config/distributed_storage_config.cpp#L43)）、三个工厂点（[storage_backend.cpp:5622](../Mooncake/mooncake-store/src/storage_backend.cpp#L5622)、[shard_allocator.cpp:69](../Mooncake/mooncake-store/src/storage/distributed/shard_allocator.cpp#L69)、[immutable_bucket_allocator.cpp:82](../Mooncake/mooncake-store/src/storage/distributed/immutable_bucket_allocator.cpp#L82)）。注意第三个工厂有 `else` 兜底，第二个**没有**——漏改会得到空指针解引用。
 
-##### 6.7.6.7 一串失败会走到哪
+##### 6.7.7.7 一串失败会走到哪
 
 | 阶段 | 错误 | 处理者 | 最终状态 |
 | --- | --- | --- | --- |
@@ -2554,7 +2997,7 @@ master 侧的回收只由容量/LRU 驱动，与客户端读失败没有因果�
 
 一句话：**DFS 的失败处理是"各段自扫门前雪"**，没有跨阶段的补偿事务。能自愈的只有 POSIX 的 reopen 一次和 bucket 的续传/删桶重试。
 
-##### 6.7.6.8 与 6.7.4 / 6.7.5 两图不符的地方
+##### 6.7.7.8 与 6.7.5 / 6.7.6 两图不符的地方
 
 读代码后需要修正的几处，按重要性排：
 
@@ -2562,14 +3005,18 @@ master 侧的回收只由容量/LRU 驱动，与客户端读失败没有因果�
 2. **`ReadDfsReplica` 只服务单 key**（唯一调用点 [client_service.cpp:1403](../Mooncake/mooncake-store/src/client_service.cpp#L1403)）。`BatchGet` 不走它，而是攒批后直接 `BatchRead`。时序图的"读"分支要画成两条。
 3. **`BatchAllocate` 在生产路径没有调用者**。`PutStart` 每 key 调一次 `Allocate`，即使 `BatchPutStart` 也是逐 key 转 `PutStart`（[rpc_service.cpp:561-568](../Mooncake/mooncake-store/src/rpc_service.cpp#L561)）。时序图若画成"批量分配"要改。
 4. **`DistributedStorageBackend::BatchWrite/BatchRead` 不是接口 override**，而是 DFS 专有的 public 方法；`StorageBackendInterface::BatchLoad` 是 key 语义，无法定位分片。
-5. **`Put` 时序漏了 DISK**。真实顺序是 `DISK（异步）→ MEMORY/NOF → DFS → PutEnd`，且 DISK 早于内存写、完成于异步线程。
+5. **`Put` 时序漏了 DISK**。真实顺序是 `DISK（异步）→ MEMORY/NOF → DFS → PutEnd`，且 DISK 早于内存写、完成于异步线程。两个限定：DISK 只在 master 配了 `--root_fs_dir`（`use_disk_replica_`）时才被分配；`NoF` 默认 `nof_replica_num=0`，默认配置下这一步实际只写一个 MEMORY 副本。
 6. **`VerifyObjectChecksum` 默认为空操作**，需要 `MOONCAKE_STORE_CHECKSUM=true` 才是必经步骤。
 7. **`transfer_task.cpp:1929` 拒绝的是 NoF，不是 DFS**。DFS 在 `submitRangeRead` 里没有分支，静默落 `nullopt`；显式拒绝在 [client_service.cpp:1470-1474](../Mooncake/mooncake-store/src/client_service.cpp#L1470)。
-8. **类图把两个方法的可见性画反了**：`WriteDfsReplicas` 与 `ReadDfsReplica` 都在 `private:` 区（[client_service.h:874](../Mooncake/mooncake-store/include/client_service.h#L874) 起），只有 `SetDfsStorageBackend` 是 public（[650](../Mooncake/mooncake-store/include/client_service.h#L650)）。外部能注入 backend，但不能直接调这两个方法。
+8. **类图把 `+ReadDfsReplica()` 画成了 public**：它声明在 `private:` 区（[client_service.h:874](../Mooncake/mooncake-store/include/client_service.h#L874) 起，声明在 [924](../Mooncake/mooncake-store/include/client_service.h#L924)）。同一节点里的 `-WriteDfsReplicas()`（[999](../Mooncake/mooncake-store/include/client_service.h#L999)）和 `+SetDfsStorageBackend()`（[650](../Mooncake/mooncake-store/include/client_service.h#L650)）符号是对的。外部能注入 backend，但不能直接调这两个读写方法。
+9. **`Client ..> MasterService` 这条依赖画得过于直接**：`Client` 并不持有 `MasterService`，它持有一个 RPC 存根 `MasterClient master_client_`（[client_service.h:1020](../Mooncake/mooncake-store/include/client_service.h#L1020)），经 coro_rpc 打到 `WrappedMasterService`。标签里的 "Query" 在 master 侧实际是 `GetReplicaList`（[client_service.cpp:1244](../Mooncake/mooncake-store/src/client_service.cpp#L1244)）。建议改成 `Client ..> MasterClient : PutStart / GetReplicaList`。
+10. **描述符字段名与真实结构不符**：图写 `{path, offset, size, shard_idx}`，真实是 `{file_path, offset, object_size, aligned_size, shard_idx}`（[replica.h:264-271](../Mooncake/mooncake-store/include/replica.h#L264)）。`size` 混淆了 `object_size`（用户字节数，写侧校验 `sum(slices)==object_size`）与 `aligned_size`（分配/回收粒度），两者不能合并。
+11. **时序图缺"非 DFS 传输成功才写 DFS"的门禁**。`WriteDfsReplicas` 的前置条件是 `allocated_dfs_replicas > 0 && NonDfsTransfersSucceeded(...)`（[client_service.cpp:2048-2049](../Mooncake/mooncake-store/src/client_service.cpp#L2048)）；任一 memory/NoF 写失败，DFS 写会被整体跳过并只记 `dfs_writes_skipped`，随后走 `PutRevoke(ALL)`。
+12. **时序图 `M->>M: DFS 副本 → COMPLETE` 缺 bucket 模式的预提交**。`allocator_type=bucket` 时 `PutEnd` 必须先对每个仍 PROCESSING 的 DFS 描述符调 `MarkCommitted`（PENDING→COMMITTED），失败直接返回 `FILE_WRITE_FAIL` 且不回滚；之后才 `mark_complete` + `UpdateAccess`（[master_service.cpp:5725-5763](../Mooncake/mooncake-store/src/master_service.cpp#L5725)）。
 
-（第 7 条同时修正 6.7.7 结论第 4 条的引用。）
+（第 7 条同时修正 6.7.8 结论第 4 条的引用。）
 
-##### 6.7.6.9 部署前必查：客户端与 master 的配置一致性
+##### 6.7.7.9 部署前必查：客户端与 master 的配置一致性
 
 DFS 的 descriptor 里**没有布局模式字段**，客户端完全用本地环境变量判断 bucket/shard、用本地容量做校验。所以下面几项必须逐项一致，否则表现是"合法 descriptor 在本地被判 `INVALID_PARAMS`"，错误信息不会提示"配置不一致"：
 
@@ -2583,7 +3030,7 @@ DFS 的 descriptor 里**没有布局模式字段**，客户端完全用本地环
 
 另外两条部署事实：环境变量解析非法值时只打 warning 用默认值（[environ.h:79-97](../Mooncake/mooncake-common/src/environ.h#L79)），所以"写错了也能启动"；未挂载共享文件系统时，`Init` 的 `create_directories` 可能先在本地盘建出同名目录，把故障推迟到首次读。
 
-#### 6.7.7 由流程导出的几条结论
+#### 6.7.8 由流程导出的几条结论
 
 1. **`LOCAL_DISK` 是"归属语义"，`DFS` 是"位置语义"**。前者说"这条副本由某个 Client 代读"，后者说"数据在共享文件的这一段，谁都能读"。
 2. **DFS 省掉了两跳**：owner 进程和 TE 搬运。代价是所有参与者必须挂载同一共享文件系统，且 master 的 allocator 状态不可恢复（与 snapshot/oplog 互斥）。
@@ -2832,5 +3279,5 @@ start client_buffer_gc_thread_
 11. 两阶段淘汰时序（5.1）
 12. NVMe KV 类图（6.7.2）
 13. NVMe KV 全链路时序（6.7.3）
-14. DFS 类图（6.7.4）
-15. DFS 全链路时序（6.7.5）
+14. DFS 类图（6.7.5）
+15. DFS 全链路时序（6.7.6）
