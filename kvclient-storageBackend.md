@@ -40,7 +40,7 @@ Mooncake 的 KV client 通过 `StorageBackendInterface` 把 KV cache 对象下�
 | `NvmeKvStorageBackend` | 本地 NVMe-KV 设备 | 无（`ScanMeta` 为空实现） |
 | `KVClientStorageBackend`（本文） | ASU（直接调用 `kv::KvClient`） | **本版不实现恢复**（`ScanMeta` 返回空） |
 
-### 1.2 本版范围
+### 1.2 本版范围  **(todo：删除的逻辑需要再确认)**
 
 **实现**：
 
@@ -61,11 +61,10 @@ Mooncake 的 KV client 通过 `StorageBackendInterface` 把 KV cache 对象下�
 | `ResetScanIterator` | 空实现 |
 | `SetTestFailurePredicate` | 保留，用于部分成功测试 |
 
-**明确不在本版**：恢复 manifest、`ScanMeta` 枚举、ASU GC 对接、chunk 分片、多副本、
-压缩/加密/TTL、零拷贝、批量查询、按 key 的公共 `BatchRemove`（v1.1）。
 
 
-### 1.3 实现注意事项（语义不统一点）
+
+### 1.3 实现注意事项（语义不统一点）**(todo：每一条都要认真确认)**
 
 | 关注点 | Mooncake 侧语义 | KvClient 侧语义（不统一点） | 直接照搬的后果 | 实现处理 |
 | --- | --- | --- | --- | --- |
@@ -99,14 +98,7 @@ Mooncake 的 KV client 通过 `StorageBackendInterface` 把 KV cache 对象下�
 | ASU 节点 | 进程外 | 持久化 KV，拥有自身容量/GC 策略 |
 | Master | 控制面进程 | 逻辑对象与 `LOCAL_DISK` replica 元数据的权威 |
 
-关键边界：
 
-1. Master 仍是逻辑对象存在性和 replica 路由的权威；ASU 只是 payload 的持久化介质。
-2. `KVClientStorageBackend` 不直接访问 Master；写完成后通过 `complete_handler`、淘汰时通过
-   `eviction_handler` 由 `FileStorage` 通知 Master。
-3. 每个客户端实例有一个稳定命名空间；它参与 ASU key 哈希。
-4. 本版实现删除/淘汰；不做恢复（`ScanMeta` 空实现）；本进程重启后 `RemoveAll` 只能删除索引中
-   已知的 key。
 
 ### 2.2 系统上下文图
 
@@ -190,7 +182,7 @@ flowchart TB
 | 重启/重注册 | `FileStorage::Init` → `ScanMeta` | 空实现，直接返回 |
 | UCM KvClient worker | `KvClientImpl::WorkerLoop` | 提交 task、等待完成；不回调 Mooncake |
 
-锁纪律：
+锁纪律：**(todo：为什么这样设计锁，能讲明白原因？）**
 
 1. `write_mutex_`：串行化 `BatchOffload`、`EvictAboveDiskWatermark`、`RemoveAll` 和 `Init`；
    保护跨 key 的原子序列和 `complete_handler`/`eviction_handler` 的顺序。
@@ -217,34 +209,10 @@ stateDiagram-v2
 
 **状态机说明**
 
-这张图描述的是 **backend 本地索引/删除簿记** 中单个 key 的生命周期，不是 ASU 的全局状态，
-也不是 Master 的 `LOCAL_DISK` replica 状态。backend 的索引是内存态，不是持久化元数据。
-
-| 状态 | 含义 | 读行为 | 淘汰候选 |
-| --- | --- | --- | --- |
-| `Absent` | 本地索引没有该 key：从未写过、已删除、或进程重启后未加载 | 若 Master 仍路由且 ASU 有数据，`BatchLoad` 仍可读（以 `slice.size` 为准）；`IsExist` 直接查 ASU | 否 |
-| `Stored` | ASU `StoreAsync` 成功且 `Wait` OK，但索引尚未提交（瞬时态） | 正常不会有读：`complete_handler` 还没通知 Master | 否 |
-| `Indexed` | 索引有条目（`payload_size`/`transfer_size`/`fifo_seq`），正常可读 | 正常读/查 | 是 |
-| `Deleting` | 淘汰/`RemoveAll` 已选中，已从淘汰候选移出，等待 `DeleteAsync` | 可能读到删除前的旧值，或 `OBJECT_NOT_FOUND`；不得半对象 | 否 |
-
-转换含义：
-
-- `Absent → Stored`：ASU 写入成功。
-- `Stored → Indexed`：提交本地索引；之后 `complete_handler` 通知 Master。
-- `Indexed → Indexed`：覆盖写；更新 `payload_size`、计数按 delta 调整。
-- `Indexed → Deleting`：仅发生在 `eviction_handler` 成功之后（master-first）；handler 为空或
-  失败时保持 `Indexed`，零删除。
-- `Deleting → Absent`：`DeleteAsync` 成功或 key 不存在；扣减计数。
-- `Deleting → Indexed`：`DeleteAsync` 失败；恢复索引，保留 FIFO 重试位置。
-- `Indexed → Absent`：ASU 侧被外部 GC/删除，`IsExist` 或读探测到 `NOT_FOUND`；清理索引。
-
-两个容易误解的点：
-
-1. **`Indexed` 不代表 ASU 一定有数据**：ASU 自己可能 GC；读/查遇到 `NOT_FOUND` 会回到 `Absent`。
-2. **`Absent` 不代表 ASU 一定没有数据**：进程重启后本地索引为空，所有 key 都从 `Absent` 开始；
-   只要 Master 仍路由、ASU 仍有数据，读仍能成功。`RemoveAll` 在重启后也只能删除索引已知的 key。
+这张图描述的是 **backend 本地索引/删除簿记** 中单个 key 的生命周期。
 
 ### 2.6 副本 / 元数据 / 句柄：三层关系
+**（todo：需要进一步了解三者的意义）**
 
 这张图把 Mooncake 读路径上的三种投影画在一起，用来定位 `KVClientStorageBackend` 在链路中的确切位置：
 **副本**回答"数据在哪里"，**元数据**回答"对象有哪些副本、多大、校验值是多少"，**句柄**回答"本进程怎么引用、何时释放"。
@@ -333,8 +301,7 @@ flowchart TB
 | F7 | staging 内存 | `StagingArena` | P0 | 注册、slot 分配、生命周期 |
 | F8 | 可观测性 | 日志 / `SsdMetric` | P1 | 复用现有指标 |
 | F9 | 空实现 | `ScanMeta` / `ResetScanIterator` | P0 | 返回 OK / 空操作 |
-| F10 | 恢复 manifest | — | 不在本版 | 后续设计 |
-| F11 | 分片/零拷贝 | — | 不在本版 | 后续设计 |
+
 
 ### 3.2 `StorageBackendInterface` 契约（本版）
 
@@ -504,6 +471,8 @@ per-value checksum；transport 校验不覆盖 at-rest 数据。因此本后端�
 `KVC1` 记录格式校验。
 
 ### 3.7 配置契约
+
+**（这里的配置应该明确为KVClientStorageBackendConfig）**
 
 ```cpp
 struct KVClientBackendConfig {
@@ -1213,7 +1182,7 @@ sequenceDiagram
 ### 5.1 分析方法
 
 - **范围**：写（`BatchOffload`）、读（`BatchLoad`）、查（`IsExist`），以及 Init、staging、配置、
-  错误映射、并发和删除/淘汰。恢复不在本版，因此不作为本版测试项，只在残余风险中列出。
+  错误映射、并发和删除/淘汰。
 - **FMEA 方法**：对每个功能列出失效模式、局部影响、系统影响、严重度、检测/缓解和对应测试。
   本版不计算 RPN，按严重度优先；发生概率和可检测性写在“检测/缓解”列。
 - **严重度定义**：
@@ -1342,12 +1311,7 @@ sequenceDiagram
 ### 5.5 覆盖结论与残余风险
 
 - S1/S2 失效模式都有对应测试；S3 覆盖配额、staging、覆盖写；S4 只做日志断言。
-- 残余风险：
-  - 恢复不在本版，没有对应测试；删除/淘汰已覆盖，但重启后 `RemoveAll` 只能删除索引中已知的 key。
-  - 真实 ASU 硬件/网络故障只在 Ascend runner 上验证；CI 的 FAKE provider 只覆盖协议语义。
-  - 64-bit key 碰撞通过注入验证，不做统计验证。
-  - CRC-32C 只检测偶然损坏，不防恶意篡改。
-  - 如果后续接入远程 KV 服务，需要为该服务单独做 SFMEA（网络分区、鉴权失败、服务端 GC）。
+
 
 ## 6. Mooncake 改动量
 
@@ -1390,8 +1354,7 @@ sequenceDiagram
 - **测试（15–23）**：约 **1,650–2,450 行**。
 - **文档（24–25）**：约 **250–400 行**。
 - **本版总计**：约 **4,300–6,350 行**，新增文件约 20 个，修改文件约 10 个。
-- **可延后项（26–27）**：约 **240–380 行**。
-- **后续版本（28）**：约 **10–60 行**。
+
 
 估算依据：
 
@@ -1412,43 +1375,9 @@ sequenceDiagram
 | P1 | 公共 `BatchRemove`/`BatchQueryStat`、性能基准 | 端到端压测通过 |
 | P2 | 恢复 manifest、零拷贝、大对象分片、按 key 公共 `BatchRemove` | 单独设计评审 |
 
-## 7. 后续工作（本版之外）
 
-1. **删除持久化**：关闭“Master 已删、重启后索引为空、残留对象不可发现”的窗口；需要 tombstone/
-   持久化索引，或 Master 按 client 枚举 `LOCAL_DISK` replica。
-2. **恢复**：ASU 无枚举，需要本地 manifest 或 Master 按 client 枚举 `LOCAL_DISK` replica 的
-   RPC；否则 Master 重启后对象不可重新注册。
-3. **零拷贝**：把 Mooncake `ClientBuffer` / local segment 通过 `RegisterRegions` 注册给 ASU，
-   `LoadAsync` 直接写入 `Slice`，省掉 staging 拷贝。
-4. **碰撞探测**：ASU key 从单 slot 扩展到 `key64 = XXH64(scoped_key || slot)` 的 2–4 个 slot。
-5. **大对象分片**：一个记录拆成多个 `KVBuffer`（同一 key、不同 `offset`），或拆成多个 key。
-6. **能力发现**：如果 UCM 后续在 `KvClient` 暴露 `ServerKvCapabilities`，用真实值替换配置值。
-7. **远程服务**：如果 ASU 侧提供 KV 服务，让服务客户端实现 `kv::KvClient`，backend 不变。
 
-## 附录 A：Rust `mooncake-store-rs` 映射
-
-如果目标改在 Rust cold tier，现有 trait `PersistentStorageBackend`
-（`mooncake-store-rs/crates/mooncake-store-client/src/client/cold_tier_storage_backend.rs`）已经
-提供写/读/查/删：
-
-| 本文操作 | Rust 方法 |
-| --- | --- |
-| 写 | `put_object` / `put_objects_batch` / `put_objects_batch_profiled` |
-| 读 | `get_object` / `get_object_into` / `get_objects_into_batch` |
-| 查 | `query_object_length`（本版可用 `IsExist` 语义，长度由调用方提供） |
-| 删 | `delete_object` / `delete_objects_batch` |
-
-Rust 侧实现不需要改 trait；改动集中在：
-
-- 新建 `mooncake-store-client/src/client/kv_client_backend.rs`；
-- 在 `cold_tier_backend_from_device_record` / `ColdTierBackendResolver` 中注册新 backend；
-- 如果目标是 ASU，需要扩展 `ColdTierTargetSpec` 或新增 target kind；
-- ASU 的 8 字节 key、异步 task、注册内存语义同样适用；
-- 测试沿用 `cold_tier_restore_tests.rs`、`isolation_test_harness.rs` 的 fixture。
-
-估算：Rust 版本新增约 1,200–1,800 行实现 + 700–1,000 行测试；trait 改动为 0。
-
-## 附录 B：术语
+## 附录 A：术语
 
 | 术语 | 含义 |
 | --- | --- |
@@ -1461,5 +1390,4 @@ Rust 侧实现不需要改 trait；改动集中在：
 | payload | 各 `Slice` 按序拼接后的对象数据，等于上报 Master 的 `data_size` |
 | transfer_size | `align_up(40 + payload_size, 512)`，ASU 实际传输长度 |
 | staging arena | backend 持有、向 ASU 注册的读写中转内存 |
-| 本版范围 | 写、读、查、删；恢复不在本版 |
 
