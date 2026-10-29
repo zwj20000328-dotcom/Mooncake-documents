@@ -148,7 +148,7 @@ flowchart TB
 2. **本地缓冲一次分配、长期驻留**。`client_buffer_allocator_` 由 `FileStorageConfig::local_buffer_size`（默认 1.2 GB）决定，构造时创建；`Init` 里以 `remote_accessible=true` 注册（[file_storage.cpp:1075-1090](../Mooncake/mooncake-store/src/file_storage.cpp#L1075)）。注释点明了原因：**远端要 RDMA READ 这块内存，必须有 rkey**，所以不能只做地址范围登记。
 3. **pinned restore arena 只服务同进程 GPU 读**。仅当 `use_uring=false`、本机 memcpy 可用（`CanUseLocalMemcpy(local endpoint)`）且 `pinned_restore_arena_size>0` 时才创建（[file_storage.cpp:56-77](../Mooncake/mooncake-store/src/file_storage.cpp#L56)）。它是 pinned host 内存，**不注册进 TE**，靠 memcpy/H2D 使用。
 4. **挂载 `LOCAL_DISK` segment**。`MountLocalDiskSegment` 要求 Master 侧 `--enable_offload=true`，否则返回 `UNABLE_OFFLOAD`（[master_service.cpp:8784-8828](../Mooncake/mooncake-store/src/master_service.cpp#L8784)）；成功后在 `LocalSsdManager` 里建一条 Client 记录，之后心跳才有地方挂任务。
-5. **启动时扫描恢复**。`ScanMeta` 遍历后端（Bucket 读 `.meta`、FilePerKey 递归扫目录、OSS/S3 发 LIST），对每批 key 调 `NotifyOffloadSuccess` 重新登记。**对支持扫描的后端，owner 重启后 Master 里丢掉的 `LOCAL_DISK` 记录能自动补回来**，应用无感。两个例外：OffsetAllocator 启动时截断数据文件，旧对象不可恢复；NVMe KV 的 `ScanMeta` 目前是空实现（[backend.cpp:1516-1525](../Mooncake/mooncake-store/src/nvme_kv/backend.cpp#L1516)），重启后不会自动补登记。
+5. **启动时扫描恢复**。`ScanMeta` 遍历后端（Bucket 读 `.meta`、FilePerKey 递归扫目录、OSS/S3 发 LIST），对每批 key 调 `NotifyOffloadSuccess` 重新登记。**对支持扫描的后端，owner 重启后 Master 里丢掉的 `LOCAL_DISK` 记录能自动补回来**，应用无感。两个例外：OffsetAllocator 默认（`persist_mode=kDisabled`）启动时截断数据文件、旧对象不可恢复，开启持久化后可从 `kv_cache.meta` 恢复（见 6.9）；NVMe KV 的 `ScanMeta` 目前是空实现（[backend.cpp:1516-1525](../Mooncake/mooncake-store/src/nvme_kv/backend.cpp#L1516)），重启后不会自动补登记。
 6. **`enable_dfs` 分流**。构造时若 backend 是 `DistributedStorageBackend` 且用的是文件系统 adapter（posix/hf3fs），`config_.enable_dfs=true` 并把自己交给 `Client::SetDfsStorageBackend`（[file_storage.cpp:86-93](../Mooncake/mooncake-store/src/file_storage.cpp#L86)）。此时 FileStorage 不挂盘、不跑 offload 心跳 —— DFS 副本由请求端在 `Put`/`Get` 时直接读写共享文件系统，是另一条路径。
 
 #### 2.2.1 RealClient 侧装配（图的上半部分）
@@ -1900,7 +1900,7 @@ eviction_handler(pending.keys) → CommitPreparedEviction → FinalizeEviction; 
 | 写路径 | iovec 直写 + datasync | 序列化 KVEntry + 写文件 | 记录头 + value 写偏移 | NVMe KV Store（store-if-not-exists） | HTTP PUT（并发） |
 | 读路径 | 按 bucket 分组批量 pread/io_uring | 读文件 + 反序列化 + memcpy | 读 header + value | Retrieve（可直读目标 buffer）+ 校验 | HTTP GET（并发，直接写入目标 buffer） |
 | 容量淘汰 | FIFO/LRU + 逻辑/物理上限 + 水位 | FIFO 队列 + 水位 | 有淘汰框架（水位 no-op） | 无（设备/上层负责） | 无 |
-| 重启恢复 | `ScanMeta` 读 `.meta` | `ScanMeta` 递归扫目录 | 截断重来（不可恢复） | `ScanMeta` 当前为空实现，不自动恢复 | `ScanMeta` LIST 对象 |
+| 重启恢复 | `ScanMeta` 读 `.meta` | `ScanMeta` 递归扫目录 | 默认 `kDisabled` 时截断重来；开启持久化后由 `Init` 从 `kv_cache.meta` 恢复（见 6.9） | `ScanMeta` 当前为空实现，不自动恢复 | `ScanMeta` LIST 对象 |
 | 单设备/单路径约束 | 一个 `storage_path` 只允许一个活 Client（flock） | 同左 | 同左 | 当前面向单个本地设备 | 每 owner 独立 prefix |
 
 ### 6.2 BucketStorageBackend
@@ -3056,7 +3056,7 @@ if (auto distributed_backend =
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | 1 | `bucket_storage_backend`（默认） | `BucketStorageBackend` | `LOCAL_DISK` | owner 心跳 `BatchOffload`，异步 | owner offload RPC 代读 | `LocalDiskDescriptor{client_id, object_size, transport_endpoint}`（[replica.h:294](../Mooncake/mooncake-store/include/replica.h#L294)） | 一个 `storage_path` 只允许一个活 Client（flock） |
 | 2 | `file_per_key_storage_backend` | `StorageBackendAdaptor` | `LOCAL_DISK` | 同上 | 同上 | 同上 | 一 key 一文件，读时整文件读入内存再拷贝 |
-| 3 | `offset_allocator_storage_backend` | `OffsetAllocatorStorageBackend` | `LOCAL_DISK` | 同上 | 同上 | 同上 | 单文件 + 区间分配；重启截断，旧对象不可恢复 |
+| 3 | `offset_allocator_storage_backend` | `OffsetAllocatorStorageBackend` | `LOCAL_DISK` | 同上 | 同上 | 同上 | 单文件 + 区间分配；默认 `kDisabled` 时重启截断，开启持久化后可从 `kv_cache.meta` 恢复（见 6.9） |
 | 4 | `nvme_kv_storage_backend` | `NvmeKvStorageBackend` | `LOCAL_DISK` | 同上（设备侧 `Store`/`StoreBatch`） | 同上 | 同上 | 物理 key 16 字节；`ScanMeta` 当前为空实现，重启不自动恢复 |
 | 5 | `distributed_storage_backend` + `MOONCAKE_DFS_FS_ADAPTER=oss`/`s3` | `DistributedStorageBackend`（`kObjectStorage`） | `LOCAL_DISK` | 同上（adapter HTTP PUT） | 同上（owner 读回暂存区） | 同上 | 底层是对象存储，但**仍登记为 LOCAL_DISK** |
 | 6 | `distributed_storage_backend` + `MOONCAKE_DFS_FS_ADAPTER=posix`/`hf3fs` | `DistributedStorageBackend`（`kFileSystem`） | **`DFS`** | 请求端 `Client::WriteDfsReplicas`，`Put` 内**同步**（[client_service.cpp:2884](../Mooncake/mooncake-store/src/client_service.cpp#L2884)） | 任意挂载同一共享文件系统的 Client（`ReadDfsReplica`，[client_service.cpp:5046](../Mooncake/mooncake-store/src/client_service.cpp#L5046)） | `DistributedFSDescriptor{file_path, offset, object_size, aligned_size, shard_idx}`（[replica.h:264](../Mooncake/mooncake-store/include/replica.h#L264)） | 不挂 `LOCAL_DISK` segment、不跑 offload 心跳；空闲区间由 master 的 `DfsAllocatorInterface` 分配 |
@@ -3069,6 +3069,94 @@ if (auto distributed_backend =
 - **第 6 行的 `PutEnd` 语义**：`PutStart` 时 master 就返回 `PROCESSING` 的 DFS 描述符；客户端写完共享文件后才 `PutEnd(ALL)`，而 `ALL` 包含 DFS（[master_service.cpp:5683-5688](../Mooncake/mooncake-store/src/master_service.cpp#L5683)），副本此时才变 `COMPLETE`。
 - **第 7 行不是 `StorageBackendInterface` 实现**：它由 master 启动参数 `--root_fs_dir` 打开（[master_service.cpp:462-472](../Mooncake/mooncake-store/src/master_service.cpp#L462)），路径在 `PutStart` 时生成（[master_service.cpp:5293-5297](../Mooncake/mooncake-store/src/master_service.cpp#L5293)）。列在这里是为了和 `LOCAL_DISK` 区分：`LOCAL_DISK` 是 owner 代读，`DISK` 是谁都能直接读共享文件。
 - `MEMORY` 和 `NOF_SSD` **不来自这些后端**：它们由 segment 分配器（DRAM / NVMe-oF segment）产生，与本表无关。
+
+### 6.9 五套 `ScanMeta` 实现对照
+
+`ScanMeta` 是唯一能把"盘上已有对象"告知 Master 的接口。调用点只有两个：`FileStorage::Init`
+（见 2.2.2）与 `SEGMENT_NOT_FOUND` 后的后台重扫（见 3.2.2 / 3.2.3）；稳态运行期不扫描。
+五套实现的能力差异很大，下表是对照，逐行代码注解见附录 C。
+
+| 后端 | 数据来源 | 遍历方式 | 分批 | `ResetScanIterator` | 真实恢复能力 |
+| --- | --- | --- | --- | --- | --- |
+| `StorageBackendAdaptor`（file-per-key） | 磁盘目录 + 文件内容 | 三层 `directory_iterator`，逐文件全量读 + protobuf 反解 | `scanmeta_iterator_keys_limit` + 每个叶子目录强制 flush | 默认 no-op（每次全扫） | 完整 |
+| `BucketStorageBackend` | 内存 `buckets_`（`Init` 时由 `*.meta` 重建） | `next_bucket_` 游标，整桶原子拷贝 | 跨 bucket 累计到 limit，单桶超限直接报错 | `next_bucket_ = -1` | 完整（元数据在 `Init` 里加载） |
+| `OffsetAllocatorStorageBackend` | 内存 shard map | 遍历 `shards_[i].map`（`kNumShards = 1024`） | 到 limit 即 flush | 默认 no-op | 取决于 `persist_mode`；默认 `kDisabled` 时为空 |
+| `DistributedStorageBackend` | 对象存储 LIST | `ListKeys()` 内部翻页，再分批回调 | `scanmeta_iterator_keys_limit` | 默认 no-op | 仅对象存储；posix/hf3fs 返回 `NOT_SUPPORTED` |
+| `NvmeKvStorageBackend` | 无 | 无 | — | 默认 no-op | 无 |
+
+**五套实现完全一致的部分**（改后端时不用改的部分）：
+
+- 回调契约相同：`handler(keys, metadatas)` 返回 `OK` 继续、非 `OK` 立即中止；`metadatas[i]`
+  与 `keys[i]` 下标一一对应。
+- 后端一律填 `transport_endpoint = ""`，由 `FileStorage` 的 handler 统一覆盖为 `local_rpc_addr_`
+  （[file_storage.cpp:187-189](../Mooncake/mooncake-store/src/file_storage.cpp#L187)）。
+- Master 只消费 `data_size` 与 `transport_endpoint`；`bucket_id` / `offset` 是后端私有信息。
+- 失败语义都是"首错即停"，没有部分进度；重试依赖 `FileStorage` 的整轮重扫。
+
+**1. `StorageBackendAdaptor` —— 唯一真正扫盘的实现**
+（[storage_backend.cpp:1359-1444](../Mooncake/mooncake-store/src/storage_backend.cpp#L1359)）
+
+- 路径固定三层 `root/fsdir/<d1>/<d2>/file`，只处理最内层 regular file；层级不符静默跳过。
+- key **不是**从文件名反解的：文件名是 `SanitizeKey` 后的有损形式。必须整文件读入 +
+  `struct_pb::from_pb` 出 `KVEntry` 才能拿到 key。
+- 代价是 **O(文件总字节数)** 的磁盘读，不是纯目录遍历。
+- 整段扫描持有 `mutex_`，而 handler 里是同步的 `NotifyOffloadSuccess` RPC
+  （[storage_backend.cpp:1384](../Mooncake/mooncake-store/src/storage_backend.cpp#L1384)）——慢 RPC 会阻塞该后端的批量写入与 `RemoveAll`。
+- root 不存在时直接 `meta_scanned_ = true` 返回成功，handler 一次不调用；单个文件读失败
+  `continue`，损坏/丢失不会让 `Init` 失败。
+- 不重置 `total_keys` / `total_size`，重复扫描会累加。
+
+**2. `BucketStorageBackend` —— 内存索引游标**
+（[storage_backend.cpp:2217-2239](../Mooncake/mooncake-store/src/storage_backend.cpp#L2217)，实现在 `HandleNext` / `BucketScan`）
+
+- **完全不读盘**。持久化元数据的解析发生在 `Init()`：递归扫 `*.meta` → `LoadBucketMetadata`
+  → 重建 `buckets_` / `object_bucket_map_`（[storage_backend.cpp:1947-2068](../Mooncake/mooncake-store/src/storage_backend.cpp#L1947)），另有一次 `.bucket` 孤儿清理。
+- 游标初值 `-1`（[storage_backend.h:1114](../Mooncake/mooncake-store/include/storage_backend.h#L1114)），`0` 表示结束，`HasNext()` 判 `!= 0`；一次扫完游标为 `0`，再次调用会立刻返回且一个 key 都不发——所以 `ReRegisterOffloadedObjects` 必须先 `ResetScanIterator()`（[storage_backend.h:824-827](../Mooncake/mooncake-store/include/storage_backend.h#L824)）。
+- 单桶是原子单位，`bucket->keys.size() > limit` 直接 `KEYS_EXCEED_BUCKET_LIMIT` 让整次扫描失败。
+- 空 store 时 `HandleNext` 仍会以空批调一次 handler；`buckets` 出参是无效输出。
+- handler 在 `iterator_mutex_` 内执行，含同步 RPC。
+
+**3. `OffsetAllocatorStorageBackend` —— 只枚举内存，不碰数据文件**
+（[storage_backend.cpp:5439-5522](../Mooncake/mooncake-store/src/storage_backend.cpp#L5439)）
+
+- 源码注释写得很直白：`// V1: Scan only in-memory maps (no disk scanning)`。
+- 对全部 1024 个分片加共享锁，把 `{bucket_id=0, entry.offset, key.size(), entry.value_size}`
+  分批交出去。
+- handler 在持有全部分片共享锁的作用域内被调用，一次慢 RPC 会阻塞所有 `BatchOffload` 的元数据提交。
+- "从盘上重建"发生在 `Init`：`TryRecoverFromMetadata` 读 `kv_cache.meta`（version 3）→
+  `RebuildShardMapsFromAllocator` 用 allocator 的 `visit_used_nodes` 跳读每个 used extent 的
+  24 B header + key，校验 CRC/seq，`seq >= checkpoint` 的丢弃。
+- **`persist_mode` 默认 `kDisabled`**：默认配置重启后 map 为空，`ScanMeta` 返回 OK 但 handler
+  零次调用，且没有任何 warning。
+
+**4. `DistributedStorageBackend` —— 远端 LIST 分页**
+（[distributed_storage_backend.cpp:863-904](../Mooncake/mooncake-store/src/storage/distributed/distributed_storage_backend.cpp#L863)）
+
+- `if (!UsesObjectStorage()) return NOT_SUPPORTED;`，posix/hf3fs 模式不参与。
+- `ListKeys()` 把全部页累积成一个 `vector<KeyInfo>` 才返回，`ScanMeta` 只做
+  `scanmeta_iterator_keys_limit` 的回调分批。
+- 两层"分页"不等价：1000 是 HTTP 页大小（`max-keys` 硬编码），20000 是 handler 批大小。
+- 非流式：任一分页失败则 handler 一个 batch 都收不到。
+- size 直接取 LIST 的 `<Size>`，不发 HEAD；逻辑 key 需要 `UriDecode → 去前缀 → 再解码`。
+
+**5. `NvmeKvStorageBackend` —— 真正的空实现**
+（[backend.cpp:1516-1525](../Mooncake/mooncake-store/src/nvme_kv/backend.cpp#L1516)）
+
+- 未初始化返回 `INTERNAL_ERROR`；成功路径 `(void)handler; return {};`，**完全没有日志**。
+- 不是偷懒——底层没有枚举能力：executor 只有 Store/Retrieve/Delete，connector 没有 list。
+- 但读不依赖索引：`BatchLoad` / `IsExist` 用 `XXH64` 派生物理 key + `ResolveRoot` 在 slot 0..63
+  逐个 `Retrieve` 探测，`manifest_cache_` 只是缓存（见 6.5、6.7）。
+- 准确说法是：**客户端重启无害**（Master 元数据还在，读写照常）；**Master 元数据丢失则设备上的
+  数据成为不可达孤儿**。
+
+**结论**
+
+1. 只有 Adaptor / Bucket / 对象存储三种实现能在 Master 丢元数据后完整重建；OffsetAllocator 取决于
+   `persist_mode`（默认不恢复）；NVMe KV 完全不恢复。
+2. `ScanMeta` 的代价不只是磁盘 IO：Adaptor 与 OffsetAllocator 都会在**持锁状态下**做同步 RPC，
+   扫描期间写路径会被阻塞。
+3. 三个恢复能力完整（`persist_mode` 开启后为四个）的实现，都是因为"元数据另有载体"：`.meta` 文件、
+   目录结构、对象名 + LIST。**没有持久元数据载体的后端，运行期读没问题，重建不了账本。**
 
 ---
 
@@ -3281,3 +3369,512 @@ start client_buffer_gc_thread_
 13. NVMe KV 全链路时序（6.7.3）
 14. DFS 类图（6.7.5）
 15. DFS 全链路时序（6.7.6）
+
+## 附录 C：五套 `ScanMeta` 逐行注解
+
+> 代码基线：`main` @ `67df8c41`。行号会随上游变动，定位时以函数名为准。
+> 建议阅读顺序：先看 C.0（所有后端共享的调用点与 handler 语义），再按需看具体后端，
+> 最后看 C.6 的横向对比。对照表见 6.9。
+
+### C.0 公共调用点
+
+#### C.0.1 `FileStorage::Init`（[file_storage.cpp:129-228](../Mooncake/mooncake-store/src/file_storage.cpp#L129)，`ScanMeta` 段 184-211）
+
+```cpp
+auto scan_meta_result = storage_backend_->ScanMeta(
+    [this](const std::vector<std::string>& keys,
+           std::vector<StorageObjectMetadata>& metadatas) {
+        for (auto& metadata : metadatas) {
+            metadata.transport_endpoint = local_rpc_addr_;
+        }
+        auto tasks = BuildOffloadTasksFromStorageKeys(keys, metadatas);
+        auto add_object_result =
+            client_->NotifyOffloadSuccess(tasks, metadatas);
+        if (!add_object_result) {
+            LOG(ERROR) << "Failed to add object to master: "
+                       << add_object_result.error();
+            return add_object_result.error();
+        }
+        return ErrorCode::OK;
+    });
+
+if (!scan_meta_result) {
+    if (config_.enable_dfs &&
+        scan_meta_result.error() == ErrorCode::NOT_SUPPORTED) {
+        LOG(INFO) << "Currently, DFS backend does not support ScanMeta; "
+                     "skip re-registering offloaded objects";
+    } else {
+        LOG(ERROR) << "Failed to scan meta and send to master: "
+                   << scan_meta_result.error();
+        return scan_meta_result;
+    }
+}
+```
+
+| 行 | 代码 | 说明 |
+| --- | --- | --- |
+| 136 | `storage_backend_->Init()` | 必须先完成：Bucket/Offset 的索引在各自 `Init` 里重建 |
+| 142-147 | `if (config_.enable_dfs) { ...; return {}; }` | DFS 模式在这里就返回，**不会执行 184 行的 ScanMeta** |
+| 184-199 | `ScanMeta([this](keys, metadatas){ ... })` | 同步执行；扫描期间心跳线程尚未启动（213-223），无并发 |
+| 187-189 | `metadata.transport_endpoint = local_rpc_addr_;` | 后端填的是空串，这里是唯一赋值点 |
+| 190 | `BuildOffloadTasksFromStorageKeys(keys, metadatas)` | 把 scoped key 拆成 `(tenant_id, key)`，取 `metadatas[i].data_size` 作 size（[file_storage.cpp:23-37](../Mooncake/mooncake-store/src/file_storage.cpp#L23)） |
+| 191-192 | `client_->NotifyOffloadSuccess(tasks, metadatas)` | 同步 RPC；Master 侧追加一条 `COMPLETE` 的 `LOCAL_DISK` replica |
+| 193-197 | `return add_object_result.error();` | handler 返回非 OK → 各后端立即中止扫描 → `Init` 失败（无重试） |
+| 201-211 | 错误分支 | `NOT_SUPPORTED` 只在 `enable_dfs` 时容忍；但该分支在 `Init` 中**不可达**（142-147 已提前返回），不要据此认为"DFS 会走 Init 扫描" |
+
+#### C.0.2 `ReRegisterOffloadedObjects`（[file_storage.cpp:1216-1285](../Mooncake/mooncake-store/src/file_storage.cpp#L1216)）
+
+```cpp
+tl::expected<void, ErrorCode> FileStorage::ReRegisterOffloadedObjects() {
+    LOG(INFO) << "ReRegisterOffloadedObjects: starting ScanMeta to re-register "
+              << "offloaded objects with master";
+    int total_keys = 0;
+    int total_batches = 0;
+    int total_failures = 0;
+    // Reset the scan iterator so ScanMeta starts from the beginning.
+    // BucketStorageBackend uses cursor-based iteration (next_bucket_);
+    // after Init() completes the cursor is 0 and HasNext() returns false,
+    // which would make ScanMeta skip all buckets.
+    storage_backend_->ResetScanIterator();
+    ...
+    auto scan_meta_result =
+        storage_backend_->ScanMeta(
+            [this, &total_keys, &total_batches, &total_failures](
+                const std::vector<std::string>& keys,
+                std::vector<StorageObjectMetadata>& metadatas) {
+                if (draining_.load()) {
+                    LOG(INFO) << "ReRegisterOffloadedObjects: aborting scan, "
+                              << "the disk tier is draining";
+                    return ErrorCode::SEGMENT_NOT_FOUND;
+                }
+                total_batches++;
+                total_keys += keys.size();
+                for (auto& metadata : metadatas) {
+                    metadata.transport_endpoint = local_rpc_addr_;
+                }
+                auto tasks = BuildOffloadTasksFromStorageKeys(keys, metadatas);
+                auto add_object_result =
+                    client_->NotifyOffloadSuccess(tasks, metadatas);
+                if (!add_object_result) {
+                    total_failures++;
+                    ...
+                    return add_object_result.error();
+                }
+                ...
+                return ErrorCode::OK;
+            });
+    ...
+}
+```
+
+| 行 | 代码 | 说明 |
+| --- | --- | --- |
+| 1216 | 函数入口 | 唯一触发点：心跳收到 `SEGMENT_NOT_FOUND`（Master 重启丢失 segment/元数据），file_storage.cpp:749-766 |
+| 1226 | `storage_backend_->ResetScanIterator();` | **唯一调用点**；对 Bucket 是必需品，对其他后端是 no-op |
+| 1240-1244 | `if (draining_.load()) return SEGMENT_NOT_FOUND;` | 第一批就中止，避免把正在下线的磁盘层重新注册 |
+| 1245-1246 | `total_batches++ / total_keys += keys.size();` | 仅统计，用于日志 |
+| 1247-1249 | endpoint 覆盖 | 与 `Init` 相同 |
+| 1250-1252 | `NotifyOffloadSuccess` | 与 `Init` 相同 |
+| 1253-1261 | `total_failures++; return error;` | 任一批失败即中止；**已成功的批次不回滚** |
+| 1268-1281 | 错误处理 | 失败时 `metadata_resync_pending_` 保持 true，下个心跳重试（file_storage.cpp:685-696） |
+
+### C.1 `StorageBackendAdaptor::ScanMeta`（[storage_backend.cpp:1359-1444](../Mooncake/mooncake-store/src/storage_backend.cpp#L1359)）
+
+```cpp
+tl::expected<void, ErrorCode> StorageBackendAdaptor::ScanMeta(
+    const std::function<
+        ErrorCode(const std::vector<std::string>& keys,
+                  std::vector<StorageObjectMetadata>& metadatas)>& handler) {
+    namespace fs = std::filesystem;
+
+    fs::path root = fs::path(file_storage_config_.storage_filepath) /
+                    file_per_key_config_.fsdir;
+    if (!fs::exists(root)) {
+        meta_scanned_.store(true, std::memory_order_release);
+        return {};
+    }
+
+    std::vector<std::string> keys;
+    std::vector<StorageObjectMetadata> metas;
+
+    auto flush = [&]() -> tl::expected<void, ErrorCode> {
+        if (keys.empty()) return {};
+        auto ec = handler(keys, metas);
+        if (ec != ErrorCode::OK) return tl::make_unexpected(ec);
+        keys.clear();
+        metas.clear();
+        return {};
+    };
+
+    MutexLocker lock(&mutex_);
+    ...
+                uintmax_t sz = fs::file_size(p, ec_leaf);
+                if (ec_leaf) continue;
+
+                std::string buf;
+                auto r =
+                    storage_backend_->LoadObject(p.string(), buf, (int64_t)sz);
+                if (!r) continue;
+
+                KVEntry kv;
+                struct_pb::from_pb(kv, buf);
+                storage_backend_->UpdateFileRecordKey(p.string(), kv.key);
+
+                total_keys++;
+                total_size += buf.size();
+
+                keys.emplace_back(std::move(kv.key));
+                metas.emplace_back(StorageObjectMetadata{
+                    -1, 0, (int64_t)keys.back().size(),
+                    static_cast<int64_t>(kv.value.size()), ""});
+
+                if ((int64_t)keys.size() >=
+                    file_storage_config_.scanmeta_iterator_keys_limit) {
+                    auto fr = flush();
+                    if (!fr) return fr;
+                }
+    ...
+    meta_scanned_.store(true, std::memory_order_release);
+    return {};
+}
+```
+
+| 行 | 代码 | 说明 |
+| --- | --- | --- |
+| 1365-1366 | `root = storage_filepath / fsdir` | 与写路径同源（`ResolvePathFromKey`，[file_util.cpp:117-129](../Mooncake/mooncake-store/src/common/file_util.cpp#L117)） |
+| 1367-1370 | `if (!fs::exists(root)) { meta_scanned_=true; return {}; }` | **"空扫描成功"**：handler 一次不调用，也不报错 |
+| 1375-1382 | `flush` lambda | 空批不发；handler 非 OK 原样透传；成功后清空缓冲 |
+| 1384 | `MutexLocker lock(&mutex_);` | 覆盖后续**全部** handler 调用；`IsEnableOffloading`（1350）与 `RemoveAll`（1455）也会被阻塞 |
+| 1387-1392 | 第一层目录 | `is_directory` 失败即 `continue`，静默跳过 |
+| 1395-1400 | 第二层目录 | 同上；层级不符的文件永远扫不到 |
+| 1403-1408 | 第三层 regular file | 只处理 `is_regular_file`；目录名/临时文件不会被误报 |
+| 1410-1411 | `fs::file_size` | 取得期望读取长度 |
+| 1413-1416 | `LoadObject(path, buf, sz)` | 精确长度整读；打不开或长度不符 → `continue`（该 key 被静默丢弃） |
+| 1418-1419 | `struct_pb::from_pb(kv, buf)` | key 只能从**文件内容**反解；**没有 try/catch**，坏数据可能抛异常穿出 `ScanMeta` |
+| 1420 | `UpdateFileRecordKey(path, key)` | 回填淘汰队列 `FileRecord.key`（该字段在 `Init` 建队列时为空） |
+| 1422-1423 | `total_keys++ / total_size += buf.size()` | 供 `IsEnableOffloading`（仅 `enable_eviction=false` 时）使用；**不重置**，重复扫描会累加 |
+| 1425-1428 | `keys/metas.emplace_back(...)` | `bucket_id=-1`、`offset=0`、`key_size=key.size()`、`data_size=value.size()`、endpoint 空串 |
+| 1430-1434 | 达到 `scanmeta_iterator_keys_limit` 即 flush | 默认 20000（[storage_backend.h:218-220](../Mooncake/mooncake-store/include/storage_backend.h#L218)） |
+| 1437-1438 | 每个叶子目录结束强制 flush | 目录边界分批，避免尾批过大 |
+| 1442-1443 | `meta_scanned_ = true` | 只有全部成功后置位；handler 失败时不会置位 |
+
+补充约束：
+
+- 目录层级写死为三层（`root/fsdir/<d1>/<d2>/file`，两级 16 路 hash）；分片规则变化时扫描器不会自动适配。
+- 与并发写/删**不互斥**：写删走的是 `StorageBackend` 的 path 级条带锁，与 `mutex_` 无关。
+- 文件名是 `SanitizeKey` 后的有损形式（`/ \ : * ? " < > |`、NUL → `_`），不同 key 可能同名。
+
+### C.2 `BucketStorageBackend::ScanMeta`（[storage_backend.cpp:2217-2239](../Mooncake/mooncake-store/src/storage_backend.cpp#L2217) 等）
+
+```cpp
+tl::expected<void, ErrorCode> BucketStorageBackend::ScanMeta(
+    const std::function<
+        ErrorCode(const std::vector<std::string>& keys,
+                  std::vector<StorageObjectMetadata>& metadatas)>& handler) {
+    while (true) {
+        auto has_next_res = HasNext();
+        if (!has_next_res) { ... return tl::make_unexpected(has_next_res.error()); }
+        if (!has_next_res.value()) break;
+        auto add_all_object_res = HandleNext(handler);
+        if (!add_all_object_res) { ... return add_all_object_res; }
+    }
+    return {};
+}
+```
+
+| 行 | 代码 | 说明 |
+| --- | --- | --- |
+| 2221-2237 | `while (true) { HasNext(); HandleNext(handler); }` | 游标驱动；每次 `HandleNext` 处理**至少一个完整 bucket** |
+| 2228-2230 | `if (!has_next_res.value()) break;` | `next_bucket_ == 0` 表示扫完 |
+| 2231-2236 | 错误直接返回 | handler / BucketScan 的错误原样透传 |
+
+```cpp
+tl::expected<void, ErrorCode> BucketStorageBackend::HandleNext(
+    const std::function<...>& handler) {
+    MutexLocker locker(&iterator_mutex_);
+    std::vector<std::string> keys;
+    std::vector<StorageObjectMetadata> metadatas;
+    std::vector<int64_t> buckets;
+    auto key_iterator_result =
+        BucketScan(next_bucket_, keys, metadatas, buckets,
+                   file_storage_config_.scanmeta_iterator_keys_limit);
+    ...
+    auto handle_result = handler(keys, metadatas);
+    if (handle_result != ErrorCode::OK) { ... return unexpected(handle_result); }
+    next_bucket_ = key_iterator_result.value();
+    return {};
+}
+```
+
+| 行 | 代码 | 说明 |
+| --- | --- | --- |
+| 3526 | `MutexLocker locker(&iterator_mutex_);` | 覆盖整个函数，**包括 handler 里的同步 RPC** |
+| 3530-3532 | `BucketScan(next_bucket_, ..., limit)` | 以游标为下界、limit 为上限做一次快照 |
+| 3538-3542 | `handler(keys, metadatas)` | 空 store 时也会以空批调用一次（`BucketScan` 返回 0，`HandleNext` 不检查空批） |
+| 3543 | `next_bucket_ = key_iterator_result.value();` | **只有 handler 成功才推进**；失败时游标停在原地（但重试路径会先 Reset） |
+| 3529 | `std::vector<int64_t> buckets;` | 传给 `BucketScan` 但从未被读取，属于无效输出 |
+
+```cpp
+tl::expected<int64_t, ErrorCode> BucketStorageBackend::BucketScan(
+    int64_t bucket_id, std::vector<std::string>& keys,
+    std::vector<StorageObjectMetadata>& metadatas,
+    std::vector<int64_t>& buckets, int64_t limit) {
+    SharedMutexLocker lock(&mutex_, shared_lock);
+    auto bucket_it = buckets_.lower_bound(bucket_id);
+    for (; bucket_it != buckets_.end(); ++bucket_it) {
+        if (static_cast<int64_t>(bucket_it->second->keys.size()) > limit) {
+            return tl::make_unexpected(ErrorCode::KEYS_EXCEED_BUCKET_LIMIT);
+        }
+        if (static_cast<int64_t>(bucket_it->second->keys.size() + keys.size()) >
+            limit) {
+            return bucket_it->first;
+        }
+        buckets.emplace_back(bucket_it->first);
+        for (size_t i = 0; i < bucket_it->second->keys.size(); i++) {
+            keys.emplace_back(bucket_it->second->keys[i]);
+            metadatas.emplace_back(StorageObjectMetadata{
+                bucket_it->first, bucket_it->second->metadatas[i].offset,
+                bucket_it->second->metadatas[i].key_size,
+                bucket_it->second->metadatas[i].data_size, ""});
+        }
+    }
+    return 0;
+}
+```
+
+| 行 | 代码 | 说明 |
+| --- | --- | --- |
+| 2245 | `SharedMutexLocker lock(&mutex_, shared_lock);` | 只护住索引遍历；返回后释放，handler 在锁外 |
+| 2246 | `buckets_.lower_bound(bucket_id)` | 游标是 bucket_id，不是下标；`-1` 等价于从头开始 |
+| 2248-2253 | 单桶超限 → `KEYS_EXCEED_BUCKET_LIMIT` | **整次扫描失败**，不会跳过该桶 |
+| 2255-2258 | 累计超限 → 返回本桶 id | 本桶留给下一轮，作为新的游标 |
+| 2260-2266 | 整桶拷贝 keys/metadatas | `bucket_id` 填真实值、`offset` 为桶内偏移、endpoint 空串 |
+| 2268 | `return 0;` | 扫到尾，`HasNext()` 下一轮返回 false |
+
+```cpp
+// storage_backend.h:824-827
+void ResetScanIterator() override {
+    MutexLocker locker(&iterator_mutex_);
+    next_bucket_ = -1;
+}
+
+// storage_backend.h:1114
+int64_t GUARDED_BY(mutex_) next_bucket_ = -1;   // 注：实际由 iterator_mutex_ 保护
+```
+
+- 游标初值 `-1`，`0` 为结束哨兵；`Init` **不调用** `ResetScanIterator`，靠成员初值。
+- 一次完整扫描后游标为 `0`，再次调用 `ScanMeta` 会立即返回且零回调。
+
+### C.3 `OffsetAllocatorStorageBackend::ScanMeta`（[storage_backend.cpp:5439-5522](../Mooncake/mooncake-store/src/storage_backend.cpp#L5439)）
+
+```cpp
+tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::ScanMeta(
+    const std::function<...>& handler) {
+    if (!initialized_.load(std::memory_order_acquire)) {
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+
+    // V1: Scan only in-memory maps (no disk scanning)
+    // Lock all shards to get consistent cross-shard snapshot
+    std::vector<std::string> keys;
+    std::vector<StorageObjectMetadata> metadatas;
+
+    auto flush = [&]() -> tl::expected<void, ErrorCode> {
+        if (keys.empty()) return {};
+        auto error_code = handler(keys, metadatas);
+        if (error_code != ErrorCode::OK) { ... return tl::make_unexpected(error_code); }
+        keys.clear();
+        metadatas.clear();
+        return {};
+    };
+
+    {
+        std::vector<std::unique_ptr<SharedMutexLocker>> shard_locks;
+        ...
+        for (size_t i = 0; i < kNumShards; ++i) {
+            shard_locks.emplace_back(std::make_unique<SharedMutexLocker>(
+                &shards_[i].mutex, shared_lock));
+            estimated_total += shards_[i].map.size();
+        }
+        ...
+        for (size_t i = 0; i < kNumShards; ++i) {
+            for (const auto& [key, entry] : shards_[i].map) {
+                keys.push_back(key);
+                metadatas.push_back(StorageObjectMetadata{
+                    0, static_cast<int64_t>(entry.offset),
+                    static_cast<int64_t>(key.size()),
+                    static_cast<int64_t>(entry.value_size), ""});
+                if (static_cast<int64_t>(keys.size()) >=
+                    file_storage_config_.scanmeta_iterator_keys_limit) {
+                    auto flush_result = flush();
+                    if (!flush_result) return flush_result;
+                }
+            }
+        }
+    }  // Release all shard locks
+    auto flush_result = flush();
+    if (!flush_result) return flush_result;
+    return {};
+}
+```
+
+| 行 | 代码 | 说明 |
+| --- | --- | --- |
+| 5443-5447 | `if (!initialized_) return INTERNAL_ERROR;` | 未 `Init` 直接失败 |
+| 5449-5450 | 注释 + 全分片加锁 | `kNumShards = 1024`（[storage_backend.h:1425-1426](../Mooncake/mooncake-store/include/storage_backend.h#L1425)），保证跨分片快照一致 |
+| 5457-5467 | `flush` lambda | 到 limit 或结尾时回调；空批不发 |
+| 5475-5479 | 先加锁再估算 `estimated_total` | 用于 `reserve`，避免反复扩容 |
+| 5491-5501 | 双重循环遍历 `shards_[i].map` | `bucket_id=0`、`offset` 为数据文件绝对偏移、`key_size=key.size()`、`data_size=value_size`（不含 24 B header 与对齐填充） |
+| 5503-5510 | 达到 limit 即 flush | **flush 在锁区内**：handler 的同步 RPC 期间，所有分片的排他锁申请（`BatchOffload` 提交索引）都会被阻塞 |
+| 5513-5519 | 作用域结束释放锁，再 flush 尾批 | 尾批的 handler 在锁外执行 |
+
+补充：
+
+- `ScanMeta` **不做任何校验**：不读 header、不算 CRC；上报内容的可信度完全依赖 `Init` 阶段
+  `TryRecoverFromMetadata` 的一次性校验。
+- `persist_mode` 默认 `kDisabled`：`Init` 走 fresh start，map 为空，`ScanMeta` 返回 OK 且 handler
+  零次调用、无 warning。
+- 没有游标；`scanmeta_iterator_keys_limit` 只是单次回调的批量上限。
+
+### C.4 `DistributedStorageBackend::ScanMeta`（[distributed_storage_backend.cpp:863-904](../Mooncake/mooncake-store/src/storage/distributed/distributed_storage_backend.cpp#L863)）
+
+```cpp
+tl::expected<void, ErrorCode> DistributedStorageBackend::ScanMeta(
+    const std::function<...>& handler) {
+    if (!UsesObjectStorage()) {
+        return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+    }
+    if (!initialized_) {
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+
+    std::vector<std::string> batch_keys;
+    std::vector<StorageObjectMetadata> batch_metas;
+    const size_t batch_limit = static_cast<size_t>(std::max<int64_t>(
+        1, file_storage_config_.scanmeta_iterator_keys_limit));
+
+    auto key_infos = object_storage_adapter_->ListKeys();
+    if (!key_infos) { ... return tl::make_unexpected(key_infos.error()); }
+
+    for (const auto& info : *key_infos) {
+        batch_keys.push_back(info.logical_key);
+        batch_metas.emplace_back(-1, 0,
+                                 static_cast<int64_t>(info.logical_key.size()),
+                                 static_cast<int64_t>(info.size), "");
+        if (batch_keys.size() >= batch_limit) {
+            auto err = handler(batch_keys, batch_metas);
+            if (err != ErrorCode::OK) return tl::make_unexpected(err);
+            batch_keys.clear();
+            batch_metas.clear();
+        }
+    }
+    if (!batch_keys.empty()) {
+        auto err = handler(batch_keys, batch_metas);
+        if (err != ErrorCode::OK) return tl::make_unexpected(err);
+    }
+    return {};
+}
+```
+
+| 行 | 代码 | 说明 |
+| --- | --- | --- |
+| 867-869 | `if (!UsesObjectStorage()) return NOT_SUPPORTED;` | posix/hf3fs 模式入口即拒绝；`FileStorage` 仅在 `enable_dfs` 时当跳过 |
+| 870-873 | `if (!initialized_) return INTERNAL_ERROR;` | 未 `Init` 失败 |
+| 877-878 | `batch_limit = max(1, scanmeta_iterator_keys_limit)` | 防 0 值导致空批/死循环 |
+| 880 | `object_storage_adapter_->ListKeys()` | **一次性取得全部 key**，分页在 adapter 内部；失败则 handler 零调用 |
+| 887-891 | 逐条转 `StorageObjectMetadata` | `bucket_id=-1`、`offset=0`、`key_size=logical_key.size()`、`data_size=info.size`（来自 LIST 的 `<Size>`） |
+| 892-897 | 每满 `batch_limit` 回调一次 | 与 HTTP 页大小无关 |
+| 899-902 | 尾批回调 | 与 `flush` 语义一致 |
+
+`ListKeys` 的分页（[rest_object_storage_adapter.cpp:878-915](../Mooncake/mooncake-store/src/storage/distributed/rest_object_storage_adapter.cpp#L878)）：
+
+```cpp
+const std::string prefix = PhysicalPrefix();
+std::vector<KeyInfo> keys;
+std::string token;
+do {
+    std::map<std::string, std::string> query{{"encoding-type", "url"},
+                                             {"list-type", "2"},
+                                             {"max-keys", "1000"},
+                                             {"prefix", prefix}};
+    if (!token.empty()) query["continuation-token"] = token;
+    auto response = Request("GET", "", query);
+    ...
+    auto page = object_storage_xml::ParseListObjectsV2(response->body);
+    ...
+    for (auto& object : page->objects) {
+        auto logical_key = PhysicalToLogicalKey(UriDecode(object.key));
+        if (!logical_key) return tl::make_unexpected(logical_key.error());
+        keys.push_back({std::move(*logical_key), object.size});
+    }
+    token = std::move(page->next_continuation_token);
+    if (ContinuationTokenIsUrlEncoded()) token = UriDecode(token);
+    if (!page->is_truncated) token.clear();
+    if (page->is_truncated && token.empty())
+        return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+} while (!token.empty());
+return keys;
+```
+
+| 行 | 代码 | 说明 |
+| --- | --- | --- |
+| 879 | `PhysicalPrefix()` | 配置的 `key_prefix_` 加 `/`；为空时等于枚举整个 bucket |
+| 883-887 | `list-type=2 / max-keys=1000 / encoding-type=url` | 页大小**硬编码 1000**，与 20000 的批大小是两回事 |
+| 887-888 | `continuation-token` | 翻页游标 |
+| 897-902 | `ParseListObjectsV2` | 严格解析：缺 Key/Size/IsTruncated 直接失败 |
+| 903-907 | `UriDecode → PhysicalToLogicalKey` | 两次解码：`encoding-type=url` 一次，逻辑 key 的 percent 编码再一次 |
+| 908-912 | token 处理 | `is_truncated=true` 但 token 为空 → `FILE_READ_FAIL`，避免静默丢对象 |
+| 913-914 | `while (!token.empty())` | 全部页累积到 `keys` 后才返回；**非流式** |
+
+补充：size 只来自 LIST 的 `<Size>`，不发 HEAD；对象体没有 header/CRC，读路径只校验长度（见 6.6）。
+
+### C.5 `NvmeKvStorageBackend::ScanMeta`（[backend.cpp:1516-1525](../Mooncake/mooncake-store/src/nvme_kv/backend.cpp#L1516)）
+
+```cpp
+tl::expected<void, ErrorCode> NvmeKvStorageBackend::ScanMeta(
+    const std::function<
+        ErrorCode(const std::vector<std::string> &keys,
+                  std::vector<StorageObjectMetadata> &metadatas)> &handler) {
+    if (!initialized_.load(std::memory_order_acquire)) {
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+    (void)handler;
+    return {};
+}
+```
+
+| 行 | 代码 | 说明 |
+| --- | --- | --- |
+| 1520-1522 | `if (!initialized_) return INTERNAL_ERROR;` | 唯一失败路径；注意不是返回 OK |
+| 1523 | `(void)handler;` | 显式丢弃回调，**一次都不调用** |
+| 1524 | `return {};` | 返回成功，调用方无从区分"扫了但没有对象"与"没扫" |
+| — | **无任何日志** | 运维无法发现"恢复没有发生" |
+
+为什么没有枚举能力（不是实现取舍）：
+
+- `NvmeKvCommandExecutor` 只有 `Store` / `Retrieve` / `Delete` 三类命令，命令集常量只有三个 opcode。
+- `NvmeKvConnector` 只能按 16 字节 physical key 访问，没有 list/scan 接口。
+- 后端不写任何本地 manifest 文件；`manifest_cache_` 只是进程内缓存。
+
+读不依赖索引：
+
+- `BatchLoad` / `IsExist` 用 `XXH64(identity)` 派生 root physical key，再在 slot `0..63` 逐个
+  `Retrieve` 探测；命中后按 `object_type` 走 inline 直拷或 manifest → chunk（见 6.5）。
+- 因此**客户端重启无害**；只有 **Master 元数据丢失**时，设备上的对象才成为不可达孤儿。
+
+### C.6 横向对比：锁、失败、重复调用
+
+| 后端 | handler 执行时持有的锁 | handler 失败 | 重复调用 | 是否读盘 |
+| --- | --- | --- | --- | --- |
+| `StorageBackendAdaptor` | `mutex_`（全程） | 立即中断，`meta_scanned_` 不置位 | 全量重扫；`total_keys/total_size` 累加 | ✅ 每文件整读 |
+| `BucketStorageBackend` | `iterator_mutex_`（期间 `mutex_` 已释放） | 立即中断，游标不前进 | 游标为 0 时零回调，必须先 `ResetScanIterator` | ❌ 只读内存索引 |
+| `OffsetAllocator` | 全部 1024 个分片共享锁 | 立即中断 | 每次全量重扫（无游标） | ❌ 只读内存 map |
+| `Distributed` | 无 | 立即中断；LIST 失败时 handler 零调用 | 每次全量重 LIST | ✅ 远端 LIST |
+| `NvmeKv` | 无 | 不适用 | 空转 | ❌ |
+
+三条通用结论：
+
+1. **handler 里做同步 RPC 会放大锁的影响面**：Adaptor 阻塞写与 `RemoveAll`，OffsetAllocator
+   阻塞所有 `BatchOffload` 的索引提交。新增后端若实现 `ScanMeta`，应在锁外回调。
+2. **失败语义都是"首错即停"**，没有部分进度恢复；重试依赖 `FileStorage` 的整轮重扫。
+3. **重复调用只有 Bucket 不是幂等的**（需要显式 Reset），其余每次都从头扫。

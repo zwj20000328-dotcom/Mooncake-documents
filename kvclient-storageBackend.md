@@ -1150,6 +1150,15 @@ sequenceDiagram
 - 结果：进程重启后，Master 若仍有 `LOCAL_DISK` 元数据，读/查仍可用；若 Master 也丢失元数据，
   对象不会自动重新注册。这是本版的明确限制。
 
+#### 4.6.4 现有五套 `ScanMeta` 实现对照
+
+五套实现（`StorageBackendAdaptor` / `BucketStorageBackend` / `OffsetAllocatorStorageBackend` /
+`DistributedStorageBackend` / `NvmeKvStorageBackend`）的对照表、逐后端要点与逐行代码注解，已移到
+《FileStorage-offload-实现解读.md》的 6.9 节与附录 C——那里是它们真正的归属地。
+
+本版只需记住结论：**只有 file-per-key、bucket、对象存储三种能在 Master 丢元数据后完整重建账本；
+OffsetAllocator 取决于 `persist_mode`（默认不恢复）；NVMe KV 完全不恢复。**
+
 ### 4.7 并发与一致性（写/读/查/删）
 
 | 场景 | 结果 | 处理 |
@@ -1390,4 +1399,3 @@ sequenceDiagram
 | payload | 各 `Slice` 按序拼接后的对象数据，等于上报 Master 的 `data_size` |
 | transfer_size | `align_up(40 + payload_size, 512)`，ASU 实际传输长度 |
 | staging arena | backend 持有、向 ASU 注册的读写中转内存 |
-
