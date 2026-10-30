@@ -106,47 +106,74 @@ Mooncake 的 KV client 通过 `StorageBackendInterface` 把 KV cache 对象下�
 
 ```mermaid
 flowchart LR
-    App["Application / vLLM"] --> Store["StoreClient API"]
-    Store --> Master["Master Service"]
-    Store -->|"Remove / BatchRemove"| Master
-    Master -->|"per-key delete task"| FS["FileStorage"]
-    Store --> FS
-    FS -->|"BatchOffload / BatchLoad / IsExist / BatchRemoveKeys"| BE["KvClientStorageBackend"]
-    BE -->|complete_handler| FS
-    FS -->|NotifyOffloadSuccess| Master
-    BE -->|"store/load/query/delete (async task)"| KV["kv::KvClient"]
+    App["Application / vLLM"] -->|"Put / Get / Remove"| Store["StoreClient API"]
+
+    Store -->|"路由 / lease / offload 队列"| Master["Master Service"]
+    Store -->|"Remove / BatchRemove（删）"| Master
+    Store -->|"BatchGet（读）"| FS["FileStorage"]
+
+    Master -->|"offload 任务（写）"| FS
+    Master -->|"per-key delete task（删）"| FS
+
+    FS -->|"BatchOffload（写）"| BE["KvClientStorageBackend"]
+    FS -->|"BatchLoad（读）"| BE
+    FS -->|"IsExist（查）"| BE
+    FS -->|"BatchRemoveKeys（删）"| BE
+
+    BE -->|"StoreAsync（写）"| KV["kv::KvClient"]
+    BE -->|"LoadAsync（读）"| KV
+    BE -->|"QueryAsync（查）"| KV
+    BE -->|"DeleteAsync（删）"| KV
+
+    BE -->|"complete_handler"| FS
+    FS -->|"NotifyOffloadSuccess"| Master
+
     KV --> View["ASU View Service"]
     KV --> ASU["ASU nodes"]
 ```
+
+四条主流程：
+
+| 流程 | 路径 |
+| --- | --- |
+| 写 / offload | App → Store（Put）→ Master（路由/lease/offload 队列）→ FileStorage 心跳 → Backend `BatchOffload` → `KvClient::StoreAsync` → ASU；Backend `complete_handler` → FileStorage → Master `NotifyOffloadSuccess` |
+| 读 / restore | App → Store（Get/BatchGet）→ Master（LOCAL_DISK 路由）→ FileStorage `BatchGet` → Backend `BatchLoad` → `KvClient::LoadAsync` → ASU；数据回填到调用方 buffer |
+| 查 / probe | FileStorage `Exists`（dangling replica probe）→ Backend `IsExist` → `KvClient::QueryAsync` → ASU |
+| 删 / per-key | App → Store（Remove/BatchRemove）→ Master（删元数据）→ per-key delete task → FileStorage `BatchRemoveKeys` → Backend `BatchRemoveKeys` → `KvClient::DeleteAsync` → ASU |
 
 ### 2.3 模块分层与依赖规则
 
 ```mermaid
 flowchart TB
-    subgraph L0["调用层（现有）"]
+    subgraph L0["Mooncake 现有调用层"]
         FS["FileStorage"]
         Factory["CreateStorageBackend"]
     end
-    subgraph L1["后端层（新增）"]
-        BE["KvClientStorageBackend"]
-        IDX["PayloadSizeIndex（scoped_key → payload_size）"]
-        CODEC["KeyCodec + RecordCodec"]
-        CFG["KvClientBackendConfig"]
-        STAGE["StagingArena"]
-        DEL["BatchRemoveKeys"]
+
+    subgraph L1["Mooncake 唯一新增实现"]
+        BE["KvClientStorageBackend<br/>: StorageBackendInterface"]
+        IDX["PayloadSizeIndex<br/>（内部缓存）"]
+        CODEC["KeyCodec + RecordCodec<br/>（内部组件）"]
+        CFG["KvClientBackendConfig<br/>（内部配置）"]
+        STAGE["StagingArena<br/>（内部组件）"]
+        DEL["BatchRemoveKeys<br/>（内部方法）"]
     end
-    subgraph L2["UCM 接口（仅 backend .cpp）"]
-        KVC["kv::KvClient"]
+
+    subgraph L2["现成依赖：UCM KvClient SDK"]
+        KVC["kv::KvClient<br/>（现成接口）"]
+        CREATE["CreateKvClient()<br/>（SDK 工厂）"]
+        LIB["libkv_client / libkv_transport"]
     end
-    subgraph L3["实现"]
-        UCM["CreateKvClient()"]
-        MEM["ReferenceKvClient（参考实现 / CI）"]
-        FAKE["FakeKvClient（测试）"]
-    end
-    subgraph L4["外部"]
+
+    subgraph L3["ASU"]
         VIEW["ASU View Service"]
         ASUN["ASU nodes"]
     end
+
+    subgraph TEST["仅测试，不进入生产架构"]
+        FAKE["FakeKvClient"]
+    end
+
     FS --> BE
     Factory --> BE
     BE --> IDX
@@ -154,19 +181,23 @@ flowchart TB
     BE --> CFG
     BE --> STAGE
     BE --> DEL
-    BE --> KVC
-    KVC --> UCM
-    KVC --> MEM
-    KVC --> FAKE
-    UCM --> VIEW
-    UCM --> ASUN
+    BE -->|"直接调用；UCM 头仅在 .cpp"| KVC
+    KVC --> CREATE
+    CREATE --> LIB
+    LIB --> VIEW
+    LIB --> ASUN
+    FAKE -.->|"测试注入"| KVC
 ```
 
 依赖规则：
 
-- `KvClientStorageBackend` 直接依赖 `kv::KvClient`；UCM 头文件只在 `kv_client/backend.cpp`
-  中包含，不进入 Mooncake 公共头。
-- `FakeKvClient` / `ReferenceKvClient` 实现 `kv::KvClient`，用于测试/参考。
+- **Mooncake 只新增一个 `StorageBackendInterface` 实现**：`KvClientStorageBackend`。索引、codec、
+  配置、staging、`BatchRemoveKeys` 都是它的内部组件/方法，不新增端口层或适配器层。
+- `kv::KvClient` 是 **现成的 UCM SDK**；Mooncake 只调用 `CreateKvClient()`、`Init`、
+  `BatchStoreAsync`/`BatchLoadAsync`/`QueryAsync`/`DeleteAsync`/`Wait`，不实现、不包装 SDK。
+- UCM 头文件只在 `kv_client/backend.cpp` 中包含；`FileStorage`、`CreateStorageBackend` 和
+  Mooncake 公共头不感知 UCM。
+- `FakeKvClient` 只用于测试注入，不进入生产架构；`ReferenceKvClient` 不是本版必需项。
 - `StagingArena` 持有 ASU 注册句柄；`UnregisterRegions` 只在 shutdown 时、所有 task 完成后调用。
 
 ### 2.4 线程模型与所有权
