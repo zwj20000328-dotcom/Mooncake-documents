@@ -72,17 +72,17 @@ Mooncake 的 KV client 通过 `StorageBackendInterface` 把 KV cache 对象下�
 | --- | --- | --- | --- | --- |
 | 调用模型 | 同步，返回 `tl::expected` | 异步 task：`XxxAsync` 返回 `taskId`，`Check`/`Wait` 取结果 | 把提交当完成；`Wait` 期间持锁；缓冲提前复用 | 每批 `submit + Wait`；`Wait` 不持元数据锁；slot 结果消费后释放 |
 | 失败/部分成功 | 逐 key 部分成功，返回成功数；`KEYS_ULTRA_LIMIT` 会永久关闭 offload | 聚合 `status` + 逐 entry `status`；`PARTIAL_FAILED` | 把聚合失败当整批失败；误用 `KEYS_ULTRA_LIMIT` | 只按逐 entry 判断；只上报成功 key；0 成功返回 `expected(0)` |
-| 批量大小 | 一次一个 map | `Batch*Async` 受 server 上限约束 | 超限 `INVALID_ARGUMENT` | 有效批量 = `min(config.batch_size, 上限)`；切块保持下标对齐 |
-| key | 变长 `scoped_key`（`tenant\0local_key`） | 8 字节 `asu_key`（`kv::CacheKey`），不可逆 | 碰撞读错对象；无法反解 | `XXH64("mooncake/kvclient/v1" + key_namespace + 0x00 + scoped_key)`；128-bit fingerprint |
+| 批量大小 | 一次一个 map | `Batch*Async` 受 server 上限约束 | 超限 `INVALID_ARGUMENT` | 按 `config.batch_size` 切块；某块超限时切半重试一次，保持下标对齐 |
+| key | Mooncake 真实 key：用户态 `ObjectKey = std::string`；到 backend 是 `scoped_key = TenantId + '\0' + local_key` | 8 字节 `asu_key`（`kv::CacheKey`），不可逆 | 无法从 ASU key 反解 `scoped_key`；64-bit 哈希碰撞未处理 | `XXH64("mooncake/kvclient/v1" + key_namespace + 0x00 + scoped_key)`；本版不做碰撞检测，默认不发生碰撞（见 §3.6） |
 | 长度 | Master `data_size` 是权威 | Query 只有存在性，没有长度 | 想从 ASU 查长度会失败 | 写时计算；读时用 `slice.size`；头里 `payload_size` 交叉校验 |
-| value/内存 | `Slice` 任意内存，无需注册 | `KVBuffer` 必须引用注册内存；长度/offset 512B 对齐 | `BUFFER_NOT_REGISTERED`/`INVALID_ARGUMENT` | staging arena 注册；`transfer_size = align_up(40+payload,512)` |
+| value/内存 | `Slice` 任意内存，无需注册 | `KVBuffer` 必须引用注册内存；长度/offset 512B 对齐 | `BUFFER_NOT_REGISTERED`/`INVALID_ARGUMENT` | staging arena 注册；`transfer_size = align_up(24+payload,512)` |
 | 查询 | `IsExist` bool；`ScanMeta` 可枚举 | `QueryAsync` exists 位图；无长度、无枚举 | 试图重建长度/恢复索引会失败 | `IsExist` 直接映射；`ScanMeta` 空实现 |
 | task/内存生命周期 | backend 自身线程安全；Slice 调用方管理 | KvClient 内部 worker；调用方保证 task 完成前注册内存有效 | 提前 `Unregister`/复用 slot → 数据损坏 | slot 生命周期覆盖 `Wait`；shutdown 前 drain |
 | 生命周期 | `Init`；无 `Shutdown`；二次 Init 失败 | `Init`/`Shutdown`；Shutdown drain task | 析构时 task 未完成 | 先 drain 再 `Shutdown`；CAS 保证二次 Init 失败 |
 | 容量/配额 | `total_size_limit`、淘汰 | 无容量查询；ASU 自管 | 计数重启归零；超量写 | 计数仅参考；超配额跳过；不返回 `KEYS_ULTRA_LIMIT` |
 | 删除/清空 | `Client::Remove`/`BatchRemove` 先删 Master 元数据；后端需要按 key 物理删除 | `DeleteAsync` 逐 key；无枚举、无前缀/租户删除 | 调用方可能不是 ASU 数据的 owner；`key_namespace` 不同无法算 key；重启后无法枚举 | Master 按 key 通知盘副本 owner → owner `BatchRemoveKeys` → `DeleteAsync`；`NOT_FOUND` 视为成功；本版不支持 `RemoveAll`/正则/水位 |
 | 恢复 | 启动 `ScanMeta` 重新注册 | 无枚举 | Master 重启后不可注册 | `ScanMeta` 返回空；读/查不依赖索引 |
-| 完整性 | 各后端自选：CRC-32C / XXH32+verify_hash | 无 per-value checksum | 撕裂/串写/碰撞被当有效数据 | 自建 `RecordHeader`（40B）+ 头 CRC + payload CRC + fingerprint |
+| 完整性 | 各后端自选：CRC-32C / XXH32+verify_hash | 无 per-value checksum | 撕裂/串写被当有效数据 | 自建 `RecordHeader`（24B）+ 头 CRC + payload CRC |
 | 错误码 | `ErrorCode` | `StatusCode` + `ENTRY_*`/`CQE_*` | 透传错误码触发错误分支 | backend 内映射；未知归 `INTERNAL_ERROR` |
 
 ## 2. 系统上下文与模块架构
@@ -207,10 +207,9 @@ flowchart TB
 
 | 线程 | 入口 | 与后端的关系 |
 | --- | --- | --- |
-| Heartbeat 线程 | `Heartbeat()` → `BatchOffload` / `PollDeleteTasks` | 串行写、按 key 删除 |
+| Heartbeat 线程 | `Heartbeat()` → `BatchOffload` / `PollDeleteTasks` → `BatchRemoveKeys` | 串行写、按 key 删除 |
 | RPC worker | `BatchGet` → `BatchLoad` | 并发读 |
 | dangling replica probe | `FileStorage::Exists` → `IsExist` | 低频并发查 |
-| Master 触发的按 key 删除 | `FileStorage::BatchRemoveKeys` → `BatchRemoveKeys` | 删除本 client 拥有的盘副本 |
 | 重启/重注册 | `FileStorage::Init` → `ScanMeta` | 空实现，直接返回 |
 | UCM KvClient worker | `KvClientImpl::WorkerLoop` | 提交 task、等待完成；不回调 Mooncake |
 
@@ -221,9 +220,59 @@ flowchart TB
 2. `metadata_mutex_`：读写锁，保护 `index_`、`total_keys_`、`total_size_`；**绝不跨 ASU
    `Wait` 或 Master 回调持有**。
 3. `staging_mutex_`：只保护 slot 分配/释放，不覆盖 `Wait`。
-4. 加锁顺序固定为 `write_mutex_` → `metadata_mutex_`。
+4. 加锁顺序固定为 `write_mutex_` → `metadata_mutex_`；`staging_mutex_` 不参与嵌套。
 5. 读/查只在需要更新/读取索引时短暂持有 `metadata_mutex_`；ASU I/O 期间不持锁。
 6. `complete_handler` 约定不得重入本后端。
+
+**每个锁的作用与必要性**
+
+| 锁 | 保护什么 | 为什么必须 | 去掉会怎样 | 必要性 |
+| --- | --- | --- | --- | --- |
+| `write_mutex_` | 多步写序列（Prepare → ASU I/O → CommitIndex → `complete_handler`）、配额准入、Init 与写互斥 | 两个写者同时看到“还有空间”会超配额；两个写序列交错会让回调顺序/计数与 ASU 实际不一致；Init 与写并发会看到半初始化 client | 计数错、超配额、回调顺序乱、Init 期访问半初始化 client | **当前设计必须**。若能量化保证“只有一个写线程且 Init 在心跳前完成”，可降级为断言；但删除任务、未来 admin 操作都可能引入第二个写者，不建议去掉 |
+| `metadata_mutex_` | `index_` + `total_keys_/total_size_` 的读一致性 | 读/查会读/删索引，写会改索引；`unordered_map` 并发读写是 UB；计数与索引需要一起更新 | 数据竞争/崩溃；读看到半更新计数 | **当前设计必须**。若读/查完全不碰索引、计数改成原子量，可去掉，但配额判断会变成近似值 |
+| `staging_mutex_` | slot 空闲队列 | 多个 RPC worker 并发读、心跳线程写，都要从同一个池里取 slot；两个操作拿到同一 slot 会互相覆盖 | 数据串写、读到别人的数据 | **必须**。除非改成每线程私有 buffer，或 per-slot 原子队列 |
+| 锁顺序 `write_mutex_ → metadata_mutex_` | 防止加锁顺序反转 | 未来新增路径若先拿 metadata 再拿 write，会死锁 | 潜在死锁 | **规则必须**；当前代码只有写路径嵌套这两把锁 |
+| 短临界区（不跨 `Wait`/回调） | 可用性/尾延迟 | ASU `Wait` 最长 `wait_timeout_ms`；持锁会让所有读写排队、心跳超时 | 功能仍正确，但读写尾延迟和心跳可用性急剧下降 | **正确性上非必须，可用性上必须** |
+| `complete_handler` 不重入 | 回调期间持有 `write_mutex_` | 回调若重入 backend 会自死锁 | 死锁 | **必须**；或者改为回调前释放锁，并重新定义顺序协议 |
+
+为什么不是一把锁：
+
+- 一把锁从 `Prepare` 持有到 `Wait` 结束，会把所有读者阻塞最长 `wait_timeout_ms`（默认 5s），不可接受。
+- 一把锁只在 `CommitIndex` 短暂持有，又无法串行化“看到有空位 → 写入 → 提交计数”的整段序列，配额会超卖。
+- 把 `staging_mutex_` 并进 `metadata_mutex_`，会让“等一个空闲 slot”阻塞所有索引读者；分开后等待 slot 不影响读索引。
+
+`staging_mutex_` 只在 `Acquire`/`Release` 的瞬间持有；slot 的所有权（不是 mutex）覆盖 ASU I/O，
+所以它不与 `metadata_mutex_` 嵌套，不参与 `write_mutex_ → metadata_mutex_` 的顺序。
+
+**与 NVMeKV 的锁设计对照**
+
+NVMeKV 没有 `write_mutex_` / `metadata_mutex_` / `staging_mutex_` 这一组锁，它的并发控制是：
+
+| NVMeKV 机制 | 证据 | 作用 |
+| --- | --- | --- |
+| `std::atomic<bool> initialized_` | `nvme_kv/backend.h:83`、`backend.cpp:460-472` | Init CAS；失败复位，允许重试 |
+| `std::atomic<int64_t> total_size_/total_keys_`（relaxed） | `backend.h:88-89`、`backend.cpp:961-962, 1503-1514` | 计数；`IsEnableOffloading` 直接读原子量 |
+| `std::shared_mutex manifest_cache_mutex_` | `backend.h:84,87`、`backend.cpp:352-399` | `FindCachedManifest` 用 shared，`CacheManifest` 用 unique |
+| `ThreadPool` + `IndexQueue`（mutex+condvar） | `backend.h:17,97-99`、`backend.cpp:216-275, 30-63` | 内部 IO 并行与任务队列 |
+| `connector_` 只在 Init 赋值，之后只读 | `backend.cpp:449-456` | 无锁读取 shared_ptr 副本 |
+
+对照到本后端：
+
+| 本后端 | NVMeKV 对应 | 差异与启示 |
+| --- | --- | --- |
+| `write_mutex_` | **无**；NVMeKV 依赖 FileStorage 心跳单写线程 | NVMeKV 的配额检查是“读原子量 → 判断 → 稍后 `fetch_add`”，并发 `BatchOffload` 会超卖；它接受这个前提。本后端若也保证“心跳单写”，可去掉 `write_mutex_`；若未来有 admin/淘汰线程，保留 |
+| `metadata_mutex_` | `manifest_cache_mutex_` + 原子计数 | NVMeKV 把 map 保护和计数拆开：map 用 `shared_mutex`，计数用原子量。本后端可照做：`PayloadSizeIndex` 用 `shared_mutex`，`total_*` 用原子量；代价是计数与索引不是同一快照 |
+| `staging_mutex_` | **无**；NVMeKV 由 connector/executor 管理设备 buffer | 本后端有共享 staging arena，必须保留；NVMeKV 没有可复用的等价物 |
+| 锁顺序 | 无嵌套 | 本后端只有 `write → metadata` 一处嵌套；`staging_mutex_` 不嵌套 |
+
+可参考的取舍：
+
+- 若保持“心跳线程是唯一写者”（当前 `BatchOffload`、`BatchRemoveKeys` 都在心跳线程），可以照 NVMeKV：
+  去掉 `write_mutex_`，用 `std::atomic` 计数 + `shared_mutex` 保护索引，配额判断接受近似值。
+- 若要求精确配额/多写者，保留 `write_mutex_`；或者用 `total_size_` 的 CAS 预留 + 失败回滚，代替整段串行。
+- `staging_mutex_` 不能照 NVMeKV 去掉，因为 NVMeKV 没有“跨读者/写者共享的注册 buffer 池”。
+- **不要照搬** NVMeKV 配额不足返回 `KEYS_ULTRA_LIMIT` 的行为：该码会让 FileStorage 永久关闭 offload；
+  本后端应跳过本批并返回 `expected(0)`。
 
 ### 2.5 对象状态机
 
@@ -388,7 +437,7 @@ tl::expected<RemoveOutcome, ErrorCode> RemoveKeys(
 关键语义：
 
 - `BatchOffload` 的 `keys` 必须是调用方传入的 **`scoped_key`**（`tenant\0local_key`），不是 ASU key。
-- `StorageObjectMetadata` 的 `data_size` 必须填 **payload 大小（不含 `RecordHeader`，40B）**。
+- `StorageObjectMetadata` 的 `data_size` 必须填 **payload 大小（不含 `RecordHeader`，24B）**。
 - `BatchLoad` 的 `Slice` 由调用方按 `data_size` 预分配；后端不得改写 `slice.ptr`。
 - `IsExist` 的“不存在”是 `expected(false)`；传输错误必须返回 `unexpected`。
 - `ScanMeta` 本版返回 `OK` 且不调用 handler；`ResetScanIterator` 空实现。
@@ -519,7 +568,7 @@ tl::expected<bool, ErrorCode> KvClientStorageBackend::IsEnableOffloading() {
 | `ENTRY_NO_RETRY_ADVISED` | `INTERNAL_ERROR` | |
 | `ENTRY_KEY_EXIST`, `CQE_KEY_ALREADY_EXISTED` | 视为成功（upsert） | 本版不依赖条件写 |
 | `ENTRY_DELETE_FAILED` | `FILE_WRITE_FAIL` | 删除失败；恢复索引 |
-| `RecordHeader` magic/version/length/fingerprint 不符 | `INVALID_READ` | 内容损坏或 key 碰撞 |
+| `RecordHeader` magic/version/length 不符 | `INVALID_READ` | 内容损坏 |
 | `RecordHeader` CRC-32C 不符 | `INVALID_READ` | 头不可信 |
 | payload CRC-32C 不符 | `CHECKSUM_MISMATCH` | 撕裂/位翻转 |
 | 本地 `ptr == nullptr` / `size == 0` | `INVALID_PARAMS` | 读 |
@@ -536,13 +585,28 @@ tl::expected<bool, ErrorCode> KvClientStorageBackend::IsEnableOffloading() {
 | 查语义 | 以 ASU `QueryResult.exists` 为准；索引不参与 |
 | 长度来源 | Master metadata（读）、写路径计算（写）；ASU 不提供长度 |
 | 可见性 | `complete_handler` 成功之前，Master 不知道该副本 |
-| 容量计数 | `total_size_` 计 `align_up(40 + payload, 512)`；仅统计本进程写入，重启后从 0 开始 |
+| 容量计数 | `total_size_` 计 `align_up(24 + payload, 512)`；仅统计本进程写入，重启后从 0 开始 |
 | 删除 | master-first（Master 先删元数据）；`BatchRemoveKeys` 逐 key `DeleteAsync`；`NOT_FOUND` 视为成功；失败恢复索引 |
 | RemoveAll | 本版不支持；继承空实现；`Client::RemoveAll` 不会物理删除 ASU |
 | 恢复 | 本版不恢复；`ScanMeta` 返回 OK 空扫描 |
 | 二次 Init | 返回 `INTERNAL_ERROR` |
 
 ### 3.6 Key 与记录布局
+
+**Mooncake 的真实 key 形态**
+
+| 层 | 类型/格式 | 说明 | 证据 |
+| --- | --- | --- | --- |
+| 用户 / Client API | `ObjectKey = std::string` | 用户传入的对象 key，不含 tenant | `types.h:201` |
+| Master 元数据 | `ObjectIdentity { TenantId tenant_id; std::string user_key; }` | tenant 是独立字段，不是 `user_key` 的一部分 | `master_service.h:1201-1204, 1302-1305` |
+| Master offload 任务 | `OffloadTaskItem { std::string tenant_id; std::string key; int64_t size; }` | 心跳返回的任务按 tenant + 裸 key 携带 | `types.h:268-277` |
+| FileStorage → StorageBackend | `scoped_key = tenant_id + '\0' + local_key` | `TenantId::MakeScopedKey`；`BatchOffload`/`BatchLoad`/`IsExist`/`BatchRemoveKeys` 都用它 | `tenant_id.h:42-48`；`file_storage.cpp:367-370, 488, 582, 1399-1404` |
+| Backend → ASU | `asu_key = XXH64(..., 8B)` | 不可逆 | 本设计 |
+
+- `TenantId` 默认 `"default"`；tenant 只允许可打印 ASCII（`0x20..0x7e`）、不能以 `_` 开头；
+  分隔符是 `'\0'`（`tenant_id.h`）。
+- `StorageObjectMetadata.key_size = scoped_key.size()`；`data_size = payload_size`。
+- 后端只看到 `scoped_key`，看不到裸 `ObjectKey`；不要假设 key 里没有 `'\0'`。
 
 **`asu_key`（`kv::CacheKey`）**
 
@@ -553,7 +617,7 @@ asu_key = XXH64("mooncake/kvclient/v1" + key_namespace + 0x00 + scoped_key, seed
 - `asu_key` 是 `kv::CacheKey`（8 字节），按小端写入。
 - `key_namespace` 由配置必填；它参与哈希，不同命名空间的同一 `scoped_key` 得到不同 `asu_key`。
   它只是 ASU 侧的逻辑命名空间，与 Master 的 `TenantId` 无关（见 §3.7）。
-- 64-bit 碰撞概率约 `N^2 / 2^65`；1 亿对象约 `5e-4`。`RecordHeader` 存 128-bit fingerprint 检测碰撞。
+- **本版不处理 64-bit 哈希碰撞**：默认不发生小概率碰撞。若后续需要，可增加 slot 探测或版本化 key。
 
 **记录布局（`RecordHeader` + payload）**
 
@@ -561,22 +625,53 @@ asu_key = XXH64("mooncake/kvclient/v1" + key_namespace + 0x00 + scoped_key, seed
 0   u32 magic          0x4B564331 ("KVC1")
 4   u16 version        1
 6   u16 flags          bit0 chunked（本版必须 0）; bit1 has_payload_crc
-8   u64 fingerprint_lo XXH64(scoped_key, seed=1)
-16  u64 fingerprint_hi XXH64(scoped_key, seed=2)
-24  u32 payload_size   单 payload <= UINT32_MAX
-28  u32 reserved       0
-32  u32 payload_crc32c
-36  u32 header_crc32c  对 [0,36) 计算，本字段按 0 参与
-40  ... payload        各 Slice 按序拼接，无补齐
+8   u32 payload_size   单 payload <= UINT32_MAX
+12  u32 reserved       0
+16  u32 payload_crc32c
+20  u32 header_crc32c  对 [0,20) 计算，本字段按 0 参与
+24  ... payload        各 Slice 按序拼接，无补齐
 ```
 
-- `record_size = 40 + payload_size`；`transfer_size = align_up(record_size, 512)`。
+- `record_size = 24 + payload_size`；`transfer_size = align_up(record_size, 512)`。
 - `KVBuffer`：`key = asu_key`、`offset = 0`、`region.size = transfer_size`、`handle = slot.handle`。
 - 上报 Master 的 `data_size = payload_size`。
-- 读校验顺序：`transfer_size >= 40` → magic → version → flags → `payload_size` 在
-  `transfer_size - 40` 以内 → `RecordHeader` CRC → fingerprint → payload CRC。
-- 单对象上限：`min(config.max_payload_bytes, ASU 单 value 上限 - 40)`，再受 staging slot 大小约束；
+- 读校验顺序：`transfer_size >= 24` → magic → version → flags → `payload_size` 在
+  `transfer_size - 24` 以内 → `RecordHeader` CRC → payload CRC。
+- 单对象上限：`min(config.max_payload_bytes, ASU 单 value 上限 - 24)`，再受 staging slot 大小约束；
   超限 key 在写路径跳过并记录。
+
+**`payload_size` / `transfer_size` 的区别与例子**
+
+- `payload_size`：对象真实数据长度，等于各 `Slice.size` 之和；不含 `RecordHeader`。它就是上报
+  Master 的 `data_size`，也是读路径里 `slice.size` 的期望值。
+- `record_size = 24 + payload_size`：`RecordHeader` + payload 的逻辑长度。
+- `transfer_size = align_up(record_size, 512)`：实际向 ASU 读/写的字节数，包含 24B 头和零填充；
+  `KVBuffer.region.size` 必须用它，`offset = 0`。
+
+| `payload_size` | `record_size` | `transfer_size` | 填充字节 |
+| --- | --- | --- | --- |
+| 0 | 24 | 512 | 488 |
+| 471 | 495 | 512 | 17 |
+| 488 | 512 | 512 | 0 |
+| 489 | 513 | 1024 | 511 |
+| 1000 | 1024 | 1024 | 0 |
+| 4096 | 4120 | 4608 | 488 |
+
+写一个 1000B 对象（两个 Slice：600B + 400B）：
+
+- `payload_size = 1000`、`record_size = 1024`、`transfer_size = 1024`。
+- staging slot 布局：`[24B RecordHeader][600B][400B]`（恰好 1024B，无填充）。
+- `KVBuffer.region.size = 1024`、`offset = 0`；上报 Master 的 `data_size = 1000`。
+
+读同一个对象（Master 给出 `slice.size = 1000`）：
+
+- `payload_size = slice.size = 1000`、`transfer_size = 1024`。
+- 从 ASU 读 1024B 到 staging；头里的 `payload_size` 必须等于 1000。
+- 校验 `RecordHeader` CRC、payload CRC。
+- 只 `memcpy` 1000B 到 `slice.ptr`。
+- 索引记 `{payload_size=1000, transfer_size=1024}`；`total_size_` 按 1024 计。
+
+填充字节不参与 payload CRC，也不返回给调用方；读时以头里的 `payload_size` 决定拷贝长度。
 
 **CRC-32C 的定位**：`mooncake-store/include/crc32c.h` 是 Mooncake 自己的 CRC-32C 实现；
 它是标准算法，但不是 ASU 或 Mooncake 的全局强制格式。`NvmeKvStorageBackend` 使用
@@ -588,8 +683,7 @@ per-value checksum；transport 校验不覆盖 at-rest 数据。因此本后端�
 
 | 校验 | 本版 | 理由 |
 | --- | --- | --- |
-| `RecordHeader` CRC-32C（40B） | **必须** | 只覆盖 36B，成本极低；保护 `payload_size`/flags/fingerprint，防止按错误长度拷贝 |
-| 128-bit fingerprint | **必须** | ASU key 只有 64 bit；没有它无法区分碰撞/串写 |
+| `RecordHeader` CRC-32C（24B） | **必须** | 只覆盖 20B，成本极低；保护 `payload_size`/flags，防止按错误长度拷贝 |
 | payload CRC-32C | **本版固定开启** | ASU 不提供 per-value checksum；撕裂/位翻转只能靠它发现。后续性能评估可加 `enable_payload_crc`，但 KV cache 场景不建议关闭 |
 | 替代算法 | 不采用 | XXH32/XXH3 更快，但哈希不是纠错码；对 burst error 的检测弱于 CRC-32C |
 
@@ -602,10 +696,8 @@ struct PreparedOffloadBatch {
     struct PreparedEntry {
         std::string scoped_key;  // tenant\0local_key，用于索引与 complete_handler
         kv::CacheKey asu_key;    // 8B ASU key（哈希后）
-        uint64_t fingerprint_lo; // 128-bit fingerprint，写入 RecordHeader
-        uint64_t fingerprint_hi;
-        uint32_t payload_size;   // 不含 RecordHeader（40B）
-        uint32_t transfer_size;  // align_up(40 + payload_size, 512)
+        uint32_t payload_size;   // 不含 RecordHeader（24B）
+        uint32_t transfer_size;  // align_up(24 + payload_size, 512)
         StagingSlot slot;        // 已注册内存；生命周期覆盖到 Wait 完成
     };
     std::vector<PreparedEntry> entries;  // 通过预检查、可提交 ASU 的 key
@@ -657,7 +749,7 @@ struct KvClientBackendConfig {
 - `ucm_config_path` 是 UCM 的 view/transport 配置文件路径，不是 Mooncake 自己的配置文件。
 - `key_namespace` 只用于 ASU key 哈希的域隔离；它**不是** Master 的 `TenantId`：租户隔离由
   `scoped_key` 的 `tenant\0local_key` 前缀表达，不参与 ASU key 计算。
-- `max_payload_bytes` 是 payload 大小（不含 `RecordHeader`，40B），与上报 Master 的 `data_size` 同义。
+- `max_payload_bytes` 是 payload 大小（不含 `RecordHeader`，24B），与上报 Master 的 `data_size` 同义。
 - 字节配置沿用仓库的 `int64_t`（`bucket_size_limit`、`total_size_limit`）；两个超时用 `uint64_t`，
   因为 UCM `Wait` 接收 `uint64_t`。`Validate()` 检查 `staging_bytes`、`batch_size`、
   `max_payload_bytes`、`wait_timeout_ms`、`query_timeout_ms` 均 `> 0`，并检查 `key_namespace` 非空。
@@ -690,13 +782,13 @@ struct KvClientBackendConfig {
 
 | 能力/限制 | 本版处理 |
 | --- | --- |
-| key 8 字节 | 哈希映射 + 128-bit fingerprint 检测碰撞 |
+| key 8 字节 | 哈希映射；本版不处理 64-bit 碰撞（默认不发生） |
 | 无长度查询 | 写时计算；读时用 Master 的 `slice.size` |
 | 无枚举 | `ScanMeta` 返回 OK 空扫描；不做恢复 |
 | 512B 对齐 | `transfer_size = align_up(record_size, 512)`；`offset=0` |
 | 注册内存 | staging arena；读写都经过 staging |
-| 单 payload 上限 | `min(config.max_payload_bytes, ASU 单 value 上限 - 40)` |
-| 批量 key 上限 | `min(config.batch_size, ASU 上限)` |
+| 单 payload 上限 | `min(config.max_payload_bytes, ASU 单 value 上限 - 24)` |
+| 批量 key 上限 | `config.batch_size`（默认 32；ASU batch 上限未通过公共 API 暴露，超限时切半重试） |
 | 异步 task | 每批提交后 `Wait`；超时 `RPC_TIMEOUT` |
 | ASU 自身 GC | 无法观测；查/读遇到 `NOT_FOUND` 按缺失处理 |
 | 删除 | 仅 `Client::Remove`/`BatchRemove` 触发的按 key 删除；无 `RemoveAll`/正则/水位淘汰 |
@@ -803,12 +895,11 @@ classDiagram
 
     class KvClientKeyCodec {
         +EncodeKey(key_namespace, scoped_key) kv::CacheKey
-        +Fingerprint(scoped_key) Fingerprint
     }
 
     class KvClientRecordCodec {
         +Encode(scoped_key, slices) EncodedRecord
-        +Parse(buffer, expected_fingerprint) DecodedRecord
+        +Parse(buffer) DecodedRecord
         +TransferSize(record_size) size
     }
 
@@ -875,7 +966,6 @@ classDiagram
     }
     class KvClientKeyCodec {
         +EncodeKey(key_namespace, scoped_key) kv::CacheKey
-        +Fingerprint(scoped_key) Fingerprint
     }
     class KvClientRecordCodec {
         +Encode(scoped_key, slices) EncodedRecord
@@ -960,14 +1050,14 @@ offload 队列，下一次心跳调用本方法；`offload_on_evict=true` 时同
    `KEYS_ULTRA_LIMIT`。
 4. 逐 key 预处理：
    - `scoped_key` 为空 → 跳过并记录 `INVALID_KEY`。
-   - 计算 `asu_key`（`kv::CacheKey`，8B）和 128-bit fingerprint；payload 超有效上限
-     （`min(config.max_payload_bytes, ASU 单 value 上限 - 40)`）、超 `UINT32_MAX`、或
+   - 计算 `asu_key`（`kv::CacheKey`，8B）；payload 超有效上限
+     （`min(config.max_payload_bytes, ASU 单 value 上限 - 24)`）、超 `UINT32_MAX`、或
      `transfer_size` 超过 staging slot → 跳过并记录 `INVALID_PARAMS`。
-   - 拼接 Slice 为连续 payload；生成 `RecordHeader`（40B）；尾部补零到 `transfer_size`。
+   - 拼接 Slice 为连续 payload；生成 `RecordHeader`（24B）；尾部补零到 `transfer_size`。
    - 若 `total_size_ + transfer_size > total_size_limit` 或
      `total_keys_ >= total_keys_limit`，跳过该 key；本版不做淘汰来腾空间。
 5. 从 `StagingArena` 分配 slot；把记录拷入 slot 的已注册内存。
-6. 按 `min(config.batch_size, ASU 上限)` 切块：
+6. 按 `config.batch_size` 切块；若某块返回 `INVALID_ARGUMENT`，切半重试该块一次：
    - 多 key 用 `BatchStoreAsync`，单 key 用 `StoreAsync`。
    - 每块提交后 `Wait(task_id, wait_timeout_ms, result)`。
    - 逐 entry 检查 `entryStatus`；聚合 `PARTIAL_FAILED` 不当作整批失败。
@@ -981,7 +1071,7 @@ offload 队列，下一次心跳调用本方法；`offload_on_evict=true` 时同
        .bucket_id = -1,
        .offset = 0,
        .key_size = static_cast<int64_t>(scoped_key.size()),
-       .data_size = static_cast<int64_t>(payload_size),  // 不含 RecordHeader（40B）
+       .data_size = static_cast<int64_t>(payload_size),  // 不含 RecordHeader（24B）
        .transport_endpoint = "",
    }
    ```
@@ -1015,7 +1105,7 @@ classDiagram
     class KvClientStorageBackend {
         +BatchLoad(slices) expected
         -LookupIndex(scoped_key) optional
-        -ValidateRecord(buffer, fingerprint) DecodedRecord
+        -ValidateRecord(buffer) DecodedRecord
         -CommitIndex(scoped_key, payload_size)
     }
     class PayloadSizeIndex {
@@ -1032,7 +1122,7 @@ classDiagram
         +Wait(taskId, timeoutMs, result) Status
     }
     class KvClientRecordCodec {
-        +Parse(buffer, expected_fingerprint) DecodedRecord
+        +Parse(buffer) DecodedRecord
     }
     FileStorage --> KvClientStorageBackend : calls
     KvClientStorageBackend --> PayloadSizeIndex : optional cache
@@ -1059,7 +1149,7 @@ sequenceDiagram
     loop each key
         BE->>BE: validate ptr and slice.size
         BE->>BE: optional index snapshot, release
-        BE->>BE: payload_size = slice.size, transfer_size = align_up(40 + payload_size, 512)
+        BE->>BE: payload_size = slice.size, transfer_size = align_up(24 + payload_size, 512)
     end
 
     BE->>SA: Acquire(slots)
@@ -1072,12 +1162,12 @@ sequenceDiagram
         alt not found
             BE->>BE: remove index entry if present
             BE-->>FS: OBJECT_NOT_FOUND (first_error)
-        else RecordHeader or fingerprint invalid
+        else RecordHeader invalid
             BE-->>FS: INVALID_READ (first_error)
         else CRC mismatch
             BE-->>FS: CHECKSUM_MISMATCH (first_error)
         else valid
-            BE->>RC: Parse(buffer, fingerprint)
+            BE->>RC: Parse(buffer)
             BE->>FS: memcpy payload into slice.ptr
             BE->>BE: CommitIndex (optional cache)
         end
@@ -1093,27 +1183,25 @@ sequenceDiagram
 2. 对每个输入 key：
    - `slice.ptr == nullptr` 或 `slice.size == 0` → `INVALID_PARAMS`。
    - **`payload_size = slice.size`**（Master 提供的权威长度）；`transfer_size =
-     align_up(40 + payload_size, 512)`；超过 staging slot → `INVALID_PARAMS`。
+     align_up(24 + payload_size, 512)`；超过 staging slot → `INVALID_PARAMS`。
    - 索引是可选缓存：命中时可用于日志/统计；**不要求命中**。
 3. 分配 staging slot，构造 `KVBuffer{key, offset=0, region.size=transfer_size, handle}`。
 4. 按 `batch_size` 切块，`BatchLoadAsync` + `Wait`；逐 entry 检查状态。
 5. 逐结果校验：
    - `NOT_FOUND`：从索引删除（若存在），记 `OBJECT_NOT_FOUND`。
    - `TIMEOUT`/`CONNECTION_ERROR`/`IO_ERROR`：映射后记首错。
-   - 读回长度 < 40（不足一个 `RecordHeader`）：`INVALID_READ`。
+   - 读回长度 < 24（不足一个 `RecordHeader`）：`INVALID_READ`。
    - magic/version/flags 不符：`INVALID_READ`。
    - `payload_size` 超出 buffer 或与 `slice.size` 不一致：`INVALID_PARAMS`。
    - `RecordHeader` CRC 不符：`INVALID_READ`。
-   - fingerprint 不符：`INVALID_READ`（key 碰撞或串写）。
    - payload CRC 不符：`CHECKSUM_MISMATCH`。
-   - 全部通过：`memcpy(slot + 40, slice.ptr, payload_size)`，并按 `payload_size` 更新索引。
+   - 全部通过：`memcpy(slot + 24, slice.ptr, payload_size)`，并按 `payload_size` 更新索引。
 6. 释放 slot；返回 `OK` 或首个错误；已经写入的 slice 不回滚。**不改写 `slice.ptr`**。
 
-**为什么需要两层 CRC 和 fingerprint**：
+**为什么需要两层 CRC**：
 
 - 头 CRC-32C 保护“怎么读”：magic/version/flags/payload_size 决定拷贝长度和记录类型。
 - payload CRC-32C 保护“读到的内容”：检测撕裂、位翻转、写入中断。
-- fingerprint 不是校验和，而是身份校验：ASU key 只有 64 bit，两个 `scoped_key` 可能碰撞。
 - CRC-32C 只检测偶然损坏，不防恶意篡改；512B padding 不参与 payload CRC。
 
 ### 4.4 查：`IsExist`
@@ -1396,8 +1484,9 @@ sequenceDiagram
 - 校验 `KvClientBackendConfig::Validate()`；`client_ = kv::CreateKvClient()`；按
   `ucm_config_path` 或 `KvClientConfig` 初始化。**不打开设备、不建 backend 线程池**；
   UCM 内部管理连接/worker/transport 线程。
-- 计算 slot size：`align_up(40 + max_payload, 512)`；slot 数 = `staging_bytes / slot_size`，
-  至少 1，且不超过 `config.batch_size`。`StagingArena::Init` 分配对齐内存并 `RegisterRegions`；
+- 计算 slot size：`align_up(24 + max_payload, 512)`；slot 数 = `staging_bytes / slot_size`，
+  至少 1；若小于 `config.batch_size`，写路径按可用 slot 数进一步分子批（有界等待，见 TC-WRITE-04）。
+  `StagingArena::Init` 分配对齐内存并 `RegisterRegions`；
   失败时注销已注册的部分区域。
 - 计数置 0，索引为空。
 - 任一步失败：`client_->Shutdown()`、`client_.reset()`、`initialized_.store(InitState::kUninit)`，
@@ -1498,7 +1587,6 @@ OffsetAllocator 取决于 `persist_mode`（默认不恢复）；NVMe KV 完全�
 | FM-INIT-03 | Init | 二次 Init | 计数/索引被重置或重复注册 | 状态不一致、重复 task | S2 | CAS 保护；第二次返回 `INTERNAL_ERROR` | TC-INIT-03 |
 | FM-INIT-04 | Init | `key_namespace` 为空或配置非法 | 使用无效 key 启动 | 写入错误对象或全部失败 | S2 | `Validate` 失败；`INVALID_PARAMS` | TC-INIT-04 |
 | FM-INIT-05 | Init | 失败后未 `Shutdown`/未复位 `initialized_` | client/内存泄漏；无法重试 | 节点只能重启 | S2 | 失败路径统一 Shutdown + reset + 复位；单测覆盖 | TC-INIT-05 |
-| FM-WRITE-01 | 写 | 8B key 碰撞 | 两个 `scoped_key` 覆盖同一 ASU key | 一个对象丢失或读错 | S1 | 128-bit fingerprint 读校验；日志 | TC-WRITE-01 |
 | FM-WRITE-02 | 写 | `RecordHeader` 编码错误 | 读端拒收合法数据 | offload 数据不可读 | S2 | `RecordHeader` 单测；头 CRC | TC-WRITE-02 |
 | FM-WRITE-03 | 写 | payload 超 slot/单值上限 | 该 key 跳过 | offload 不完整，Master 仍持有内存副本 | S3 | 跳过集合；日志；返回成功数 | TC-WRITE-03 |
 | FM-WRITE-04 | 写 | staging 耗尽 | 批次阻塞或跳过 | 心跳延迟或丢批 | S3 | 有界等待/跳过；slot 计数 | TC-WRITE-04 |
@@ -1522,7 +1610,6 @@ OffsetAllocator 取决于 `persist_mode`（默认不恢复）；NVMe KV 完全�
 | FM-READ-02 | 读 | ASU `NOT_FOUND` | 返回 `OBJECT_NOT_FOUND` | Master 路由悬挂 | S2 | 清索引；probe 修复 | TC-READ-02 |
 | FM-READ-03 | 读 | magic/version/flags 损坏 | `INVALID_READ` | 不返回错误数据 | S1 | 头校验 | TC-READ-03 |
 | FM-READ-04 | 读 | `RecordHeader` CRC 损坏 | `INVALID_READ` | `RecordHeader` 不可信 | S1 | CRC-32C | TC-READ-03 |
-| FM-READ-05 | 读 | fingerprint 不匹配 | `INVALID_READ` | key 碰撞/串写被发现 | S1 | 128-bit fingerprint | TC-READ-04 |
 | FM-READ-06 | 读 | payload CRC 损坏 | `CHECKSUM_MISMATCH` | 不返回撕裂数据 | S1 | CRC-32C | TC-READ-05 |
 | FM-READ-07 | 读 | 读回长度不足/超出 | `INVALID_READ`/`INVALID_PARAMS` | 不越界拷贝 | S1 | 读回长度校验 | TC-READ-06 |
 | FM-READ-08 | 读 | 索引缺失但对象存在 | 若强制查索引则读失败 | 重启后读不可用 | S2 | 以 `slice.size` 为准；成功后补索引 | TC-READ-07 |
@@ -1552,8 +1639,7 @@ OffsetAllocator 取决于 `persist_mode`（默认不恢复）；NVMe KV 完全�
 | TC-INIT-03 | FM-INIT-03 | 连续两次 Init | 两次调用 | 第一次 OK；第二次 `INTERNAL_ERROR`；索引/计数不变 |
 | TC-INIT-04 | FM-INIT-04 | `key_namespace` 为空/配置非法 | 调 Validate/Init | Validate false；Init `INVALID_PARAMS`；不调用 KvClient |
 | TC-INIT-05 | FM-INIT-05 | `RegisterRegions` 失败 | 调 Init，再重试 | 首次失败后 `initialized_ == kUninit`、client 已 Shutdown；第二次 Init 成功 |
-| TC-WRITE-01 | FM-WRITE-01 | 注入两个 `scoped_key` 映射到同一 8B key | 写两个对象，再读第一个 | 读返回 `INVALID_READ`；不返回错误字节；日志含碰撞提示 |
-| TC-WRITE-02 | FM-WRITE-02 | 固定 payload/`RecordHeader` 向量 | 编码后再解码 | 字段/CRC/fingerprint 与向量一致；篡改任一字段解码失败 |
+| TC-WRITE-02 | FM-WRITE-02 | 固定 payload/`RecordHeader` 向量 | 编码后再解码 | 字段/CRC 与向量一致；篡改任一字段解码失败 |
 | TC-WRITE-03 | FM-WRITE-03/11 | payload 超 slot、超配额、空 key | 批量写 3 个 key | 超限 key 跳过；其余成功；handler 只收到成功 key；不返回 `KEYS_ULTRA_LIMIT` |
 | TC-WRITE-04 | FM-WRITE-04 | staging slot=1，延长 Wait | 并发两个写 | 有界等待；无死锁；slot 全部归还；成功数正确 |
 | TC-WRITE-05 | FM-WRITE-05 | `BatchStoreAsync` 返回错误 | 调 BatchOffload | 无 handler 调用；返回错误；索引/计数不变 |
@@ -1573,7 +1659,6 @@ OffsetAllocator 取决于 `persist_mode`（默认不恢复）；NVMe KV 完全�
 | TC-READ-01 | FM-READ-01 | 写入 4096B，读时 `slice.size=4097` | 调 BatchLoad | 返回 `INVALID_PARAMS`；`slice.ptr` 内容不变 |
 | TC-READ-02 | FM-READ-02 | ASU 无该 key | 调 BatchLoad | 返回 `OBJECT_NOT_FOUND`；索引条目被清理；无崩溃 |
 | TC-READ-03 | FM-READ-03/04 | 篡改 magic/version/`RecordHeader` CRC | 调 BatchLoad | 返回 `INVALID_READ`；不拷贝 payload；缓冲区不变 |
-| TC-READ-04 | FM-READ-05 | 篡改 fingerprint | 调 BatchLoad | 返回 `INVALID_READ`；不返回错误字节 |
 | TC-READ-05 | FM-READ-06 | 篡改 payload 一个字节 | 调 BatchLoad | 返回 `CHECKSUM_MISMATCH`；不拷贝 payload |
 | TC-READ-06 | FM-READ-07 | fake 返回短读/超长 | 调 BatchLoad | 返回 `INVALID_READ`/`INVALID_PARAMS`；ASAN 无越界 |
 | TC-READ-07 | FM-READ-08 | 清空索引，Master 提供 `slice.size` | 调 BatchLoad | 读成功；字节一致；索引被补回 |
@@ -1601,7 +1686,7 @@ OffsetAllocator 取决于 `persist_mode`（默认不恢复）；NVMe KV 完全�
 - `DelayNext(op, ms)`：模拟 `Wait` 超时。
 - `PartialFailure(indices)`：让指定 entry 在 `entryStatus` 中失败，聚合状态为 `PARTIAL_FAILED`。
 - `FailDelete(key, StatusCode)`：删除失败，用于验证索引恢复。
-- `CorruptValue(key, field)`：篡改 magic/version/`RecordHeader` CRC/fingerprint/payload CRC。
+- `CorruptValue(key, field)`：篡改 magic/version/`RecordHeader` CRC/payload CRC。
 - `RejectUnregisteredBuffer()`：模拟 `BUFFER_NOT_REGISTERED`。
 - `RecordCalls()`：记录提交/等待顺序和 task 数。
 
@@ -1613,6 +1698,8 @@ OffsetAllocator 取决于 `persist_mode`（默认不恢复）；NVMe KV 完全�
   - `RemoveAll`/`RemoveByRegex`/水位淘汰不支持；这些操作只删元数据，ASU 数据残留。
   - 真实 ASU 对“删除不存在的 key”的返回码需实测；本版按 `KEY_NOT_EXIST`/`NOT_FOUND` 归一成功。
   - owner 路由/`key_namespace` 配置错误会导致漏删或删错，需要审计与配置校验。
+  - `asu_key` 只有 64 bit；本版不做碰撞检测，假设不发生小概率碰撞。若发生，后写对象会覆盖先写对象，
+    读先写 key 可能返回后写对象的数据（该 value 自身 CRC 仍可能通过）。这是本版明确接受的假设。
 
 
 ## 6. Mooncake 改动量
@@ -1629,8 +1716,8 @@ OffsetAllocator 取决于 `persist_mode`（默认不恢复）；NVMe KV 完全�
 | 6 | `mooncake-store/src/config/kv_client_backend_config.cpp` | 环境变量解析 + `Validate` | +100~140 | 必须 |
 | 7 | `mooncake-store/include/kv_client/backend.h` | 后端声明；前置声明 `kv::KvClient`；`BatchRemoveKeys` | +140~190 | 必须 |
 | 8 | `mooncake-store/src/kv_client/backend.cpp` | 写/读/查/按 key 删、索引、task 编排、UCM 类型/错误映射 | +1,200~1,600 | 必须 |
-| 9 | `mooncake-store/include/kv_client/record.h` + `mooncake-store/src/kv_client/record.cpp` | `KvClientRecordCodec`：`RecordHeader`（40B）、CRC、fingerprint | +140~200 | 必须 |
-| 10 | `mooncake-store/include/kv_client/key_codec.h` + `mooncake-store/src/kv_client/key_codec.cpp` | `KvClientKeyCodec`：8B key + 128-bit fingerprint | +80~120 | 必须 |
+| 9 | `mooncake-store/include/kv_client/record.h` + `mooncake-store/src/kv_client/record.cpp` | `KvClientRecordCodec`：`RecordHeader`（24B）、CRC | +100~160 | 必须 |
+| 10 | `mooncake-store/include/kv_client/key_codec.h` + `mooncake-store/src/kv_client/key_codec.cpp` | `KvClientKeyCodec`：`scoped_key` → 8B `asu_key` | +50~80 | 必须 |
 | 11 | `mooncake-store/include/kv_client/staging.h` + `mooncake-store/src/kv_client/staging.cpp` | `StagingArena`：注册内存、slot 池 | +180~280 | 必须 |
 | 12 | `mooncake-store/include/kv_client/factory.h` + `mooncake-store/src/kv_client/factory.cpp`；`mooncake-store/include/kv_client/reference_kv_client.h` + `mooncake-store/src/kv_client/reference_kv_client.cpp`（`ReferenceKvClient`） | 工厂 + 参考实现（各自独立文件） | +200~300 | 必须 |
 | 13 | `mooncake-store/src/CMakeLists.txt` | 源文件 + UCM include/link；`USE_UCM` | +20~40 | 必须 |
@@ -1643,7 +1730,7 @@ OffsetAllocator 取决于 `persist_mode`（默认不恢复）；NVMe KV 完全�
 | 20 | `mooncake-store/tests/storage_backend_test_utils.h` + `storage_backend_test.cpp` | 抽取共享 helper | +80~140 / +10~20 | 必须 |
 | 21 | `mooncake-store/tests/kv_client/backend_test.cpp` | 写/读/查/删契约、故障、并发、owner 路由 | +900~1,300 | 必须 |
 | 22 | `mooncake-store/tests/kv_client/record_test.cpp` | `RecordHeader`/`Record` 测试 | +140~200 | 必须 |
-| 23 | `mooncake-store/tests/kv_client/key_codec_test.cpp` | key/fingerprint 测试 | +80~120 | 必须 |
+| 23 | `mooncake-store/tests/kv_client/key_codec_test.cpp` | key 编码测试 | +50~80 | 必须 |
 | 24 | `mooncake-store/tests/kv_client/staging_test.cpp` | 对齐/注册/池测试 | +100~160 | 必须 |
 | 25 | `mooncake-store/tests/kv_client/fake_kv_client.h` | `FakeKvClient : public kv::KvClient` | +200~300 | 必须 |
 | 26 | `mooncake-store/tests/kv_client/kv_client_backend_config_test.cpp` | 配置/能力校验 | +100~150 | 必须 |
@@ -1692,16 +1779,17 @@ OffsetAllocator 取决于 `persist_mode`（默认不恢复）；NVMe KV 完全�
 | ASU | 存储节点/设备：持久化 KV，拥有自身的容量与 GC 策略 |
 | UCM | 客户端库/接入层：提供 `kv::KvClient`、视图路由、task 管理与内存注册 |
 | KVClient | 本文专指 UCM 的 `kv::KvClient`（旧分支 `UC::ASU::AsuClient`） |
-| `asu_key` | ASU key 变量名，类型 `kv::CacheKey`（8 字节）；由 `XXH64` 从 `key_namespace` + `scoped_key` 得到 |
+| `ObjectKey` | 用户/Client API 的对象 key，`using ObjectKey = std::string`（`types.h:201`）；不含 tenant，Master 侧按 `TenantId` 区分 |
+| `asu_key` | ASU key 变量名，类型 `kv::CacheKey`（8 字节）；由 `XXH64("mooncake/kvclient/v1" + key_namespace + 0x00 + scoped_key)` 得到 |
 | `kv::CacheKey` | ASU key 的类型：`std::array<std::byte, 8>` |
 | KVBuffer | ASU 的一次读写描述：key + 注册内存区间 + offset |
 | `scoped_key` | `TenantId::MakeScopedKey(tenant, key)`，即 `tenant_id + '\0' + local_key`；backend 接口统一用该名称，`FileStorage` 现有的 `storage_key` 指同一对象 |
 | key_namespace | 配置项，参与 ASU key 哈希的域隔离；与 Master 的 `TenantId` 无关 |
 | TenantId | Master 的多租户标识，编码在 `scoped_key` 的 `tenant` 前缀中；不参与 ASU key 计算 |
-| `RecordHeader` | 40 字节记录头：magic/version/flags/fingerprint/payload_size/CRC |
+| `RecordHeader` | 24 字节记录头：magic/version/flags/payload_size/CRC |
 | `Record` | `RecordHeader` + payload，即写入 ASU 的一条 value |
 | payload | 对象字节（value bytes），各 `Slice` 按序拼接，不含 `RecordHeader`；等于上报 Master 的 `data_size` |
-| transfer_size | `align_up(40 + payload_size, 512)`，ASU 实际传输长度 |
+| transfer_size | `align_up(24 + payload_size, 512)`，ASU 实际传输长度 |
 | staging arena | backend 持有、向 ASU 注册的读写中转内存 |
 | `ReferenceKvClient` | 仓库内的 `kv::KvClient` 参考实现（内存后端），仅 `client_impl=kReference` 时在 CI/单测使用 |
 | `FakeKvClient` | 测试替身，实现 `kv::KvClient`，用于故障注入；不进入生产 |
