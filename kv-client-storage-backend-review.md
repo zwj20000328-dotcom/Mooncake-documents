@@ -253,38 +253,6 @@ tl::expected<int64_t, ErrorCode> BatchOffload(batch, complete_handler, ...) {
     return published.size();
 }
 ```
-
-#### 3.1.4 注意事项
-
-- **`Init`**：三态 `kUninit → kInitializing → kReady`；任一步失败都要 `Shutdown` client、`reset` 指针、回滚 `kUninit`；二次 Init 返回 `INTERNAL_ERROR`。backend 不建线程池，连接/视图/transport 线程由 `KvClient` 内部管理。
-- **`IsEnableOffloading`**：`kReady` 后直接返回 true；未就绪返回错误，让 `FileStorage::Init` 明确失败；不读计数、不查 ASU。它只在 Init 调用一次，返回值被锁存，返回 false 会让本进程直到重启都不再 offload。
-
-  ```text
-  FileStorage::Init:      storage_backend_->Init() → IsEnableOffloading() → MountLocalDiskSegment(result)
-  FileStorage::Heartbeat: OffloadObjectHeartbeat(enable_offloading_)   // 锁存的 bool，不再调用 backend
-  ```
-- **配额/容量只在 `BatchOffload` 内逐批/逐 key 做**：超限 key 跳过，返回 `expected(success_count)`/`expected(0)`；下一轮心跳重试。
-- **绝不返回 `KEYS_ULTRA_LIMIT`**：该码会令 `FileStorage` 永久关闭 offload；其他硬错误会中断整个心跳周期（`file_storage.cpp:612-625`）。
-- **24-bit 上限**：`tensorSizes[0] <= 0xFFFFFF`，最大 `16,776,704`，对应 `payload_size <= 16,776,680`。原默认 `max_payload_bytes = 16 MiB` 不可用，建议默认 2 MiB。
-- **`PARTIAL_FAILED` 保守处理**：可能存在“entryStatus=OK 但子批未发送”，本块整体不发布；`Wait` 超时的 tensor 区间隔离，不复用。
-- **`mrKey` 不由后端填**：`BuildKvBuffers` 留空，SDK 的 `SubmitAsync` 按 `buffer.handle` 解析 `tokenId`，transport 组 SQE 时读取。
-- **`FindPersistentHandle`**：返回包含该 tensor 子区间的注册区域 handle；找不到说明分配越界，本批不提交。`RegisterRegions` 在 transports 为空时返回 OK + 空 vector，必须当失败。
-- **一个对象一个 `Shard`/tensor**：`BatchLoad` 只给一个连续 `Slice`，`vector<Slice>` 边界不持久化；整体作为一个 tensor 可以不做 per-slice 布局索引。未来要 per-slice entry 时再引入 `ObjectLayout`。
-- **`complete_handler` 失败**：数据已在 ASU、Master 未登记；本版不回滚，重试 Put 覆盖。
-
-**关键错误映射**
-
-| SDK 状态 | Mooncake | 处理 |
-| --- | --- | --- |
-| `BUFFER_NOT_REGISTERED` / `BUFFER_NOT_SUPPORTED` | `INVALID_PARAMS` | handle 错误/注册失败；按实现 bug 告警 |
-| `PARTIAL_FAILED` | 首个失败 entry 的错误 | 本块不发布 |
-| `TIMEOUT` / `TASK_NOT_FOUND` | `RPC_TIMEOUT` | tensor 区间隔离 |
-| `RESOURCE_BUSY` / `CQE_OUT_OF_CREATE_SIZE` | `UNAVAILABLE_IN_CURRENT_STATUS` | 本批跳过，下一轮重试 |
-| Query `exists=0` + `ENTRY_KEY_NOT_EXIST` | `expected(false)` | 未命中不是失败 |
-| Query `exists=0` + `IO_ERROR` 等 | `unexpected(...)` | 不能当不存在 |
-| Delete `CQE_KEY_NOT_EXIST` | 成功 | 幂等删除 |
-| Delete `ENTRY_DELETE_FAILED` | `FILE_WRITE_FAIL` | 失败日志/重试 |
-
 ---
 
 ### 3.2 读：`BatchLoad`
@@ -417,17 +385,6 @@ tl::expected<void, ErrorCode> BatchLoad(std::unordered_map<std::string, Slice>& 
     return first_error ? tl::make_unexpected(*first_error) : tl::expected<void, ErrorCode>{};
 }
 ```
-
-#### 3.2.4 注意事项
-
-- **前缀读必须支持**：Mooncake LOCAL_DISK ranged read 会传 `src_offset + size`（`real_client.cpp:5128-5138`），`slice.size` 可能小于对象全长。规则是 `slice.size <= payload_size`，按 `slice.size` 拷贝，不能要求 `payload_size == slice.size`。
-- **长度契约**：请求长度 `align_up(24 + slice.size, 512)` 隐含 `slice.size <= 对象实际 payload_size`；V1 依赖调用方契约，不做本地长度索引。
-- **CRC**：全长读校验 payload CRC；前缀读只能校验头 CRC（payload CRC 覆盖完整 value）。
-- **不要改写 `slice.ptr` / `slice.size`**；后端只写它们指向/描述的内存。
-- **`PARTIAL_FAILED` 不返回任何数据**；`Wait` 超时的 tensor 区间隔离。
-- **未命中**：`ENTRY_KEY_NOT_FOUND`/`CQE_KEY_NOT_EXIST` → `OBJECT_NOT_FOUND`；本版无索引，无需清索引。
-- **并发读**：多个 RPC worker 共享注册区域；`Wait` 期间不持锁。
-
 ---
 
 ### 3.3 查：`IsExist`
@@ -505,16 +462,6 @@ tl::expected<bool, ErrorCode> IsExist(const std::string& scoped_key) {
     return tl::make_unexpected(Map(entry));   // 分片失败不能当“不存在”
 }
 ```
-
-#### 3.3.4 注意事项
-
-- **查询超时/传输错误绝不能返回 false**：dangling replica probe 会把 false 当“对象不存在”并删 Master 元数据；必须返回 `unexpected`。
-- **Query 只有存在性，没有长度**：读长度仍以 Master 的 `slice.size` 为准。
-- **同时看 `exists` 与 `entryStatus`**：`exists=0` + `IO_ERROR` 是分片失败，不是未命中。
-- **`prefixHitKeys` 不使用**：它只是连续前缀命中数，不是总命中数。
-- **无副作用**：`IsExist` 不做懒修复、不删索引、不触发删除。
-- **`Wait` 是破坏性读**：超时/`TASK_NOT_FOUND` 返回错误；本路径不需要注册内存。
-
 ---
 
 ### 3.4 删
