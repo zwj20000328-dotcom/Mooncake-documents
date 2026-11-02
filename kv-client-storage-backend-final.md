@@ -60,7 +60,7 @@
 | B5 | §4.5 按 key 删除 + Master→owner 路由「必须」 | 需改 `storage_backend.h`/`file_storage.{h,cpp}`/`local_ssd/manager.{h,cpp}`/`master_service.cpp`/`client_service.cpp`，另需新增 RPC（`rpc_service.h` + `master_client.cpp` + `RpcNameTraits`），实测约 **500–900 行 / 10 个文件**；且 HA/oplog 路径必须在 `EraseMetadata` **之前**捕获 owner，原方案顺序写反了 | 整节删除（§3.7） |
 | B6 | 新增 `StorageBackendType::kKvClient` 等却宣称不改 Mooncake | 见 §0.1 冲突 1 | 收敛为 4 文件约 10 行（§2.1） |
 | B7 | `BatchOffload` 空间不足时返回错误码 | `IsPerBucketSoftOffloadError` 只放行 `INVALID_READ` / `OBJECT_ALREADY_EXISTS`（`file_storage.cpp:352-355`）；返回其它任何错误都会 `abort_error` + `break` **中断整个心跳周期**；`KEYS_ULTRA_LIMIT` 更会 `enable_offloading_ = false` **永久关闭 offload**（`file_storage.cpp:612-625`） | 可恢复情形一律返回 `expected(count)`（§3.5.2） |
-| B8 | `slice.size` == Master 权威全长；不等则 `INVALID_PARAMS` | Mooncake **确实发起前缀读**：非 pinned 的 LOCAL_DISK ranged read 传 `src_offset + size`（`real_client.cpp:5109-5138`），`get_into_ranges` 是公开 API 且被 EngramStore 使用 → 原规则会让**合法 ranged read 全部失败**并触发 dangling-replica 修复路径 | 支持前缀读（§3.5.3） |
+| B8 | `slice.size` == Master 权威全长；不等则 `INVALID_PARAMS` | Mooncake **确实发起前缀读**：非 pinned 的 LOCAL_DISK ranged read 传 `src_offset + size`（`real_client.cpp:5109-5138`），`get_into_ranges` 是公开 API 且被 EngramStore 使用 → 原规则会让**合法 ranged read 全部失败**并触发 dangling-replica 修复路径 | 支持前缀读；配合长度契约用单一公式 `align_up(32+slice.size,512)`（§3.5.3） |
 | B9 | `ReferenceKvClient` 参考实现 + `KvClientImplType{kUcm,kReference}` + env 选择 | SDK 无可继承的 `kv::KvClient` 接口；真正的测试缝是 `CreateAsuClient(TransportFactory, TransProviderFactory)`（`asu_client.h:75-81`）。第二套实现会与真实 ASU 语义漂移，且可被 env 选进生产 | 删除；改用 fake `AsuTransport`（§5.1） |
 | B10 | `PayloadSizeIndex` 作为独立子系统参与写/读/查/删 | 读的权威长度来自 Master 的 `slice.size`；查以 ASU `QueryResult.exists` 为准；索引重启即空且不影响正确性 → 文档自己也承认「索引可选」 | 删除；`IsEnableOffloading` 不依赖计数（§3.5.5） |
 
@@ -79,7 +79,7 @@
 | 记录头 | 40 B | **32 B** |
 | 独立子系统 | StagingArena / PayloadSizeIndex / KeyCodec / RecordCodec / Factory / ReferenceKvClient | **全部内联为 backend.cpp 私有 helper** |
 | 删除 | 按 key（Master→owner 路由） | **`RemoveAll()`（当前不可达，如实标注）** |
-| FMEA / 测试用例 | 39 FM / 38 TC | **15 FM / 17 TC** |
+| FMEA / 测试用例 | 39 FM / 38 TC | **19 FM / 23 TC** |
 
 ---
 
@@ -143,7 +143,8 @@ owner 的 offload 队列并对源 `MEMORY` 副本 `inc_refcnt`，`refcnt > 0` �
 | 批量上限 | 一次一个 map；非 bucket 后端会把**全部** drained key 放进单批（`file_storage.cpp:413-420`） | store/load 110、delete 254、query 256（`asu_transport.h:85-88`）；delete 线格式硬限 `[1,254]` | 后端内部按 `batch_size`（默认 32）切块 |
 | 单值上限 | — | length 是 **24-bit**：`≤ 0xFFFFFF` 且 512B 对齐（`kv_protocol.cpp:532-543`） | 硬校验 `transfer_size ≤ 16,776,704`，超限 key 跳过 |
 | key | 变长 `scoped_key`（`tenant\0local_key`） | 8 字节 `CacheKey`；**全零 key 被拒**（`kv_protocol.cpp:517-521`） | `XXH64` 派生；结果为 0 时重映射 |
-| 长度 | `slice.size` 可能是**前缀**（ranged read） | Query 只有存在性，无长度 | 记录头存 `payload_size`；支持前缀读（§3.5.3） |
+| 长度 | `slice.size` 可能是**前缀**（ranged read） | Query 只有存在性，无长度；`TaskResult` **也不返回实际传输字节数** | 记录头存 `payload_size`；请求长度恒为 `align_up(32+slice.size,512)`；校验只能以「请求长度」为依据（§3.5.3） |
+| **长度契约** | 使用方约定请求长度不超出存储长度 | 超读行为无法从 SDK 源码确定 | 靠 `align_up` 单调性**自动满足**：`slice.size ≤ payload_size` ⇒ 请求长度 ≤ 存储 `transfer_size`，故永不超读；代价是前缀读变成欠读，需真机确认支持（§6.2） |
 | value/内存 | `Slice` 任意内存，无需注册 | `KVBuffer` 必须引用已注册内存；offset/length 512B 对齐 | staging arena 注册；读写都经 staging |
 | 完整性 | 端到端 CRC-64-ECMA **默认关闭**（`MOONCAKE_STORE_CHECKSUM=false`）且 ranged read 跳过 | 无 per-value checksum | **payload CRC-32C 是必需的**（§3.3） |
 | 能力发现 | — | `ServerKvCapabilities` 存在但**公有 `AsuClient` 未暴露**（client 公有/impl 头无 `Capabilit*`） | 只依赖静态已知线格式限制；其余逐 entry 失败反馈 |
@@ -490,8 +491,11 @@ transfer_size = align_up(record_size, 512)
   且 ranged read 会跳过校验；ASU 公共 API 无 per-value checksum。
   → 这是唯一的 at-rest 完整性检查，**不可裁剪**。
   用 Mooncake 自带 `crc32c.h`（`Crc32c` 类，含 SSE4.2 加速路径，`crc32c.h:73,109-130`）。
-- 读校验顺序：`got ≥ 32` → magic → version → flags → 头 CRC → fingerprint →
-  `payload_size ≤ got - 32` → `payload_size ≥ slice.size` → payload CRC（**仅全长读**）。
+- 读校验顺序（详见 §3.5.3 步骤 5）：magic → version → flags → 头 CRC → fingerprint →
+  `payload_size ≤ max_payload_bytes` → `payload_size ≥ slice.size` →
+  payload CRC（**仅当 `transfer_size - 32 ≥ payload_size`**，即请求已覆盖整个 payload）。
+  注意校验依据是 `transfer_size`（请求长度）而**不是**任何「实际收到字节数」——
+  ASU 的 `TaskResult` 不返回实际传输长度（`types.h:177-181`）。
 
 **单值上限**：`max_payload_bytes` 的绝对硬上限是 **16,776,672 B**
 （原方案默认的 16 MiB 会撞 B3）。本文默认取 **2 MiB**，理由见下方耦合约束。
@@ -556,7 +560,10 @@ Init:  slot_size = align_up(32 + max_payload_bytes, 512)
 同理：
 
 - **隔离的区域在进程退出前不得 `UnregisterRegions`**（`Shutdown` 只是有界 drain）。
-- **读路径同样适用**（原方案只在写路径提到 slot 释放）。
+- **读路径同样适用**（原方案只在写路径提到 slot 释放）。此外读路径还要多做一步
+  **请求前投毒**：把 slot 前 32 B 清 0，防止「设备返回成功 CQE 但未写入」时，
+  slot 内**同 key 的上一轮记录**冒充本次结果（`TaskResult` 无实际传输长度，
+  这类静默短读否则完全不可观测）。见 §3.5.3 步骤 2 与 FM-READ-04 / TC-READ-04。
 - 隔离集是**单调增长**的：超时多 → 空闲 slot 耗尽 → 后续写跳过该 key 并返回
   `expected(已成功数)` + WARNING，**绝不返回 `KEYS_ULTRA_LIMIT`**（会永久关闭 offload）。
 - 「等待完成后再复用」和「可证明取消后再复用」两条路都不可行——公有 `AsuClient` 两者都不提供；
@@ -620,6 +627,11 @@ offload 队列，下一次心跳调用本方法。
 3. 取 `write_mutex_`。逐 key 预处理：
    - `scoped_key` 为空 → 跳过。
    - `payload_size = Σ slice.size`；`transfer_size = align_up(32 + payload_size, 512)`。
+   - **`payload_size == 0` → 跳过该 key**（记 WARNING）。
+     ★ 必须禁止零长对象：读侧对 `slice.size == 0` 返回 `INVALID_PARAMS`，
+     而零长对象的任何读请求都必然是零长，于是**一旦写入就永远读不回来**
+     （`slice.size ≥ 1` 时又会因 `slice.size ≤ payload_size(0)` 失败）。
+     在写侧拒绝比在读侧留下一个不可读对象更安全。
    - `transfer_size > 16,776,704` 或 `payload_size > max_payload_bytes` 或 `transfer_size > slot_size`
      → **跳过该 key**（记 `INVALID_PARAMS` 日志）。
    - 取空闲 slot；无空闲 → 跳过该 key（记 WARNING）。
@@ -675,60 +687,166 @@ FileStorage 会把该批**所有未上报的 key 以 `data_size = -1` NACK 回 M
 1. 空 map → `OK`。
 2. 逐 key 预检：
    - `slice.ptr == nullptr` 或 `slice.size == 0` → 记 `INVALID_PARAMS` 首错。
-   - `slice.size > max_payload_bytes` → `INVALID_PARAMS`（请求长度本身就不可能）。
+     （写侧已禁止 `payload_size == 0` 的对象落盘，故零长读不是合法请求。）
+   - `slice.size > max_payload_bytes` → `INVALID_PARAMS`。
+     **注意这是运维约束而非纯防御**：见下方「配置收缩」。
    - 取空闲 slot（读侧不取 `write_mutex_`，只取 `slots_mutex_`）。
-3. **确定传输长度**——这是本方法唯一的难点，分两种情形：
+   - **投毒**：把 slot 的前 32 B（记录头区域）清 0，使「设备返回成功但一个字节都没写」
+     必然在 magic 检查处失败，而不是让上一轮残留的同 key 记录冒充本次结果。
+3. **确定传输长度——单一公式，全长读与前缀读共用**：
 
-   | 情形 | `transfer_size` | 是否精确 |
-   | --- | --- | --- |
-   | **全长读**（`slice.size == payload_size`，稳态主路径） | `align_up(32 + slice.size, 512)` | ✅ 与写入时完全一致 |
-   | **前缀读**（`slice.size < payload_size`，ranged read） | `slot_size`（按满长 over-read） | ⚠️ 见下方风险 |
+   ```text
+   transfer_size = align_up(32 + slice.size, 512)
+   ```
 
-   前缀读无法算出精确长度：记录全长只能从记录头的 `payload_size` 得知，而那正是本次要读回来的东西；
-   ASU 的 `QueryAsync` 只有存在性、没有长度（§1.4）。因此只能 over-read。
+   **★ 为什么这一个公式就够（且永不违反长度契约）**：
+   `align_up` 单调不减，而契约保证 `slice.size ≤ payload_size`，于是
 
-   **⚠️ 必须实测的残留风险**：ASU 对「请求长度 > 存储值长度」的 retrieve 行为**无法从 SDK 源码确定**
-   ——可能返回存储的全部字节（over-read 成功）、可能返回 `INVALID_ARGUMENT`、
-   也可能返回 `ASU_CQE_UNRECOVERED_READ_ERROR`。因此：
-   - 全长读路径不依赖该行为，**稳态功能不受影响**；
-   - 前缀读若 entry 返回错误，映射为 `NOT_SUPPORTED` 并记 WARNING，
-     **不要**误映射成 `OBJECT_NOT_FOUND`（那会触发 dangling-replica 探测并让 Master 删除有效元数据）；
-   - 该项列入 §6.2 残留风险，需在真实 ASU 上验证后再决定是否收窄或放宽。
+   ```text
+   align_up(32 + slice.size, 512)  ≤  align_up(32 + payload_size, 512)  =  ASU 上存储的 transfer_size
+   ```
 
-   *被否掉的替代方案*：维护 `scoped_key → payload_size` 索引以精确算长度——
-   索引重启即空、对首次前缀读无效，且会重新引入 B10 裁掉的索引、锁与计数漂移问题。
+   即请求长度**恒不超过**存储长度。已用 40 万组随机样本 + 小区间穷举验证，0 反例。
+   - 全长读（`slice.size == payload_size`）→ 请求与写入时**逐字节一致**；
+   - 前缀读（`slice.size < payload_size`）→ 请求是存储长度的一个**前缀**（under-read）。
+
+   因此**不需要 over-read**，也**不需要长度索引**。原 §3.5.3 的 over-read 设计
+   （`transfer_size = slot_size`）已删除——它违反本契约。
+
+   **⚠️ 仍需真机验证的一项**：契约消除了「超读」这个未知，但把风险转移到了
+   「**ASU 是否支持截断读**（请求长度 < 存储长度）」。SDK 源码只能看到
+   `FakeTransProvider::LoadBytes`（`fake_trans_provider.cpp:137-166`）用 `ifstream::read`
+   天然截断、不足部分补零并返回成功——这**不能代表真实硬件**。
+   一次真机测试即可关闭：写入 N 字节，读 L < N，验证返回 OK 且前 L 字节正确。
+   全长读（稳态主路径）**不依赖**该行为。
 4. 按 `min(config_.batch_size, 110)` 切块，`BatchLoadAsync` + `Wait`；逐 entry 判定，
    slot 隔离规则同 §3.4。
-5. 逐结果校验（顺序即短路顺序，`got` = 本次请求的 `transfer_size`）：
+5. 逐结果校验（顺序即短路顺序）：
+
+   > **★ `got` 只是「本次请求的长度」，不是「实际收到的字节数」。**
+   > `TaskResult` 没有任何长度字段（`types.h:177-181`），CQE 只回 cid + status
+   > （`kv_protocol.cpp:30-56`），批量结果是 1/4-bit 位图。**后端无法观测实际传输字节数。**
+   > 所以任何形如 `payload_size > got - 32` 的检查都是恒真式，必须删除
+   > （原稿这一条对前缀读会把**所有合法前缀读**判为 `INVALID_READ`）。
+   > 防越界的真正保证来自：步骤 2 的 `slice.size ≤ max_payload_bytes` 预检，
+   > 以及本步末尾 `transfer_size - 32 ≥ slice.size`（由步骤 3 的同一公式恒成立：
+   > `align_up(32+slice.size,512) - 32 ≥ slice.size`）。
+
    - entry `NOT_FOUND` / `ASU_ENTRY_KEY_NOT_FOUND` / `ASU_ENTRY_DATA_NOT_EXIST` /
      `ASU_CQE_KEY_NOT_EXIST` → 记 `OBJECT_NOT_FOUND` 首错。
-   - **前缀读且 entry 返回 `INVALID_ARGUMENT` / `ASU_CQE_UNRECOVERED_READ_ERROR`
-     → 记 `NOT_SUPPORTED`**（ASU 可能不接受 over-read，见步骤 3 的风险说明）；
-     **绝不映射为 `OBJECT_NOT_FOUND`**，否则会触发 dangling-replica 探测让 Master 删掉有效元数据。
-   - `got < 32` → `INVALID_READ`。
-   - magic / version / flags 不符 → `INVALID_READ`。
-   - `header_crc32c` 不符 → `INVALID_READ`。
+   - 其它 entry 错误 → 按 §3.6 映射（`ASU_CQE_UNRECOVERED_READ_ERROR` → `FILE_READ_FAIL`）。
+     §3.6 是错误码映射的**唯一真源**，本节不再单列特例。
+   - magic / version / flags 不符 → `INVALID_READ`（**步骤 2 的投毒使静默短读在此暴露**）。
+   - `header_crc32c`（覆盖 `[0,24)`）不符 → `INVALID_READ`。
    - `fingerprint` 不符 → `INVALID_READ`（key 碰撞或串写）。
-   - `payload_size > got - 32` → `INVALID_READ`。
-   - **`slice.size > payload_size` → `INVALID_PARAMS`**（请求超出对象全长，真错）。
-   - **`slice.size == payload_size`（全长读）→ 校验 `payload_crc32c`**，不符 `CHECKSUM_MISMATCH`。
-   - **`slice.size < payload_size`（前缀读）→ 跳过 payload CRC**（前缀无法校验整体 CRC），
-     只拷 `slice.size` 字节。头 CRC 与 fingerprint 仍强制校验。
+   - `payload_size > max_payload_bytes`（协议硬上限 16,776,672）→ `INVALID_READ`。
+     这是替代被删除的 `payload_size > got - 32` 的**真检查**：防止伪造的超大 `payload_size`
+     导致本步末尾按错误长度拷贝。
+   - `slice.size > payload_size` → `INVALID_PARAMS`。
+     **契约保证不会发生**，但必须防御：64-bit key 碰撞、Master 元数据与实际对象不一致、
+     或对象被更小的 payload 覆盖写后又收到按旧 `object_size` 定尺的 ranged read，都会命中。
+     该检查**只能在 retrieve 之后**生效（`payload_size` 在记录头里，而 `QueryAsync` 无长度），
+     所以违约时超读已经发生——这正是契约必须由使用方保证的原因。
+     日志需与「普通调用方参数错误」区分，因为它是元数据不一致的指示器。
+   - **判定 payload CRC 能否校验——用 `full_payload_present`，不要用 `slice.size == payload_size`**：
+
+     ```cpp
+     const bool full_payload_present = (transfer_size - 32 >= payload_size);
+     ```
+
+     ★ 这是本次修订最重要的修正。原稿用 `slice.size == payload_size` 作门控是**错的**：
+     `align_up` 有 512 B 的对齐余量，对任意 `payload_size`，都存在**恰好 32 个** `slice.size`
+     取值（`[payload_size-31, payload_size]`）使请求长度已经覆盖整个 payload，
+     但 `slice.size != payload_size` 于是被误判为前缀读而**跳过了本可计算的 CRC**。
+     实测 `payload_size ∈ {512, 1024, 4096, 65536, 1 MiB}` 时窗口宽度恒为 32。
+     用 `full_payload_present` 则这 31 个漏检点全部补上，且顺带把「设备少写字节」
+     变成 `CHECKSUM_MISMATCH`（陈旧字节过不了 CRC）而不是静默返回。
+   - `full_payload_present == true` → **必须校验 `payload_crc32c`**（对 `payload_size` 字节），
+     不符 → `CHECKSUM_MISMATCH`。
+   - `full_payload_present == false`（真截断：请求未覆盖整个 payload）→
+     **无法校验 payload CRC**，只拷 `slice.size` 字节。头 CRC 与 fingerprint 仍强制校验。
+     这是本设计的已知残留风险，见 §6.2。
    - 通过 → `memcpy(slice.ptr, slot + 32, slice.size)`。**不改写 `slice.ptr`。**
 6. 释放/隔离 slot；返回 `OK` 或首错。已写入的 slice 不回滚。
 
+**可选强化：两段式读（本版不采用，留作决策项）**
+
+若要求前缀读也具备 payload 完整性保证，可改为两段：
+
+```text
+第一跳  retrieve length = 512                      （存储长度恒 ≥ 512，故仍是合法前缀读）
+        → 解析记录头，取得 payload_size、payload_crc32c
+第二跳  retrieve length = align_up(32 + payload_size, 512)   （与写入时逐字节一致）
+        → 校验 payload_crc32c，再只拷 slice.size 字节
+```
+
+收益：前缀读也能校验 payload CRC，FM-READ-05 的残留风险消除。
+
+代价与**一个容易忽略的事实**：
+
+1. 每次前缀读变成 **2 次 ASU 往返**，延迟与 task 数翻倍（对 ranged read 密集的
+   EngramStore 路径影响明显）；
+2. ★ **它并不能消除对「截断读支持」的依赖**——第一跳的 512 B 请求对任何
+   `payload_size > 480` 的对象仍然是截断读。也就是说两段式只是把同一个未验证前提
+   用在了第一跳上，并没有让方案更"确定"；
+3. 需要额外一个 slot 生命周期跨越两次 `Wait`，§3.4 的隔离规则要相应扩展。
+
+→ 结论：**本版不采用**。理由是第 2 点——付出一倍往返却换不来确定性提升，
+而 FM-READ-05 的暴露面（真截断前缀读内的位翻转）已由 TC-READ-05 固化、
+并在 §6.2 明示给部署方。若真机实测确认截断读**不被支持**，
+则两段式同样不可行，届时唯一出路是恢复长度索引（B10 已裁）或放弃前缀读支持。
+
 **★ 前缀读必须支持（B8）**：`real_client.cpp:5109-5138` 的非 pinned LOCAL_DISK ranged read
 明确只请求 `src_offset + size` 字节，注释写着「we only need src_offset + size bytes (not total_size)」；
+该长度经 `batch_get_into_offload_object_internal` → owner 侧 `FileStorage::BatchGetLocal`
+→ `LoadBatch` → `AllocateBatch` 原样成为 `slice.size`（`file_storage.cpp:1363`）。
 `get_into_ranges` 是公开 API 且被 EngramStore 使用。若按原方案「`slice.size != payload_size`
-→ `INVALID_PARAMS`」，这些合法读会全部失败并触发 dangling-replica 修复路径，
-最终导致 Master 元数据被误删。
+→ `INVALID_PARAMS`」，这些合法读会全部失败。
 （现有后端在此点上并不一致：`BucketStorageBackend`（`storage_backend.cpp:1793-1799`）与 `NvmeKv`
 都拒绝不等长，`StorageBackendAdaptor`（`storage_backend.cpp:1372`）支持前缀。
 本文选择支持，因为 ASU 场景下拒绝会误伤 EngramStore。）
 
+**★ 读失败与 Master 元数据删除的真实因果链（修正原稿的不精确表述）**：
+
+原稿称「BatchLoad 返回 `OBJECT_NOT_FOUND` 会触发 dangling-replica 探测并让 Master 删除元数据」。
+实测更准确的机制是：
+
+1. **任何** BatchLoad 失败（不限 `OBJECT_NOT_FOUND`）都会触发
+   `heal_disk_replica_for_read`（`real_client.cpp:3954-3990, 4078-4085`）；
+2. 该 heal 向 owner 发 `verify_disk_replica` RPC，owner 调 `FileStorage::Exists()`
+   → 本后端的 `IsExist()`（`real_client.cpp:9215-9221`）；
+3. **只有 `IsExist` 返回 `false` 才会真正淘汰副本**；返回错误（`states.push_back(2)`）
+   或 `true` 都不淘汰。owner 还有 tenant scope 歧义保护，宁可不淘汰。
+
+→ 所以**承重的是 §3.5.4 的 `IsExist` 纪律（传输错误必须 `unexpected`，绝不 `false`）**，
+而不是 BatchLoad 的错误码选择。BatchLoad 的错误码映射仍应按 §3.6 正确进行，
+但它不是防误删的那道闸。这一点纠正后，原稿「绝不能映射为 `OBJECT_NOT_FOUND`」
+的强约束可放宽为「按 §3.6 如实映射」。
+
+**★ 配置收缩与异构部署（新增硬约束）**：
+
+`slot_size = align_up(32 + max_payload_bytes, 512)` 由**本进程配置**推导，因此：
+
+1. **`max_payload_bytes` 一经投产不得下调**。下调后，先前按更大上限写入的对象，
+   其全长读会在步骤 2 被 `slice.size > max_payload_bytes` 以 `INVALID_PARAMS` 永久拒绝
+   （错误码是安全的，但数据不可达）。
+2. **同一 `key_namespace` / 同一 ASU 设备上的所有 client 必须使用相同的 `max_payload_bytes`**。
+   否则一个 2 MiB 配置的进程去读另一个 16 MiB 配置写入的对象时，若真机不严格遵守
+   请求长度而按存储长度整段 DMA，会向 2 MiB 的已注册 slot 写入最多 16,776,704 字节
+   → **注册内存越界**。本设计依赖「retrieve 不会写入超过 `length` 的字节」，
+   该前提**需在真机确认为硬性保证**（见 §6.2）。
+
+**★ `data_size == payload_size` 是承重不变量**：Master 侧 `object_size` 直接来自后端上报的
+`metadata.data_size`（`master_service.cpp:8181-8182`），而 reader 的 `slice.size` 上界又来自
+`local_disk_descriptor.object_size`（`client_buffer.cpp:144-159`）。
+所以「上报 `transfer_size` 而非 `payload_size`」这类错误会让 reader 的 `slice.size`
+系统性大于真实 `payload_size`，**在读到记录头之前就构成超读**，且步骤 5 的事后检查无法阻止。
+必须有直接单测断言 `complete_handler` 收到的 `data_size` 恰为 `payload_size`（不含 32 B 头、不含补齐）。
+
 **多 key 批次的错误语义**：本接口返回单个 `tl::expected<void>`，一个 key 失败即整批返回首错
 （这是接口既有形状，`BucketStorageBackend` 同样如此）。已成功的 key 的数据不回滚，
-调用方按整批失败处理。
+调用方按整批失败处理。每个 entry 的 `KVBuffer` 长度独立，
+所以同批混合全长读与前缀读是合法的。
 
 #### 3.5.4 查：`IsExist()`
 
@@ -936,7 +1054,9 @@ struct KvClientBackendConfig {
 | key 固定 8 字节 | `XXH64` 派生 + 64-bit fingerprint 检出碰撞；全零 key 重映射 |
 | 单值 24-bit 线格式上限 | `transfer_size ≤ 16,776,704`，超限 key 跳过 |
 | 无长度查询 | 写时算 `payload_size` 存进记录头；读时用头里的值 |
-| 前缀 / ranged read | **支持**：`slice.size < payload_size` 时拷前缀、跳过 payload CRC |
+| 前缀 / ranged read | **支持**：`transfer_size = align_up(32 + slice.size, 512)` 是存储长度的前缀（欠读，永不超读）；仅当 `transfer_size - 32 ≥ payload_size` 时才校验 payload CRC |
+| 长度契约 | 使用方约定请求长度不超出存储长度；后端用 `align_up` 单调性自动满足，无需长度索引 |
+| 零长对象 | 写侧跳过、读侧 `INVALID_PARAMS`（否则写入即永久不可读） |
 | 无枚举 | `ScanMeta` 返回 OK 空扫描；`RemoveAll` 只能删本进程写过的 key |
 | 512B 对齐 | `transfer_size = align_up(record_size, 512)`；`offset = 0`，每 entry 独占 slot |
 | 必须注册内存 | staging arena；读写都经 staging |
@@ -981,7 +1101,10 @@ class FakeAsuTransport : public UC::ASU::AsuTransport {
     void TimeoutNextWait();                     // 让 Wait 返回 TIMEOUT（task 仍"在途"）
     void CorruptField(CacheKey, Field);         // magic/version/header_crc/fingerprint/payload_crc
     void CompleteAfterTimeout();                // ★ 超时后才真正写入 buffer，复现 UAF
+    void SucceedWithoutWriting(CacheKey);       // ★ 返回成功 CQE 但一个字节都不写（复现 FM-READ-04）
+    void WritePartial(CacheKey, size_t nbytes); // ★ 成功但只写 nbytes 字节（短写）
     const std::vector<Call>& Calls() const;     // 断言 task 数、切块、顺序
+    const std::vector<Load>& Loads() const;     // ★ 记录每次 retrieve 的请求长度，用于契约合规断言
 };
 
 // 注入：构造后端时传 ClientFactory
@@ -991,11 +1114,20 @@ auto factory = []{ return UC::ASU::CreateAsuClient(
 KvClientStorageBackend backend(cfg, factory);
 ```
 
-- **不使用** SDK 自带的 `FakeTransProvider`：它在 `trans/src/`（非公有 include），
-  且依赖 Ascend ACL runtime，CI 不可用。
+- **不使用** SDK 自带的 `FakeTransProvider`，三个理由（前两个是打包/依赖，第三个才是关键）：
+  1. 它在 `trans/src/`（非公有 include），且依赖 Ascend ACL runtime，CI 不可用；
+  2. 单值 retrieve 用 `request[8]`(`buffer_length`) 而非 `length` 字段作为传输长度
+     （`fake_trans_provider.cpp:265-293`），与真实设备可能的字段语义不一致；
+  3. ★ **它无法用于验证本文的长度契约**：`LoadBytes` 对「请求长度 > 存储长度」的超读
+     用 `std::fill` 补零并**返回成功**（`fake_trans_provider.cpp:147-166`），
+     对短读也不报错。也就是说超读在它那里永远"通过"，
+     用它测不出 TC-READ-01 要断言的契约合规性。`StoreBytes` 覆盖写时也不截断
+     （`seekp` + `write`，`fake_trans_provider.cpp:100-135`），缩短后的对象会残留旧尾部。
+  → 因此长度语义必须在 `FakeAsuTransport`（client/mock 层）注入并断言，
+  真机行为另需一次实测（§6.2）。
 - `FakeAsuClient` 只存在于 `tests/`，**不可被 env 选进生产**（这正是裁掉 `kReference` 的理由）。
 
-### 5.2 FMEA（15 项，只覆盖六操作）
+### 5.2 FMEA（19 项，只覆盖六操作）
 
 | ID | 功能 | 失效模式 | 严重度 | 缓解 | TC |
 | --- | --- | --- | --- | --- | --- |
@@ -1009,13 +1141,17 @@ KvClientStorageBackend backend(cfg, factory);
 | FM-WRITE-04 | 写 | 返回非软错误码中断心跳 / 返回 `KEYS_ULTRA_LIMIT` 永久停 offload | S2 | 可恢复情形一律 `expected(count)` | TC-WRITE-04 |
 | FM-WRITE-05 | 写 | `Wait` 超时后复用 slot → **UAF** | **S1** | slot 永久隔离，不复用不注销 | TC-WRITE-05 |
 | FM-WRITE-06 | 写 | `complete_handler` 失败 | S2 | 透传错误，不回滚 | TC-WRITE-06 |
-| FM-READ-01 | 读 | 前缀读被拒（ranged read / EngramStore） | S2 | 支持 `slice.size < payload_size` | TC-READ-01 |
-| FM-READ-02 | 读 | 前缀读 over-read 被 ASU 拒绝，误映射为 `OBJECT_NOT_FOUND` → Master 删有效元数据 | S1 | 映射为 `NOT_SUPPORTED`；全长读不受影响 | TC-READ-01 |
-| FM-READ-03 | 读 | 头/fingerprint/CRC 损坏 | S1 | 按序校验；不拷贝 | TC-READ-02 |
+| FM-READ-01 | 读 | 前缀读被拒（ranged read / EngramStore） | S2 | 支持 `slice.size < payload_size`；`align_up` 单调性保证不超读 | TC-READ-01 |
+| FM-READ-02 | 读 | **CRC 门控用错谓词**：以 `slice.size == payload_size` 判定，导致对齐余量窗口内（恒 32 个 `slice.size` 取值）请求已覆盖整个 payload 却跳过可计算的 CRC | **S1** | 改用 `transfer_size - 32 ≥ payload_size` 判定 | TC-READ-02 |
+| FM-READ-03 | 读 | 头/fingerprint/CRC 损坏 | S1 | 按序校验；不拷贝 | TC-READ-03 |
+| FM-READ-04 | 读 | 设备返回成功 CQE 但一个字节都没写，slot 内**同 key 的陈旧记录**冒充本次结果（`TaskResult` 无实际长度，无法观测） | **S1** | 请求前把 slot 前 32 B 清 0，使其在 magic 处必然失败 | TC-READ-04 |
+| FM-READ-05 | 读 | 真截断的前缀读无法校验 payload CRC → 前缀内位翻转被静默返回 | S2（本版接受） | 头 CRC + fingerprint 仍强制；残留风险记入 §6.2 | TC-READ-05 |
+| FM-READ-06 | 读 | `max_payload_bytes` 被下调 / 同 namespace 异构配置 → 旧大对象全长读被拒；若真机不严守请求长度还会越界写注册内存 | **S1** | 投产后禁止下调；同 namespace 统一配置；真机确认 retrieve 严守 `length` | TC-READ-06 |
+| FM-READ-07 | 读 | 上报 `data_size ≠ payload_size` → reader 的 `slice.size` 系统性偏大，读到记录头前即超读，事后检查拦不住 | **S1** | 承重不变量，直接单测断言 | TC-WRITE-03 |
 | FM-QUERY-01 | 查 | 传输错误返回 `false` → Master 误删元数据 | **S1** | 必须 `unexpected` | TC-QUERY-01 |
 | FM-LIFE-01 | 关停 | 有在途 task 就 `UnregisterRegions` | S1 | 隔离区域不注销；先 drain 再 Shutdown | TC-LIFE-01 |
 
-### 5.3 测试用例（17 项）
+### 5.3 测试用例（23 项）
 
 | TC | 覆盖 | 注入 / 前置 | 步骤 | 通过标准 |
 | --- | --- | --- | --- | --- |
@@ -1027,13 +1163,19 @@ KvClientStorageBackend backend(cfg, factory);
 | TC-CODEC-02 | key 派生 | `XXH64` 结果为 0 的构造 key | 写 + 读 + 查 | 三处得到同一非零 8B key；无 `INVALID_ARGUMENT` |
 | TC-WRITE-01 | FM-WRITE-01 | 两个 `scoped_key` 映射到同一 8B key | 写两个，读第一个 | `INVALID_READ`；**不返回错误字节**；日志含碰撞提示 |
 | TC-WRITE-02 | FM-WRITE-02 | payload 使 `transfer_size > 0xFFFFFF`；payload 超 slot；空 key | 批量写 | 超限 key 跳过；其余成功；handler 只收成功 key；返回 `expected(成功数)` |
-| TC-WRITE-03 | FM-WRITE-03 | 3 key，entry 2 注入失败，聚合 `PARTIAL_FAILED` | 调 `BatchOffload` | 返回 2；handler keys = k1/k3 的 `scoped_key`；`data_size` 不含 32B 头 |
+| TC-WRITE-03 | FM-WRITE-03 / **FM-READ-07** | 3 key，entry 2 注入失败，聚合 `PARTIAL_FAILED` | 调 `BatchOffload` | 返回 2；handler keys = k1/k3 的 `scoped_key`；**断言每个 `metadata.data_size` 恰等于 `payload_size`**（不含 32B 头、不含 512B 补齐）；`key_size == scoped_key.size()`；`bucket_id == -1`、`offset == 0` |
 | TC-WRITE-04 | FM-WRITE-04 | staging slot 全耗尽 / ASU `OUT_OF_CREATE_SIZE` | 调 `BatchOffload` | 返回 `expected(0)`；**绝不返回 `KEYS_ULTRA_LIMIT`**；FakeTransport 未收到新提交 |
 | **TC-WRITE-05** | **FM-WRITE-05** | `TimeoutNextWait()` + `CompleteAfterTimeout()` | 超时后再次写复用同一 slot | **slot 被隔离，未复用**；ASAN/TSAN 干净；第二次写用不同 slot；无 use-after-free |
 | TC-WRITE-06 | FM-WRITE-06 | `complete_handler` 返回错误 | 调 `BatchOffload` | 原样返回该错误；数据仍可读；不回滚 |
-| TC-READ-01 | FM-READ-01 | 写 4096 B；分别以 `slice.size = 4096 / 1024 / 4097` 读；再注入前缀读 over-read 返回 `INVALID_ARGUMENT` | 调 `BatchLoad` | 4096→OK 且 CRC 校验；1024→OK 前缀字节一致且**跳过** payload CRC；4097→`INVALID_PARAMS`；over-read 被拒→`NOT_SUPPORTED`（**不是** `OBJECT_NOT_FOUND`）；`slice.ptr` 未被改写 |
-| TC-READ-02 | FM-READ-02 | 逐个篡改 magic / version / header_crc / fingerprint / payload_crc | 调 `BatchLoad` | 前四项 `INVALID_READ`；payload_crc → `CHECKSUM_MISMATCH`；目标缓冲区不变 |
-| TC-READ-03 | 读缺失 | ASU 无该 key | 调 `BatchLoad` | `OBJECT_NOT_FOUND`；无崩溃 |
+| TC-WRITE-07 | 零长对象 | `payload_size == 0` 的对象混入批次 | 调 `BatchOffload` | 该 key 被跳过（WARNING）；handler 未收到它；**FakeTransport 未收到该 entry 的提交** |
+| **TC-READ-01** | **FM-READ-01 / 契约合规** | 写 `payload_size = 4096`（stored `transfer_size = 4608`）；分别以 `slice.size = 4096 / 4095 / 4065 / 4064 / 1024 / 1 / 4097` 读 | 调 `BatchLoad`，并用 `FakeAsuTransport::Loads()` 记录每次请求长度 | **★ 所有请求长度恒等于 `align_up(32+slice.size,512)` 且 ≤ 4608（契约合规，无超读）**；4096/4095/4065 → OK 且**payload CRC 被校验**（`full_payload_present`）；4064/1024/1 → OK 且 CRC 跳过（真截断），前缀字节一致；4097 → `INVALID_PARAMS`；`slice.ptr` 未被改写 |
+| TC-READ-02 | **FM-READ-02** | 写 4096 B；以 `slice.size = 4095`（对齐余量窗口内，请求长度 == stored）读，并翻转 payload 第 100 字节 | 调 `BatchLoad` | **`CHECKSUM_MISMATCH`**（而非静默返回损坏数据）；对 `[4065, 4095]` 全部 31 个取值重复该断言 |
+| TC-READ-03 | FM-READ-03 | 逐个篡改 magic / version / flags / header_crc / fingerprint / payload_crc；另构造 `payload_size = 16,776,673`（超硬上限） | 调 `BatchLoad` | 前五项 `INVALID_READ`；payload_crc → `CHECKSUM_MISMATCH`；超上限 → `INVALID_READ`；目标缓冲区不变 |
+| **TC-READ-04** | **FM-READ-04** | 先用 key K 写一条有效记录并读一次（slot 内留下 K 的旧记录）；再注入「返回成功 CQE 但写入 0 字节」；另注入「只写 16 字节」 | 复用同一 slot 再次读 K | 两种注入都返回 `INVALID_READ`（投毒后 magic 失败）；**绝不返回旧版本字节**；ASAN 干净 |
+| TC-READ-05 | FM-READ-05 | 真截断前缀读（`slice.size = 1024`，`payload_size = 4096`），翻转 payload 第 100 字节（落在被读取的前缀内） | 调 `BatchLoad` | 返回 OK 且**损坏字节被拷出**——本用例是**已知残留风险的固化断言**，用于防止后续误以为前缀读有完整性保证；文档与 §6.2 必须一致 |
+| TC-READ-06 | FM-READ-06 | 以 `max_payload_bytes = 2 MiB` 的后端读一个 `payload_size = 4 MiB` 的既存对象 | 调 `BatchLoad` | 步骤 2 预检返回 `INVALID_PARAMS`（**不是** `OBJECT_NOT_FOUND`，避免触发副本淘汰）；日志明确指出是配置收缩而非调用方错误 |
+| TC-READ-07 | 读缺失 | ASU 无该 key | 调 `BatchLoad` | `OBJECT_NOT_FOUND`；无崩溃 |
+| TC-READ-08 | 混合批次 | 同批含全长读 + 前缀读 + 缺失 key | 调 `BatchLoad` | 每个 entry 的请求长度独立正确；返回缺失 key 的首错；已成功 key 的数据不回滚 |
 | TC-QUERY-01 | FM-QUERY-01 | Query 超时 / `CONNECTION_ERROR` | 调 `IsExist` | 返回 `unexpected`（`RPC_TIMEOUT`/`UNAVAILABLE_IN_CURRENT_STATUS`）；**绝不返回 `false`** |
 | TC-LIFE-01 | FM-LIFE-01 | 有在途 task 时析构 | 析构 backend | 隔离区域**未** `UnregisterRegions`；先 drain 再 `Shutdown`；ASAN 无泄漏/崩溃 |
 
@@ -1089,11 +1231,15 @@ KvClientStorageBackend backend(cfg, factory);
 | **Master 丢元数据后不可重建** | 高 | `ScanMeta` 空实现；冷数据永久不可达 |
 | **staging 永久泄漏** | 中 | `Wait` 超时不可观测 → slot 只能隔离；长期运行下空闲 slot 单调减少，最终停止 offload（返回 `expected(0)`，不会崩）。需靠进程重启恢复；建议监控隔离计数 |
 | **64-bit key 碰撞** | 中 | 1 亿对象约 `5e-4`。碰撞时后写覆盖先写，先写对象**永久丢失**且 Master 仍认为副本存在；读时 fingerprint 只能检出、无法恢复 |
-| **前缀读 over-read 行为未定** | 中 | 为支持 ranged read，前缀读按 slot 满长 over-read（§3.5.3 步骤 3）；但 ASU 对「请求长度 > 存储长度」的 retrieve 行为无法从 SDK 源码确定，可能成功、可能报 `INVALID_ARGUMENT`。全长读（稳态主路径）不受影响；前缀读失败映射为 `NOT_SUPPORTED` 而非 `OBJECT_NOT_FOUND`，需真实硬件验证 |
-| **ASU 服务端更紧限制不可发现** | 中 | `ServerKvCapabilities` 未暴露；若服务端 `singleValueMaxBytes` 小于本地上限，只能靠逐 entry 失败反馈 |
+| **截断读（欠读）支持性未实测** | 中 | 长度契约消除了超读，但把未知转移到了「ASU 是否接受请求长度 < 存储长度」。SDK 源码只能看到 `FakeTransProvider::LoadBytes` 用 `ifstream::read` 天然截断、补零并返回成功（`fake_trans_provider.cpp:147-166`），**不代表真实硬件**。全长读（稳态主路径）不依赖该行为；一次真机测试即可关闭：写 N 字节、读 L<N、验证 OK 且前 L 字节正确 |
+| **前缀读无 payload 完整性保证** | 中 | 真截断时 payload CRC 无法校验（只有部分字节），头 CRC 只覆盖 `[0,24)`，故前缀内的位翻转**检出概率为 0**；同一对象的全长读则有 `1-2⁻³²` 检出率。这是设计取舍，不是缺陷遗漏；已由 TC-READ-05 固化断言，部署方需知悉 |
+| **无法观测实际传输字节数** | 中 | `TaskResult` 无长度字段（`types.h:177-181`），CQE 只回 cid+status（`kv_protocol.cpp:30-56`）。设备若返回成功却少写字节，前缀读会静默返回 slot 陈旧/补零内容（全长读由 CRC 兜住）。缓解：请求前把 slot 前 32 B 投毒清 0（§3.5.3 步骤 2），使静默短读必然在 magic 处失败 |
+| **配置收缩 / 异构部署** | **高** | `slot_size` 由本进程 `max_payload_bytes` 推导。① 投产后下调该值 → 旧大对象全长读被永久拒绝；② 同一 `key_namespace` 下不同进程配置不一致 → 若真机不严守请求长度而按存储长度整段 DMA，会向小 slot 写入最多 16,776,704 字节，**越界写注册内存**。必须约定：`max_payload_bytes` 投产后不可变，且同 namespace/同设备所有 client 配置一致 |
+| **`data_size == payload_size` 不变量** | **高** | Master 的 `object_size` 直接取自后端上报的 `data_size`（`master_service.cpp:8181-8182`），reader 的 `slice.size` 上界又取自它（`client_buffer.cpp:144-159`）。一旦上报成 `transfer_size`，`slice.size` 会系统性大于真实 `payload_size`，**在读到记录头之前就构成超读**，事后检查拦不住。由 TC-WRITE-03 直接断言 |
+| **ASU 服务端更紧限制不可发现** | 中 | `ServerKvCapabilities` 未经公有 `AsuClient` 暴露；若服务端 `singleValueMaxBytes` 小于本地上限，只能靠逐 entry 失败反馈 |
 | **descriptor 静默退回** | 中 | 未打补丁时 `kv_client_storage_backend` 静默变 `kBucket`，只有一条 ERROR 日志 |
 | **`RemoveAll` 跨租户** | 低（因不可达） | 若上游恢复接线，本实现是全库级、不区分租户，且只删本进程写过的 key |
-| **真实 ASU 行为未实测** | — | Store 是否真为 upsert、删除不存在 key 的真实返回码，均需在硬件上确认（SDK 侧只能读到 `FakeTransProvider` 的 upsert 行为与 `TASK_OP_PUT` 语义） |
+| **真实 ASU 行为待实测清单** | — | ① Store 是否为 upsert——SDK 侧 `FakeTransProvider::StoreBytes` 无存在性检查、`TASK_OP_PUT` 语义支持 upsert，但真机需确认；② 删除不存在 key 的真实返回码；③ 截断读支持性（见上）；④ retrieve 是否严格不写入超过 `length` 的字节（配置收缩风险的前提）；⑤ `offset` 在真机上相对存储值还是相对目标缓冲区（`types.h:167` 注释为 "target buffer offset"，与 fake 的 seek 语义不一致；本设计恒用 `offset=0` 故不受影响） |
 
 ### 6.3 相对原方案的净变化
 
@@ -1110,3 +1256,23 @@ BatchOffload 返回值纪律（B7）、前缀读支持（B8）、错误码前缀
 **新增**：§2.1 最小适配补丁的精确形态与「静默退回 kBucket」失败模式、
 §0.2 `RemoveAll` 不可达的实测结论、全零 `CacheKey` 重映射、
 `Wait(id, 0)` 语义陷阱、`FakeAsuTransport` 注入缝。
+
+**§6.4 长度契约修订（用户裁决后追加）**：使用方约定「请求长度不超出存储长度」，据此：
+- **删除**前缀读的 over-read 设计（原 `transfer_size = slot_size`）及其
+  `NOT_SUPPORTED` 特例映射；改为单一公式 `align_up(32 + slice.size, 512)`，
+  全长读与前缀读共用，由 `align_up` 单调性自动满足契约（40 万组随机 + 穷举验证 0 反例）。
+- **删除**恒真检查 `payload_size > got - 32 → INVALID_READ` 与 `got < 32`
+  （`got` 只是请求长度，非实际传输字节数；该检查会误杀所有合法前缀读），
+  改为 `payload_size > max_payload_bytes → INVALID_READ`。
+- **修正 CRC 门控谓词**：`slice.size == payload_size` → `transfer_size - 32 >= payload_size`。
+  原谓词在对齐余量窗口内（恒 32 个 `slice.size` 取值）会跳过本可计算的 CRC（FM-READ-02，S1）。
+- **新增**：slot 请求前投毒清 0 头部（FM-READ-04，防静默短读冒充成功）、
+  写侧禁止 `payload_size == 0`（否则写入即永久不可读）、
+  `max_payload_bytes` 投产后不可下调且同 namespace 配置必须一致（FM-READ-06，S1）、
+  `data_size == payload_size` 承重不变量与直接单测（FM-READ-07，S1）。
+- **澄清**：读失败与 Master 删元数据的真实因果链——任何 BatchLoad 失败都会触发
+  `heal_disk_replica_for_read`，但真正淘汰副本的闸门是 owner 侧 `IsExist` 返回 `false`
+  （`real_client.cpp:9215-9221`）。故承重的是 §3.5.4 的 `IsExist` 纪律，
+  而非 BatchLoad 的错误码选择。
+- **风险重定位**：契约消除了「超读行为未知」，但转移为「截断读是否被真机支持」，
+  并暴露「前缀读无 payload 完整性保证」这一既有取舍（§6.2）。
