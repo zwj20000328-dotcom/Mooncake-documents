@@ -91,12 +91,10 @@ flowchart TB
 
 ## 3. 功能实现
 
-本章按“写 → 读 → 查 → 删”组织。每个小节固定四段：类图、时序图、伪代码、注意事项。
-
-entry 构造统一沿用 asuStore 命名：
+entry 构造沿用 asuStore 命名：
 
 - `BlockId`（16B）由 `key_namespace + '\0' + scoped_key` 的 128-bit 哈希派生；
-- `MakeAsuKey(BlockId)` 生成 8B `kv::CacheKey`（全零重映射）；实现必须用稳定哈希（如 XXH64），不要直接用 `std::hash`（跨进程/编译器不稳定）；
+- `MakeAsuKey(BlockId)` 生成 8B `kv::CacheKey`；
 - 一个 Mooncake 对象 = 一个 `Shard` + 一个 tensor：`tensorSizes[0] = align_up(24 + Σ slice.size, 512)`，`offset = 0`；
 - 注册内存 = `KVCacheRegistration`，Init 时 `RegisterKVCaches` 注册一次，返回 `RegisteredPersistentRegion{region, handle}`；
 - `BuildKvBuffers(TaskDesc, tensorSizes)` 生成 `vector<kv::KVBuffer>`；`buffer.handle` 由 `FindPersistentHandle(region)` 解析；`mrKey` 留空，由 SDK 提交时写入。
@@ -166,7 +164,8 @@ sequenceDiagram
     loop 每个对象
         BE->>BE: block = MakeBlockId(scoped_key)
         BE->>BE: tensor_size = align_up(24 + Σslice.size, 512)
-        BE->>BE: tensor_addr = AllocateTensor(tensor_size); EncodeRecord(...)
+        BE->>BE: tensor_addr = AllocateTensor(tensor_size)
+        BE->>BE: EncodeRecord(tensor_addr, slices)
         BE->>BE: task.push_back(Shard{block, 0, {tensor_addr}})
     end
     BE->>BE: entries = BuildKvBuffers(task, tensorSizes)
@@ -194,7 +193,7 @@ sequenceDiagram
     FS->>MS: NotifyOffloadSuccess(tasks, metadatas)
 ```
 
-#### 3.1.3 伪代码
+#### 3.1.3 实现
 
 ```cpp
 // Init：注册区域
@@ -362,7 +361,7 @@ sequenceDiagram
     BE-->>FS: OK / first_error
 ```
 
-#### 3.2.3 伪代码
+#### 3.2.3 实现
 
 ```cpp
 tl::expected<void, ErrorCode> BatchLoad(std::unordered_map<std::string, Slice>& slices) {
@@ -479,7 +478,7 @@ sequenceDiagram
     end
 ```
 
-#### 3.3.3 伪代码
+#### 3.3.3 实现
 
 ```cpp
 tl::expected<bool, ErrorCode> IsExist(const std::string& scoped_key) {
@@ -520,6 +519,8 @@ tl::expected<bool, ErrorCode> IsExist(const std::string& scoped_key) {
 
 ### 3.4 删
 
+本节类图、时序图和实现按“**已添加按 key 删除逻辑**”绘制；当前 HEAD 的实际状态与方案选择见 3.4.4。
+
 #### 3.4.1 类图
 
 ```mermaid
@@ -532,10 +533,10 @@ classDiagram
         +Remove(key, force)
         +BatchRemove(keys, force)
         -EraseMetadata()
-        -EnqueueDelete(owner, scoped_key)
+        -EnqueueDelete(owner, scoped_keys)
     }
     class LocalSsdTaskMailbox {
-        +EnqueueDelete(scoped_key)
+        +EnqueueDelete(scoped_keys)
         +TakeDeleteTasks()
     }
     class FileStorage {
@@ -551,8 +552,8 @@ classDiagram
         +Wait(taskId, timeout, result)
     }
     Client --> Master : Remove / BatchRemove
-    Master --> LocalSsdTaskMailbox : 方案 A（未实现）
-    FileStorage ..> LocalSsdTaskMailbox : owner 拉取删除任务
+    Master --> LocalSsdTaskMailbox : EnqueueDelete
+    FileStorage ..> LocalSsdTaskMailbox : TakeDeleteTasks
     FileStorage --> KvClientStorageBackend : BatchRemoveKeys
     KvClientStorageBackend --> KvClient : DeleteAsync + Wait
 ```
@@ -565,62 +566,75 @@ sequenceDiagram
     participant U as User
     participant C as Client
     participant MS as Master
-    participant MB as owner mailbox
+    participant MB as LocalSsdTaskMailbox
     participant FS as FileStorage
     participant BE as Backend
     participant KC as kv::KvClient
+    participant TR as Transport
     participant ASU as ASU
 
     U->>C: Remove(key) / BatchRemove(keys)
     C->>MS: Remove / BatchRemove RPC
-    alt V1：逻辑删除
-        MS->>MS: EraseMetadata（删 Master 元数据）
-        MS-->>C: per-key result
-        Note over MS: 链路到此为止；ASU 上的 value 仍在
-    else 方案 A：按 key 物理删除（未实现）
-        MS->>MS: 在 EraseMetadata 之前捕获 LOCAL_DISK owner
-        MS->>MB: EnqueueDelete(owner, scoped_key)
-        FS->>MB: owner 心跳拉取删除任务
-        FS->>BE: BatchRemoveKeys(scoped_keys)
-        BE->>BE: scoped_key → BlockId → MakeAsuKey；按 254 切块
+    MS->>MS: 捕获 LOCAL_DISK owner（在 EraseMetadata 之前）
+    MS->>MS: EraseMetadata（删 Master 元数据）
+    MS->>MB: EnqueueDelete(owner, scoped_keys)
+    MS-->>C: per-key result
+
+    FS->>MB: owner 心跳 TakeDeleteTasks()
+    MB-->>FS: delete tasks
+    FS->>BE: BatchRemoveKeys(scoped_keys)
+    BE->>BE: scoped_key → BlockId → MakeAsuKey；按 254 切块
+
+    loop 每个 chunk
         BE->>KC: DeleteAsync(keys, taskId)
-        KC->>ASU: Delete
         KC-->>BE: taskId
+        KC->>TR: dispatch
+        TR->>ASU: Delete(key)
         BE->>KC: Wait(taskId, timeout)
-        KC-->>BE: per-entry status
-        BE-->>FS: per-key result
+        KC-->>BE: entryStatus
+        BE->>BE: per-entry：OK 或 CQE_KEY_NOT_EXIST → 成功；否则失败
     end
+    BE-->>FS: per-key result
+    Note over KC,TR: Delete 不需要 mrKey / 注册内存
 ```
 
-#### 3.4.3 伪代码
+#### 3.4.3 实现
 
 ```cpp
-// V1：逻辑删除（当前实现）
-// Client::Remove / BatchRemove 只发 Master RPC；Master 删元数据；
-// 不调用 FileStorage / StorageBackendInterface / KvClient。
-
-// 方案 A：按 key 物理删除（未实现；需要接口 + 路由）
-// Master::BatchRemove:
+// Master::BatchRemove（删除按 key 已接入的形态）
 //   owners = CollectLocalDiskOwners(metadata);   // 必须在 EraseMetadata 之前
 //   EraseMetadata();
-//   for (owner : owners) EnqueueDelete(owner, scoped_key);
+//   for (owner : owners) EnqueueDelete(owner, scoped_keys);
 
-// owner 心跳：
-//   for (task : TakeDeleteTasks()) {
-//       keys = task.scoped_keys.map(k => MakeAsuKey(MakeBlockId(k)));
-//       for (chunk : Chunk(keys, 254)) {
-//           DeleteAsync(chunk, taskId);
-//           Wait(taskId, wait_timeout_ms, result);   // 每块只 Wait 一次
-//           for (i : chunk) {
-//               if (result.entryStatus[i].ok()) success;
-//               else if (whole_cqe == CQE_KEY_NOT_EXIST) success;  // 幂等
-//               else failed;   // 保留索引/日志
-//           }
-//       }
-//   }
+// owner 心跳拉取删除任务，调用 backend：
+tl::expected<...> BatchRemoveKeys(scoped_keys) {
+    for (const auto& scoped_key : scoped_keys) {
+        const auto block = MakeBlockId(scoped_key);
+        const auto key = MakeAsuKey(block);       // 与写/读/查同一套 key 编码
+        keys.push_back(key);
+    }
+
+    for (chunk : Chunk(keys, 254)) {              // deleteIoNum 默认 254
+        kv::TaskId taskId{};
+        if (!client_->DeleteAsync(chunk, taskId).ok()) {
+            // 提交失败：没有 task，本块 key 全部记失败
+            continue;
+        }
+        kv::TaskResult result;
+        client_->Wait(taskId, wait_timeout_ms, result);   // 每块只 Wait 一次
+
+        for (i : chunk) {
+            if (result.entryStatus[i].ok()) success;
+            else if (whole_cqe == CQE_KEY_NOT_EXIST) success;  // 幂等
+            else failed;   // 记日志，交给后续重试
+        }
+    }
+}
 ```
 
 #### 3.4.4 注意事项
+
+3.4.1 / 3.4.2 / 3.4.3 按“按 key 删除已接入”绘制；当前 HEAD 的实际状态如下。
 
 **现状：按 key 删除到不了后端**
 
@@ -681,68 +695,45 @@ sequenceDiagram
 
 ### 4.1 失效模式与影响
 
-> 严重度：S1 数据损坏/误删；S2 功能不可用/永久停；S3 性能/配额退化；S4 可观测性。
+> 严重度：S1 数据损坏/误删；S2 功能不可用/永久停；S3 性能/配额退化。
 
 | ID | 功能 | 失效模式 | 影响 | 严重度 | 检测/缓解 | 测试 |
 | --- | --- | --- | --- | --- | --- | --- |
-| FM-INIT-01 | Init | `KvClient::Init` 或 `RegisterKVCaches` 失败 | 后端不可用，FileStorage Init 失败 | S2 | 失败回滚 `kUninit`、`Shutdown` client；不进入 `kReady` | TC-INIT-01 |
-| FM-INIT-02 | Init | `RegisterRegions` 返回 OK + 空 vector（无 transport） | 后续提交全部 `BUFFER_NOT_REGISTERED` | S2 | 空结果当失败；Init 失败并回滚 | TC-INIT-01 |
-| FM-INIT-03 | Init | 二次 Init / 并发 Init | 状态、计数、注册区域被重置 | S2 | CAS `kUninit → kInitializing`；第二次返回 `INTERNAL_ERROR` | TC-INIT-02 |
-| FM-ENTRY-01 | BuildKvBuffers | `FindPersistentHandle` 找不到包含该 tensor 的注册区域 | entry handle 非法，提交失败 | S1/S2 | 检查 `region.addr + size` 边界；找不到不提交 | TC-ENTRY-02 |
-| FM-ENTRY-02 | Key | `MakeAsuKey` 全零或 64-bit 碰撞 | 写错对象/覆盖先写 | S1 | 全零重映射；碰撞作为已知风险接受 | TC-ENTRY-05 |
-| FM-ENTRY-03 | BuildKvBuffers | `tensorSizes[0]` 超 24-bit 或未 512B 对齐 | SDK `INVALID_ARGUMENT` | S2 | 提交前校验长度/对齐；超限 key 跳过 | TC-ENTRY-04 |
-| FM-ENTRY-04 | 内存 | `buffer.handle` 不是 `FindPersistentHandle` 返回值 | `BUFFER_NOT_REGISTERED` | S2 | 只用注册区域 handle；不手工编 handle | TC-ENTRY-01 |
-| FM-WRITE-01 | 写 | `complete_handler` 失败 | 数据在 ASU、Master 未登记 | S2 | 返回错误、记日志；不回滚，重试 Put 覆盖 | TC-STORE-02 |
-| FM-WRITE-02 | 写 | `PARTIAL_FAILED` 下把 OK entry 当成功 | Master 指向未发送的数据（假成功） | S1 | 本块整体不发布；释放 tensor 区间 | TC-STORE-01 |
-| FM-WRITE-03 | 写 | `Wait` 超时/`TASK_NOT_FOUND` 后复用 tensor | 数据串写 / use-after-free | S1 | tensor 区间隔离，不复用、不注销 | TC-STORE-01 |
-| FM-WRITE-04 | 写 | `BatchStoreAsync` 提交失败 | 无 task、本批失败 | S2 | 立即释放 tensor；下一轮心跳重试 | TC-STORE-03 |
-| FM-WRITE-05 | 配额 | 返回 `KEYS_ULTRA_LIMIT` 或硬错误 | offload 永久关闭 / 心跳中断 | S2 | 逐 key 跳过，返回 `expected(count)`；绝不返回该码 | TC-QUOTA-02 |
-| FM-WRITE-06 | 配置 | 默认 16 MiB 超过 24-bit 上限 | 满尺寸写全部失败 | S2 | 默认 2 MiB；硬上限 `payload_size ≤ 16,776,680` | TC-ENTRY-04 |
-| FM-READ-01 | 读 | 要求 `payload_size == slice.size` | 合法前缀读全部失败 | S2 | 允许 `slice.size <= payload_size`；按前缀拷贝 | TC-LOAD-02 |
-| FM-READ-02 | 读 | magic/version/flags/头 CRC 损坏 | 返回错误数据 | S1 | 头校验失败 → `INVALID_READ`，不拷贝 | TC-LOAD-03 |
-| FM-READ-03 | 读 | payload CRC 不匹配 | 撕裂/位翻转被当有效数据 | S1 | 全长读校验 payload CRC → `CHECKSUM_MISMATCH` | TC-LOAD-04 |
-| FM-READ-04 | 读 | `slice.size > payload_size` | 请求超过存储长度 | S2 | 解析头后拒绝，返回 `INVALID_PARAMS` | TC-LOAD-05 |
-| FM-QUERY-01 | 查 | `exists=0` + `IO_ERROR` 当“不存在” | probe 误删 Master 元数据 | S1 | 同时看 `entryStatus`；非 `ENTRY_KEY_NOT_EXIST` 返回 `unexpected` | TC-QUERY-01 |
-| FM-QUERY-02 | 查 | `Wait` 超时/传输错误返回 false | probe 误删 Master 元数据 | S1 | 超时/错误一律 `unexpected`，绝不返回 false | TC-QUERY-01 |
-| FM-DEL-01 | 删 | V1 只做逻辑删除 | ASU value 残留，容量不释放 | S2（接受） | 明确对外口径；同 key 覆盖/ASU GC/namespace 轮转 | TC-DEL-02 |
-| FM-DEL-02 | 删 | owner 路由错误或 `key_namespace` 不匹配 | 删不到或删错对象 | S1 | Master 记录 owner；按 `scoped_key` 校验；审计 | TC-DEL-01 |
-| FM-DEL-03 | 删 | `DeleteAsync` 逐 entry 失败 | 残留对象；计数不释放 | S3 | 逐 entry 状态；失败日志；幂等重试 | TC-DEL-03 |
-| FM-DEL-04 | 删 | owner 重启丢失删除任务 | ASU 残留 | S2（接受） | 本版无持久化队列；带外清理兜底 | TC-DEL-04 |
-| FM-CONC-01 | 并发 | `Wait` 期间持有 `regions_mutex_` | 读写互相阻塞/心跳超时 | S2 | 任何 `Wait` 不持锁；短临界区 | TC-CONC-01 |
-| FM-CONC-02 | 并发 | tensor 未完成就释放/复用 | 数据损坏 | S1 | 正常完成释放；超时/任务丢失隔离 | TC-CONC-01 |
-| FM-LIFE-01 | 关停 | 有在途 task 就 `UnregisterRegions` | 崩溃/数据损坏 | S1 | 先 drain 所有 task；隔离区间不注销 | TC-LIFE-01 |
-| FM-OBS-01 | 可观测性 | 无 `task_id`/`entryStatus` 日志 | 无法定位 | S4 | 结构化日志：op/keys/task_id/entry 下标/首错 | TC-OBS-01 |
+| FM-INIT-01 | Init | `KvClient::Init` / `RegisterKVCaches` 失败或返回空结果 | 节点不参与 offload | S2 | 失败回滚 `kUninit`；空结果当失败 | TC-INIT-01 |
+| FM-ENTRY-01 | BuildKvBuffers | `FindPersistentHandle` 找不到 / handle 非注册返回值 | `BUFFER_NOT_REGISTERED` | S2 | 边界检查；只用注册区域 handle | TC-ENTRY-02 |
+| FM-ENTRY-02 | Key | `MakeAsuKey` 全零或 64-bit 碰撞 | 写错对象/覆盖先写 | S1 | 全零重映射；碰撞作为已知风险接受 | TC-ENTRY-03 |
+| FM-ENTRY-03 | BuildKvBuffers | `tensorSizes[0]` 超 24-bit 或未 512B 对齐 | SDK `INVALID_ARGUMENT` | S2 | 提交前校验；超限 key 跳过 | TC-ENTRY-04 |
+| FM-WRITE-01 | 写 | `PARTIAL_FAILED` 下把 OK entry 当成功 | 假成功，Master 指向未发送数据 | S1 | 本块整体不发布 | TC-STORE-01 |
+| FM-WRITE-02 | 写 | `Wait` 超时/`TASK_NOT_FOUND` 后复用 tensor | 数据串写 / use-after-free | S1 | tensor 区间隔离，不复用 | TC-STORE-01 |
+| FM-WRITE-03 | 写/配额 | 返回 `KEYS_ULTRA_LIMIT` 或硬错误 | offload 永久关闭 / 心跳中断 | S2 | 逐 key 跳过，返回 `expected(count)` | TC-STORE-02 |
+| FM-WRITE-04 | 写 | `complete_handler` 失败 | 数据在 ASU、Master 未登记 | S2 | 返回错误、记日志；重试 Put 覆盖 | TC-STORE-03 |
+| FM-READ-01 | 读 | 前缀读被拒绝 / `slice.size > payload_size` | ranged read 失败或超读 | S2 | 允许 `slice.size <= payload_size` | TC-LOAD-02 |
+| FM-READ-02 | 读 | 头 / payload CRC 损坏 | 返回错误数据 | S1 | 头 CRC + payload CRC | TC-LOAD-03 |
+| FM-QUERY-01 | 查 | `IO_ERROR`/超时返回 false | probe 误删 Master 元数据 | S1 | 一律 `unexpected`，绝不返回 false | TC-QUERY-01 |
+| FM-DEL-01 | 删 | V1 逻辑删除不释放 ASU | 容量残留 | S2（接受） | 明确对外口径；覆盖/GC/namespace 轮转 | TC-DEL-03 |
+| FM-DEL-02 | 删 | owner 路由错误或 `DeleteAsync` 失败 | 漏删/删错/残留 | S1/S3 | Master→owner；逐 key 日志；幂等重试 | TC-DEL-01/02 |
+| FM-CONC-01 | 并发 | `Wait` 持锁 / tensor 未完成就复用 | 心跳阻塞 / 数据损坏 | S1/S2 | `Wait` 不持锁；超时隔离 | TC-CONC-01 |
 
 ### 4.2 测试用例与验收点
 
 | 编号 | 场景 | 注入/前置 | 验收点 |
 | --- | --- | --- | --- |
-| TC-INIT-01 | Init 注册失败 / 无 transport | `RegisterKVCaches` 返回错误或空 vector | Init 返回错误、回滚 `kUninit`、不进入 `kReady`；FileStorage Init 失败 |
-| TC-INIT-02 | 连续两次 Init | 正常 Init 两次 | 第一次 OK；第二次 `INTERNAL_ERROR`；状态/计数不变 |
-| TC-ENTRY-01 | 注册后提交 Store | 正常注册区域 | transport 收到的 entry `mrKey` 非空且等于注册返回 `tokenId`；`region.size` 512B 对齐；`handle` 来自 `FindPersistentHandle` |
-| TC-ENTRY-02 | 未注册/伪造 handle 提交 | 伪造 `buffer.handle` | `BUFFER_NOT_REGISTERED`；不发布；tensor 区间释放；无泄漏 |
-| TC-ENTRY-03 | 同一 `KVCacheRegistration` 多个子区间 tensor | 同一注册区域分配多个 tensor | 每个 entry `addr` 不同、`handle` 相同；transport 子区间寻址成功（真机确认） |
-| TC-ENTRY-04 | 超 24-bit / 超 tensor 区间 | `payload_size` 超限 | 该 key 跳过、不提交；其他 key 正常 |
-| TC-ENTRY-05 | Key 编码稳定性 | 同一 `scoped_key` 走写/读/查 | 三次得到同一非零 `MakeAsuKey(BlockId)`；不同 namespace 得到不同 key |
-| TC-STORE-01 | OK / `PARTIAL_FAILED` / `Wait` 超时 | 注入部分失败/延迟 | OK 只发布成功 entry；PARTIAL 本块不发布；超时 tensor 区间隔离且不复用 |
-| TC-STORE-02 | `complete_handler` 失败 | handler 返回错误 | 数据仍可读；返回错误；不回滚；日志记录 |
-| TC-STORE-03 | `BatchStoreAsync` 返回 `RESOURCE_BUSY` | 注入提交失败 | 不调用 `Wait`；tensor 区间立即释放；下一轮可重试 |
-| TC-LOAD-01 | 全长读 + payload CRC | 写入后按全长读 | 字节一致；head/payload CRC 通过；不越界 |
-| TC-LOAD-02 | 前缀读（`slice.size < payload_size`） | 只读对象前缀 | 返回前缀；头 CRC 通过；不越界 |
-| TC-LOAD-03 | 头损坏 | 篡改 magic/version/头 CRC | 返回 `INVALID_READ`；不拷贝 payload |
-| TC-LOAD-04 | payload 损坏 | 篡改一个字节 | 返回 `CHECKSUM_MISMATCH`；不拷贝 |
-| TC-LOAD-05 | `slice.size > payload_size` | 请求长度超过存储 | 返回 `INVALID_PARAMS`；不拷贝 |
-| TC-QUERY-01 | `exists=0` + `IO_ERROR` / 超时 | 注入分片失败/延迟 | 返回 `unexpected`；绝不返回 false；Master 元数据不变 |
-| TC-QUOTA-01 | `kReady` / 未就绪 | 构造 `kUninit`/`kInitializing` | `kReady` 返回 true 且不读计数/不调 ASU；未就绪返回错误 |
-| TC-QUOTA-02 | 计数超 `total_keys_limit`/`total_size_limit` | 构造超限计数 | 超限 key 跳过；返回 `expected(success_count)`/`expected(0)`；不返回 `KEYS_ULTRA_LIMIT` |
-| TC-DEL-01（选 A） | 多 client、非 owner 调用 Remove | 两个 client，A 删 B 拥有的 key | Master 通知 owner；owner 删除；调用方不直接删；254 分块；`CQE_KEY_NOT_EXIST` 成功 |
-| TC-DEL-02（选 B） | `Client::Remove` 后 ASU 值仍在 | V1 逻辑删除 | 行为与文档一致；再次 Put 覆盖；不崩溃 |
-| TC-DEL-03（选 A） | `DeleteAsync` 逐 entry 失败 | 注入删除失败 | 失败 key 有日志；重复删除幂等；计数只扣成功 key |
-| TC-DEL-04（选 A） | owner 重启丢失删除任务 | 入队后重启 owner | 任务丢失、ASU 残留；不崩溃；行为与文档一致 |
-| TC-CONC-01 | 多读并发 + 写 | 多线程读写 + 单 tensor 区间 | TSAN/ASAN 干净；tensor 区间全部归还；无 use-after-free |
-| TC-LIFE-01 | 有在途 task 时 Shutdown | 延长 `Wait` | 等待 task 完成；不提前 `UnregisterRegions`；无崩溃 |
-| TC-OBS-01 | 注入一次 entry 失败 | 检查日志 | 日志含 `op`、`task_id`、entry 下标/状态、首错、key |
-| TC-E2E-01 | 写 → 读回 | 正常 Object | 字节一致（含前缀读）；Master 可见 `LOCAL_DISK` 副本 |
+| TC-INIT-01 | Init 注册失败 / 空结果 | 注入注册失败或空 vector | 回滚 `kUninit`、不进入 `kReady`；FileStorage Init 失败 |
+| TC-ENTRY-01 | Store entry 构造 | 正常注册区域 | `mrKey` 非空且等于 `tokenId`；`region.size` 512B 对齐；handle 来自 `FindPersistentHandle` |
+| TC-ENTRY-02 | 伪造 / 未注册 handle | 伪造 `buffer.handle` | `BUFFER_NOT_REGISTERED`；不发布；tensor 释放 |
+| TC-ENTRY-03 | Key 编码稳定性 | 同一 `scoped_key` 写/读/查 | 得到同一非零 `MakeAsuKey(BlockId)`；不同 namespace 不同 |
+| TC-ENTRY-04 | 超 24-bit / 未对齐 | `payload_size` 超限 | 该 key 跳过、不提交；其他 key 正常 |
+| TC-STORE-01 | OK / `PARTIAL_FAILED` / 超时 | 注入部分失败/延迟 | OK 只发布成功 entry；PARTIAL 不发布；超时 tensor 隔离 |
+| TC-STORE-02 | 超配额 | 计数超 limit | 超限 key 跳过；返回 `expected(count)`；不返回 `KEYS_ULTRA_LIMIT` |
+| TC-STORE-03 | `complete_handler` 失败 | handler 返回错误 | 数据仍可读；返回错误；不回滚 |
+| TC-LOAD-01 | 全长读 + CRC | 写入后按全长读 | 字节一致；head/payload CRC 通过 |
+| TC-LOAD-02 | 前缀读 | `slice.size < payload_size` | 返回前缀；不越界 |
+| TC-LOAD-03 | 数据损坏 | 篡改头 / payload | `INVALID_READ` / `CHECKSUM_MISMATCH`；不拷贝 |
+| TC-QUERY-01 | 查询错误 | `exists=0` + `IO_ERROR` / 超时 | 返回 `unexpected`；绝不返回 false |
+| TC-DEL-01 | 按 key 删除 | 多 client，非 owner 调用 | master 通知 owner；owner 删除；254 分块；`CQE_KEY_NOT_EXIST` 成功 |
+| TC-DEL-02 | 删除失败 / 重复删除 | 注入 `ENTRY_DELETE_FAILED` | 失败有日志；重复删除幂等；计数只扣成功 key |
+| TC-DEL-03 | V1 逻辑删除（若选 B） | `Client::Remove` 后检查 ASU | ASU value 仍在；行为与文档一致；再次 Put 覆盖 |
+| TC-CONC-01 | 多读并发 + 写 | 多线程读写 | TSAN/ASAN 干净；tensor 区间全部归还 |
 
 ---
 
