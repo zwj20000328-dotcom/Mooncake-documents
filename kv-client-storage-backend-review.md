@@ -466,8 +466,6 @@ tl::expected<bool, ErrorCode> IsExist(const std::string& scoped_key) {
 
 ### 3.4 删
 
-本节类图、时序图和实现按“**已添加按 key 删除逻辑**”绘制；当前 HEAD 的实际状态与方案选择见 3.4.4。
-
 #### 3.4.1 类图
 
 ```mermaid
