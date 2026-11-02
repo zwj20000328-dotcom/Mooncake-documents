@@ -8,6 +8,9 @@
 - 2026-11-02 裁决：`IsEnableOffloading` 在 `kReady` 后返回 true，未就绪返回错误；
   容量/配额控制只在 `BatchOffload` 内逐批/逐 key 做。以
   `kv-client-storage-backend-review.md` §0.3 / §5.2 为准。
+- 2026-11-02 entry 构造改为对齐 asuStore 命名：`BlockId` / `Shard` / `TaskDesc` /
+  `KVCacheRegistration` / `RegisteredPersistentRegion` / `FindPersistentHandle` /
+  `BuildKvBuffers`；以 `kv-client-storage-backend-review.md` 的 3.1 / 3.2 节为准。
 - 适用代码：`mooncake-store`（C++）
 - 接口基线：`mooncake-store/include/storage_backend.h`
 - 参考实现：`NvmeKvStorageBackend`（KV 客户端型后端）

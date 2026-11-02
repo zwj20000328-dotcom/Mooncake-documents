@@ -1,42 +1,4 @@
-# KvClientStorageBackend 方案评审（讲解版）
-
-> 基于 `kv-client-storage-backend.md`（Draft v1）整理，面向评审会讲解。
-> 只保留需要拍板的内容，不复述全部实现细节。
->
-> - 代码基线：Mooncake `522b716e`；UCM `kv_semantics`（`kv::KvClient`）
-> - SDK 接口：`kv_semantics/include/kv_client.h`；不是旧分支的 `UC::ASU::AsuClient`
-> - 接口基线：`mooncake-store/include/storage_backend.h:263-331`
-> - 讲解顺序建议：5 min 背景 → 10 min 删除专题 → 8 min entry/mrKey → 5 min 测试与风险
-
----
-
-## 0. 一页结论
-
-### 0.1 四句话
-
-| # | 问题 | 结论 |
-| --- | --- | --- |
-| 1 | 按 key 删除能不能只靠后端实现？ | **不能**。Mooncake 的 `Client::Remove`/`BatchRemove` 只删 Master 元数据和客户端内存副本，不经过 `StorageBackendInterface`；现有接口也没有任何方法能携带“要删除的 key 集合”。 |
-| 2 | 那是否必须改 `StorageBackendInterface`？ | **要物理删除就必须扩展后端契约**。接口本身只需增加一个带默认实现的虚函数（非破坏性）；真正成本在 Master→owner 的按 key 删除任务路由，约 500–900 行 / 10 个文件。 |
-| 3 | 有没有不改接口也能交付的方案？ | **有，但只能把删除降级为“逻辑删除”**：`Remove` 后 ASU 上的值仍在，靠同 key 覆盖写 / ASU GC / 命名空间轮转回收。不能宣称“删除释放 ASU 容量”。 |
-| 4 | 写/读的 entry 和内存怎么落？ | 启动时分配一块对齐的 staging arena，**整块注册一次**；每次读写从 slot 池取子区间，构造 `KVBuffer` 后提交。`mrKey` 不由后端填写，由 SDK 在提交时按 `buffer.handle` 解析并写入，transport 组 SQE 时读取。 |
-
-### 0.2 需要评审拍板的三件事
-
-1. **V1 是否要求 `Remove` 立即释放 ASU 容量？**
-   - 是 → 选方案 A（扩展后端契约 + Master→owner 路由），单独立项。
-   - 否 → 选方案 B（逻辑删除，零接口改动，明确对外口径）。
-2. **读路径是否必须支持“前缀读”？**
-   Mooncake 的 LOCAL_DISK ranged read 会传 `src_offset + size`，`slice.size` 可能小于对象全长（`real_client.cpp:5128-5138`）。必须支持，否则合法 ranged read 全部失败。
-3. **单对象上限取多少？**
-   原方案默认 `max_payload_bytes = 16 MiB` 不可用：`24 + 16 MiB` 对齐后超过 SQE 的 24-bit length 上限。建议默认 2 MiB，硬上限 `payload_size ≤ 16,776,680`。
-
-### 0.3 已确定
-
-- **`IsEnableOffloading()`：`kReady` 后直接返回 true；未就绪返回错误，让 `FileStorage::Init` 明确失败。** 不在该方法里读计数或查 ASU 容量/水位。
-- **容量/配额控制放在 `BatchOffload` 内逐批/逐 key 做**：超限 key 跳过，返回 `expected(success_count)` 或 `expected(0)`，下一轮心跳重试；绝不返回 `KEYS_ULTRA_LIMIT`。
-
----
+# KvClientStorageBackend 方案
 
 ## 1. 背景与边界
 
@@ -44,13 +6,26 @@
 
 ```mermaid
 flowchart LR
-    APP["Application / vLLM"] --> STORE["StoreClient"]
-    STORE -->|"Put / Get / Remove"| MASTER["Master"]
-    STORE -->|"BatchGet"| FS["FileStorage"]
-    MASTER -->|"offload 任务"| FS
-    FS -->|"BatchOffload / BatchLoad / IsExist"| BE["KvClientStorageBackend"]
-    BE -->|"Store/Load/Query/Delete + Wait"| KC["kv::KvClient"]
-    KC --> ASU["ASU"]
+    FS["FileStorage<br/>BatchOffload / BatchLoad / IsExist / BatchRemoveKeys"]
+    BE["KvClientStorageBackend<br/>BuildKvBuffers + FindPersistentHandle"]
+    KC["kv::KvClient"]
+    ASU["ASU"]
+
+    FS -->|"① BatchOffload"| BE
+    BE -->|"① BatchStoreAsync + Wait"| KC
+    KC -->|"① 写"| ASU
+
+    FS -->|"② BatchLoad"| BE
+    BE -->|"② BatchLoadAsync + Wait"| KC
+    KC -->|"② 读"| ASU
+
+    FS -->|"③ IsExist"| BE
+    BE -->|"③ QueryAsync + Wait"| KC
+    KC -->|"③ 查"| ASU
+
+    FS -.->|"④ BatchRemoveKeys（方案 A，未实现）"| BE
+    BE -.->|"④ DeleteAsync + Wait"| KC
+    KC -.->|"④ 删"| ASU
 ```
 
 默认是“写完即下沉”：`PutEnd` 成功后 Master 把对象放进 owner 的 offload 队列，下一次心跳由 `FileStorage` 调 `BatchOffload` 写入 ASU；内存副本在 `NotifyOffloadSuccess` 前不可淘汰。本后端不感知触发时机。
@@ -59,14 +34,12 @@ flowchart LR
 
 | 在范围内 | 说明 |
 | --- | --- |
-| 写 `BatchOffload` | 编码进 staging，`BatchStoreAsync` + `Wait`，只上报成功 key |
-| 读 `BatchLoad` | `BatchLoadAsync` + `Wait`，校验记录头，支持前缀读 |
+| 写 `BatchOffload` | `BuildKvBuffers` 编码进 tensor 区间，`BatchStoreAsync` + `Wait`，只上报成功 key |
+| 读 `BatchLoad` | `BuildKvBuffers` + `BatchLoadAsync` + `Wait`，校验记录头，支持前缀读 |
 | 查 `IsExist` | `QueryAsync` + `Wait`，同时看 `exists` 与 `entryStatus` |
-| 删 | 见第 3 节：V1 建议逻辑删除；物理删除单列 P1 |
-| `Init` / `IsEnableOffloading` | 注册 staging；`IsEnableOffloading` 在 `kReady` 后返回 true，未就绪返回错误；不查 ASU、不读计数 |
+| 删 | 逻辑删除；物理删除 |
+| `Init` / `IsEnableOffloading` | 注册 `KVCacheRegistration`；`IsEnableOffloading` 在 `kReady` 后返回 true，未就绪返回错误；不查 ASU、不读计数 |
 | `ScanMeta` | **不实现枚举**，返回 OK 空扫描；本文不讨论恢复 |
-
-不在本版：`RemoveByRegex`、水位淘汰、ASU GC 对接、恢复 manifest、chunk 分片、多副本、压缩/加密/TTL、零拷贝、批量查询。
 
 ### 1.3 与现有后端的关系
 
@@ -75,7 +48,7 @@ flowchart LR
 | `StorageBackendAdaptor` | `RemoveAll` | `ScanMeta` 目录扫描 |
 | `BucketStorageBackend` | `RemoveAll` / 水位淘汰 | 内存索引 + 持久化元数据 |
 | `NvmeKvStorageBackend` | 无 | 无（`ScanMeta` 空实现） |
-| `KvClientStorageBackend` | 见第 3 节 | 无（`ScanMeta` 空实现） |
+| `KvClientStorageBackend` | 见 3.4 节 | 无（`ScanMeta` 空实现） |
 
 ---
 
@@ -88,14 +61,14 @@ flowchart TB
     FS["FileStorage"] --> BE["KvClientStorageBackend"]
     FAC["CreateStorageBackend"] --> BE
     BE --> CFG["KvClientBackendConfig"]
-    BE --> H1["私有 helper：KeyCodec / RecordCodec / SlotPool"]
-    BE -->|"RegisterRegions<br/>Store/Load/Query/Delete<br/>Wait"| KC["kv::KvClient"]
+    BE --> H1["私有 helper：KeyCodec / RecordCodec / BuildKvBuffers / FindPersistentHandle"]
+    BE -->|"RegisterKVCaches<br/>Store/Load/Query/Delete<br/>Wait"| KC["kv::KvClient"]
     KC --> VIEW["ASU View Service"]
     KC --> ASU["ASU nodes"]
 ```
 
 - UCM 头只在 `backend.cpp` 包含；`backend.h` 只前置声明 `namespace kv { class KvClient; }`。
-- 不新增端口层/适配器层；key 编码、记录编解码、slot 池都是 `backend.cpp` 的私有 helper。
+- 不新增端口层/适配器层；key 编码、记录编解码、注册区域内的 tensor 区间分配都是 `backend.cpp` 的私有 helper。
 - `backend.h` 不暴露 `kv::` 类型，避免 UCM 头进入 Mooncake 公共头。
 
 ### 2.2 线程与锁
@@ -109,258 +82,95 @@ flowchart TB
 
 锁纪律：
 
-1. `write_mutex_` 只串行化写路径与 slot 写侧分配。
-2. `slots_mutex_` 只保护 Free/InUse/Quarantined 集合，**绝不覆盖 `Wait`**。
+1. `write_mutex_` 只串行化写路径与 tensor 区间分配。
+2. `regions_mutex_` 只保护注册区域的空闲/隔离 tensor 区间集合，**绝不覆盖 `Wait`**。
 3. 任何 ASU `Wait` 期间不持锁；`complete_handler` 回调期间不持锁。
 4. 无索引锁——读长度以 Master 的 `slice.size` 为准，不依赖本地索引。
 
 ---
 
-## 3. 删除专题（重点）
+## 3. 功能实现
 
-### 3.1 现状：按 key 删除在 Mooncake 里走到哪
+本章按“写 → 读 → 查 → 删”组织。每个小节固定四段：类图、时序图、伪代码、注意事项。
 
-| 用户操作 | 实际动作 | 到 `StorageBackendInterface`？ | 证据 |
-| --- | --- | --- | --- |
-| `Client::Remove(key)` | 删 Master 元数据 + hot cache；物理删除调用被注释 | **否** | `client_service.cpp:3795-3812`，`3801-3803` 为注释 |
-| `Client::BatchRemove(keys)` | Master 逐 key 删元数据 | **否** | `client_service.cpp:3848-3870`；`master_service.cpp:7437-7530` |
-| `Client::RemoveByRegex` | Master 扫描删元数据 | **否** | `client_service.cpp:3814-3831` |
-| `Client::RemoveAll` | Master 删元数据；客户端物理清空当前不可达 | **否（当前 HEAD）** | `file_storage.cpp:912-921` 零调用者；`local_ssd/manager` 的 `RequestRemoveAll` 也无调用者 |
-| `EvictAboveDiskWatermark` | 后端选 key，通知 Master 后物理删 | 是，但**不是用户按 key** | `storage_backend.h:323-328` |
-| KvClient | `DeleteAsync(vector<CacheKey>)` | 是（若被调用） | `kv_client.h:50` |
+entry 构造统一沿用 asuStore 命名：
 
-关键事实：
-
-- 当前 HEAD 的 `Client::Remove`/`BatchRemove` 是 **master-first、metadata-only**；offload 数据面完全不知道用户删了哪个 key。
-- `RemoveAll` 链路两端都是死的：`RequestRemoveAll()` 无调用者，`FileStorage::RemoveAll()` 无调用者，`Client::PollRemoveAll()` 无调用者。RPC 还在，但标志位永远不会被置起。
-- `KvClient` 没有 `RemoveAll`/drop/scan；只能按 8 字节 key 调 `DeleteAsync`。
-- `Client::Remove` 里被注释的 `storage_backend_` 是客户端本地文件后端的 `std::shared_ptr<StorageBackend>`（`client_service.h:1178`），不是 `FileStorage` 持有的 `StorageBackendInterface`（`file_storage.h:291`）。即使取消注释，也不会到达 offload 后端。
-
-### 3.2 现有后端接口能否承载“按 key 删除”
-
-`StorageBackendInterface` 能到达后端的只有这几个方法：
-
-| 方法 | 语义 | 能否表达“删除这些 key” |
-| --- | --- | --- |
-| `BatchOffload` | 写/覆盖 | 否，会把 key 写回 |
-| `BatchLoad` | 读 | 否 |
-| `IsExist` | 查询 | 否，约定无副作用 |
-| `GetObjectDataSize` | 查询长度（可选） | 否 |
-| `RemoveAll` | 全清 | 只能全量，不能按 key；且当前不可达 |
-| `EvictAboveDiskWatermark` | 后端自选 victim | 后端不知道用户删了哪些 key |
-
-**结论：不改接口就不可能把“要删的 key”传到后端。** 唯一不改接口的选择是把删除降级为逻辑删除，而不是物理删除。
-
-### 3.3 方案对比
-
-| 方案 | 做法 | 按 key 物理删除 | 容量回收 | 改动面 | 主要风险 | 结论 |
-| --- | --- | --- | --- | --- | --- | --- |
-| **A. 扩展基类接口 + 路由** | `StorageBackendInterface` 加 `BatchRemoveKeys`（默认 `NOT_SUPPORTED`）；Master 删元数据前捕获 LOCAL_DISK owner，投递按 key 删除任务；owner 心跳取任务后调 backend `DeleteAsync` | 是 | 立即 | 约 500–900 行 / 10 文件 | owner 捕获顺序、HA/oplog、无持久化重试、任务通道 | 需要容量回收时**唯一正确方案** |
-| **A'. 旁路能力接口 + 同样路由** | 不动基类，新增 `KeyDeleteCapable` 侧接口，`FileStorage` `dynamic_cast` | 是 | 立即 | 同 A（路由成本不变） | RTTI/可选能力；仍要改 FileStorage | 不想动公共基类时的备选 |
-| **B. 逻辑删除** | 不改任何接口；`Remove` 只删元数据 | 否 | 靠同 key 覆盖写 / ASU GC / 命名空间轮转 | 0 | 容量泄漏；无回收保证；不能对外宣称“删除” | **V1 推荐**，需明确口径 |
-| **C. 本地 key 集合 + `RemoveAll` 全清** | 记录本进程写过的 key，`RemoveAll` 时按 254 分批 `DeleteAsync` | 否（只能全清） | 全清 | 需新增 key 集合 + 恢复 `RemoveAll` 两端接线 | 重启后集合为空；租户隔离被破坏；当前链路已死 | 只适合运维重置，不作为按 key 删除 |
-| **D. 哨兵复用 `BatchOffload`** | Master 把删除 key 当 offload 任务下发，空 slice 表示删除 | 名义上是 | 是 | 仍需 Master 路由 | 语义滥用；FileStorage/bucket/D2H/complete_handler 全假设有数据 | **否决** |
-
-### 3.4 推荐决策
-
-**建议 V1 选 B，物理删除单列 P1。** 理由：
-
-- 当前 HEAD 的删除通道本身不可达，V1 若强行做 A，会把“后端实现”变成“跨 Master/Client/FileStorage/local_ssd 的协议改造”，评审范围和风险都失控。
-- `Client::Remove` 的语义本来就是“让对象不可路由”；在 ASU 作为 cache tier 的定位下，逻辑删除 + 同 key 覆盖写可以满足大部分场景。
-- 对外必须明确：**`Remove` 不释放 ASU 容量；ASU 残留由覆盖写 / ASU GC / 命名空间轮转回收。**
-
-如果评审认为“删除必须释放 ASU 容量”，则选 A（或 A'），并接受：
-
-- `StorageBackendInterface` 增加一个带默认实现的虚函数，对现有后端非破坏；
-- Master 必须在 `EraseMetadata` **之前**捕获 LOCAL_DISK replica 的 owner，否则删除任务没有投递对象；
-- HA/oplog 路径要把“捕获 owner”和“元数据删除”放在同一个持久化语义里；
-- 本版没有持久化删除任务队列，owner 重启会丢任务；需要带外清理兜底。
-
-反过来说，**只加接口方法、不接路由也不够**：方法会永远没有调用者；如果只在 `Client::Remove` 里本地调用，则调用方不一定是 owner，多 client 场景会漏删，且可能用了错误的 `key_namespace`。所以“改接口”和“接路由”必须成对出现。
-
-### 3.5 若选 A：最小改动清单
-
-| 层 | 改动 |
-| --- | --- |
-| `storage_backend.h` | 新增 `virtual BatchRemoveKeys(const vector<string>& scoped_keys)`，默认逐 key 返回 `NOT_SUPPORTED` |
-| `file_storage.{h,cpp}` | 转发 `BatchRemoveKeys`；提供删除任务消费入口 |
-| `local_ssd/manager.{h,cpp}` | 新增按 key 删除任务邮箱/队列（现有只有 `RemoveAll` 布尔位） |
-| `master_service.{h,cpp}` | `Remove`/`BatchRemove` 成功删元数据前捕获 owner，投递按 key 任务 |
-| `rpc_service` / `master_client` / `RpcNameTraits` | 新增拉取删除任务的 RPC，或扩展心跳响应（不建议改 `PollRemoveAll` 返回值） |
-| `client_service` / `FileStorage::Heartbeat` | 拉取删除任务并调用 backend |
-| `kv_client/backend.cpp` | `scoped_key → asu_key`；按 254 切块 `DeleteAsync`；每块只 `Wait` 一次；`CQE_KEY_NOT_EXIST` 视为成功；失败保留索引/日志 |
-
-注意：
-
-- 删除按 key 是幂等的；重复删除返回 `CQE_KEY_NOT_EXIST`，归一为成功。
-- 非 owner 的调用方不能直接算 ASU key（`key_namespace` 只有 owner 知道），所以必须 Master→owner 路由。
-- 单次 `DeleteAsync` 的 key 数按 `deleteIoNum` 默认 254 切块；本次后端自己切，不依赖 transport 内部再拆。
-- 删除不需要注册内存，因此不走 staging。
-
-### 3.6 若选 B：必须写进对外口径
-
-| 项 | 说明 |
-| --- | --- |
-| `Remove` 的实际效果 | Master 元数据 + hot cache 删除；ASU 上的 value 仍在 |
-| 回收路径 | 同 key 再次 Put（Store 是 upsert，覆盖旧 value；需真机确认 ASU 的覆盖写语义）；ASU 自身 GC/容量淘汰；运维轮转 `key_namespace` |
-| 不可观测 | 没有 ASU 容量查询；无法确认残留何时消失 |
-| 监控 | 只能看 ASU 侧容量/GC 指标；Mooncake 侧无 per-key 删除成功率 |
-| 禁止宣称 | “删除会释放 ASU 空间”或“`Remove` 后 ASU 立即不可见” |
+- `BlockId`（16B）由 `key_namespace + '\0' + scoped_key` 的 128-bit 哈希派生；
+- `MakeAsuKey(BlockId)` 生成 8B `kv::CacheKey`（全零重映射）；实现必须用稳定哈希（如 XXH64），不要直接用 `std::hash`（跨进程/编译器不稳定）；
+- 一个 Mooncake 对象 = 一个 `Shard` + 一个 tensor：`tensorSizes[0] = align_up(24 + Σ slice.size, 512)`，`offset = 0`；
+- 注册内存 = `KVCacheRegistration`，Init 时 `RegisterKVCaches` 注册一次，返回 `RegisteredPersistentRegion{region, handle}`；
+- `BuildKvBuffers(TaskDesc, tensorSizes)` 生成 `vector<kv::KVBuffer>`；`buffer.handle` 由 `FindPersistentHandle(region)` 解析；`mrKey` 留空，由 SDK 提交时写入。
 
 ---
 
-## 4. Entry 构造、内存注册与 mrKey（重点）
+### 3.1 写：`BatchOffload`
 
-### 4.1 Init：注册 staging arena
+#### 3.1.1 类图
+
+```mermaid
+classDiagram
+    class FileStorage {
+        +BatchOffload(batch, complete_handler, eviction_handler)
+    }
+    class KvClientStorageBackend {
+        +BatchOffload(...)
+        -BuildTaskDesc(batch) TaskDesc
+        -AllocateTensor(size) addr
+        -BuildKvBuffers(task, tensorSizes) Entries
+        -FindPersistentHandle(region) MRHandle
+    }
+    class TaskDesc {
+        +shards
+        +prerequisiteHandle
+    }
+    class Shard {
+        +owner BlockId
+        +index
+        +addrs
+    }
+    class KVCacheRegistration {
+        +addr
+        +size
+    }
+    class RegisteredPersistentRegion {
+        +region MemoryRegion
+        +handle MRHandle
+    }
+    class KvClient {
+        +BatchStoreAsync(entries, taskId)
+        +Wait(taskId, timeout, result)
+    }
+    FileStorage --> KvClientStorageBackend : BatchOffload
+    KvClientStorageBackend ..> TaskDesc : builds
+    TaskDesc *-- Shard
+    KvClientStorageBackend ..> KVCacheRegistration : Init 注册
+    KvClientStorageBackend ..> RegisteredPersistentRegion : FindPersistentHandle
+    KvClientStorageBackend --> KvClient : BatchStoreAsync + Wait
+```
+
+#### 3.1.2 时序图
 
 ```mermaid
 sequenceDiagram
     autonumber
+    participant MS as Master
     participant FS as FileStorage
     participant BE as Backend
-    participant SA as StagingArena
-    participant KC as kv::KvClient
-    participant MP as MemoryProvider
-
-    FS->>BE: Init()
-    BE->>SA: 分配对齐 arena（staging_bytes）
-    BE->>KC: RegisterRegions([{HOST, base, size}])
-    KC->>MP: RegisterMemory([{MEM_HOST, addr, size}])
-    MP-->>KC: MRHandle
-    KC->>MP: GetMemTokenId(handle)
-    MP-->>KC: tokenId
-    KC-->>BE: RegisteredMemory{region, handle, tokenId}
-    BE->>SA: 保存 canonical handle；初始化 Free slot 池
-    Note over BE: 返回为空（无 transport）或注册失败 → Init 失败并回滚
-```
-
-实现要点：
-
-- **整块注册一次**：`RegisterRegions` 接收 `vector<MemoryRegion>`，每个 region 返回一个 `RegisteredMemory{region, handle, tokenId}`（`kv_client_impl.cc:321-425`）。
-- 每个 slot 是已注册 arena 的**子区间**：`buffer.region.addr = slot_base`、`buffer.region.size = transfer_size`、`buffer.handle = arena_handle`。subrange 寻址是否被 transport 接受需真机确认；若不支持，退化为每 slot 单独注册（会多出 handle/token）。
-- **陷阱**：`RegisterRegions` 在 `transports.empty()` 时返回 OK 且 `registeredRegions` 为空（`kv_client_impl.cc:337-339`）。必须把“空结果”当失败，否则后续所有提交都会 `BUFFER_NOT_REGISTERED`。
-- `UnregisterRegions` 只能在所有 task 完成且没有 `Quarantined` slot 后调用；`Shutdown` 只是有界 drain。
-
-```cpp
-std::vector<kv::RegisteredMemory> regs;
-auto st = client_->RegisterRegions(
-    {kv::MemoryRegion{kv::MemoryType::HOST,
-                      reinterpret_cast<uint64_t>(arena_base),
-                      static_cast<uint64_t>(arena_bytes)}},
-    regs);
-if (!st.ok() || regs.size() != 1) {
-    // 注册失败或 transports 为空：回滚 Init，不要进入 kReady
-    return MapStatus(st.code);
-}
-arena_handle_ = regs[0].handle;   // 唯一需要长期保存的注册结果
-```
-
-### 4.2 slot 与对齐
-
-| 项 | 规则 |
-| --- | --- |
-| slot 大小 | `slot_size = align_up(24 + max_payload_bytes, 512)` |
-| slot 数量 | `max(1, staging_bytes / slot_size)` |
-| 传输长度 | `transfer_size = align_up(24 + payload_size, 512)` |
-| 512B 对齐 | `buffer.region.size` 与 `offset` 必须 512B 对齐；建议 `slot_base` 至少 512B 对齐（推荐 2 MiB 页对齐） |
-| 24-bit 上限 | `transfer_size <= 0xFFFFFF`，即最大 `16,776,704`；对应 `payload_size <= 16,776,680` |
-| 零填充 | 记录尾部补零到 `transfer_size`，填充不参与 payload CRC |
-
-固定 slot 的取舍：实现最简单，但 `max_payload_bytes` 大时 slot 数少、读并发受限。V1 接受；P1 可改 size-class slot 或按需分配。
-
-两个 Init 校验：
-
-- 必须满足 `slot_size <= staging_bytes`，否则一个 slot 都放不下，Init 直接失败；若 `slot_count < batch_size`，实际每块大小取 `min(batch_size, slot_count)`。
-- `staging_bytes` / `slot_size` / arena 地址都按 512B 对齐；建议 arena 用 2 MiB 页对齐分配，减少跨页注册问题。
-
-**原方案默认值需要修正**：`max_payload_bytes = 16 MiB` 时 `transfer_size = 16,777,728 > 0xFFFFFF`，满尺寸写会被 SDK 直接 `INVALID_ARGUMENT`。建议默认 2 MiB。
-
-### 4.3 Store entry 构造
-
-每个 key 的构造步骤：
-
-1. `scoped_key` 来自 `FileStorage`（`tenant_id + '\0' + local_key`）。
-2. `asu_key = XXH64("mooncake/kvclient/v1" + key_namespace + 0x00 + scoped_key)`；结果为全零时重映射（SDK 拒绝全零 key）。
-3. `payload_size = Σ slice.size`；`record_size = 24 + payload_size`；`transfer_size = align_up(record_size, 512)`。
-4. 超 `slot_size`、超 24-bit、超 `max_payload_bytes` → 跳过该 key，不提交。
-5. 从 slot 池 `Acquire` 一个 slot，写入 `RecordHeader`（24B）+ payload + 零填充。
-6. 上报 Master 的元数据：`data_size = payload_size`（不含 24B 头），`key_size = scoped_key.size()`，`offset = 0`，`bucket_id = -1`。
-7. 构造 `KVBuffer`：
-
-```cpp
-kv::KVBuffer e{};
-e.key = EncodeAsuKey(ns, scoped_key);          // 8B CacheKey，非全零
-e.buffer.region = kv::MemoryRegion{
-    kv::MemoryType::HOST,                       // host staging，provider 按 MEM_HOST 注册
-    reinterpret_cast<uint64_t>(slot.addr),      // slot 起始地址
-    static_cast<uint64_t>(transfer_size)        // 512B 对齐
-};
-e.buffer.handle = arena_handle;                 // RegisterRegions 返回的 canonical handle
-e.offset = 0;                                   // 远端 value 内偏移
-e.mrKey.reset();                                // 关键：不要填，SDK 负责写
-```
-
-`KVBuffer` 字段归属：
-
-| 字段 | 谁填 | 值 |
-| --- | --- | --- |
-| `key` | backend | `asu_key`（8B） |
-| `buffer.region.memoryType` | backend | `HOST` |
-| `buffer.region.addr` | backend | slot 起始地址 |
-| `buffer.region.size` | backend | `transfer_size` |
-| `buffer.handle` | backend | arena canonical handle |
-| `offset` | backend | `0` |
-| `mrKey` | **SDK** | 提交时由 `handle → tokenId` 解析 |
-
-### 4.4 Load entry 构造与前缀读
-
-Load 的 entry 构造与 Store 相同，只有长度来源不同：
-
-```text
-payload_hint = slice.size                 // Master 可能给前缀长度，不保证是全长
-transfer_size = align_up(24 + payload_hint, 512)
-```
-
-步骤：
-
-1. 校验 `slice.ptr != nullptr`、`slice.size > 0`。
-2. `transfer_size` 不超过 slot 大小；否则 `INVALID_PARAMS`。
-3. 取 slot，构造与 Store 相同的 `KVBuffer`（`key/region/handle/offset/mrKey` 规则完全一致）。
-4. `BatchLoadAsync` + `Wait`。
-5. 解析 slot 头部：magic → version → flags → `payload_size` → 头 CRC。
-6. 要求 `slice.size <= header.payload_size`；否则 `INVALID_PARAMS`，不拷贝。通过后按 `slice.size` 拷贝（前缀读时就是前缀长度）。
-7. 全长读时校验 payload CRC；前缀读时 payload CRC 无法覆盖完整 value，只能校验头 CRC（见风险）。
-
-后端只写 `slice.ptr` 指向的内存，不改写 `slice.ptr` / `slice.size`。
-
-**前缀读是必须支持的**：Mooncake 的 LOCAL_DISK ranged read 会传 `src_offset + size`（`real_client.cpp:5128-5138`）。原方案“头里的 `payload_size` 必须等于 `slice.size`，否则 `INVALID_PARAMS`”会让合法前缀读全部失败，需要改成上面的“`slice.size <= payload_size`”规则。
-
-**长度契约**：上面的请求长度公式隐含 `slice.size <= 对象实际 payload_size`。如果 Master 给出的长度超过 ASU 上存储的长度，请求会超过存储长度；V1 依赖调用方契约，不做本地长度索引。需要真机确认：超长读的返回行为，以及截断读是否被支持。
-
-### 4.5 Store / Load 时序：entry、注册内存与 mrKey
-
-#### 4.5.1 Store 时序
-
-```mermaid
-sequenceDiagram
-    autonumber
-    participant FS as FileStorage
-    participant BE as Backend
-    participant SA as StagingArena
     participant KC as kv::KvClient
     participant TR as Transport
     participant ASU as ASU
 
-    FS->>BE: BatchOffload(host_slices_by_scoped_key)
-    BE->>BE: EncodeAsuKey；payload_size=Σslice.size
-    BE->>BE: record_size=24+payload；transfer=align_up(record_size,512)
-    BE->>SA: AcquireSlots(N)
-    SA-->>BE: N slots（addr, handle）
-
-    loop 每个 key
-        BE->>BE: 写 RecordHeader + payload + 零填充到 slot
-        BE->>BE: 构造 KVBuffer{key, region{HOST,slot.addr,transfer}, handle, offset=0, mrKey=nullopt}
+    FS->>MS: OffloadObjectHeartbeat
+    MS-->>FS: OffloadTaskItem[]
+    FS->>BE: BatchOffload(batch_object)
+    loop 每个对象
+        BE->>BE: block = MakeBlockId(scoped_key)
+        BE->>BE: tensor_size = align_up(24 + Σslice.size, 512)
+        BE->>BE: tensor_addr = AllocateTensor(tensor_size); EncodeRecord(...)
+        BE->>BE: task.push_back(Shard{block, 0, {tensor_addr}})
     end
+    BE->>BE: entries = BuildKvBuffers(task, tensorSizes)
+    BE->>BE: FindPersistentHandle(region) 取 buffer.handle；offset=0；mrKey 留空
 
     BE->>KC: BatchStoreAsync(entries, taskId)
     loop 每个 entry
@@ -377,35 +187,155 @@ sequenceDiagram
     alt status == OK
         BE->>BE: 只发布 entryStatus == OK 的 key
     else PARTIAL_FAILED / TIMEOUT
-        BE->>BE: 本块不发布；TIMEOUT 的 slot 隔离
+        BE->>BE: 本块不发布；TIMEOUT 的 tensor 区间隔离
     end
-    BE->>SA: Release 或 Quarantine
+    BE->>BE: Release 或 Quarantine tensor 区间
     BE->>FS: complete_handler(published_keys, metadatas)
+    FS->>MS: NotifyOffloadSuccess(tasks, metadatas)
 ```
 
-#### 4.5.2 Load 时序
+#### 3.1.3 伪代码
+
+```cpp
+// Init：注册区域
+KVCacheRegistration reg{kv_cache_addr, kv_cache_size};
+RegisterKVCaches(&reg, 1);   // -> RegisteredPersistentRegion{region, handle}
+
+// BatchOffload
+tl::expected<int64_t, ErrorCode> BatchOffload(batch, complete_handler, ...) {
+    if (!ready) return INTERNAL_ERROR;
+
+    Detail::TaskDesc task;
+    std::vector<std::size_t> tensorSizes;
+    std::vector<std::string> keys;
+    for (auto& [scoped_key, slices] : batch) {
+        if (over_quota(scoped_key, slices)) continue;   // 配额在这里逐 key 跳过
+
+        const auto block = MakeBlockId(scoped_key);
+        const auto tensor_size = AlignUp(kRecordHeaderSize + SumSliceSize(slices),
+                                         kv::kAlignmentBytes);
+        auto tensor_addr = AllocateTensor(tensor_size);  // 注册区域内的连续区间
+        EncodeRecord(tensor_addr, slices);               // header + payload + zero padding
+        task.push_back(Detail::Shard{block, 0, {tensor_addr}});
+        tensorSizes.push_back(tensor_size);
+        keys.push_back(scoped_key);
+    }
+
+    auto entries = BuildKvBuffers(task, tensorSizes);   // key/handle/offset 在这里填
+    if (entries.empty()) return int64_t{0};
+
+    kv::TaskId taskId{};
+    if (!client_->BatchStoreAsync(entries, taskId).ok()) {
+        ReleaseTensors(task);                           // 没有 task，立即释放
+        return int64_t{0};
+    }
+
+    kv::TaskResult result;
+    auto st = client_->Wait(taskId, wait_timeout_ms, result);   // 只 Wait 一次
+    if (!st.ok() || result.status.code == TIMEOUT ||
+        result.status.code == TASK_NOT_FOUND) {
+        QuarantineTensors(task);                        // 底层可能仍在飞
+        return Map(st);
+    }
+    if (result.status.code == PARTIAL_FAILED) {
+        ReleaseTensors(task);                           // 保守：本块不发布
+        return int64_t{0};
+    }
+
+    std::vector<std::string> published;
+    for (std::size_t i = 0; i < result.entryStatus.size(); ++i) {
+        if (result.entryStatus[i].ok()) published.push_back(keys[i]);
+    }
+    ReleaseTensors(task);
+
+    std::vector<StorageObjectMetadata> metadatas;
+    BuildMetadatas(published, metadatas);
+    complete_handler(published, metadatas);
+    return published.size();
+}
+```
+
+#### 3.1.4 注意事项
+
+- **`Init`**：三态 `kUninit → kInitializing → kReady`；任一步失败都要 `Shutdown` client、`reset` 指针、回滚 `kUninit`；二次 Init 返回 `INTERNAL_ERROR`。backend 不建线程池，连接/视图/transport 线程由 `KvClient` 内部管理。
+- **`IsEnableOffloading`**：`kReady` 后直接返回 true；未就绪返回错误，让 `FileStorage::Init` 明确失败；不读计数、不查 ASU。它只在 Init 调用一次，返回值被锁存，返回 false 会让本进程直到重启都不再 offload。
+
+  ```text
+  FileStorage::Init:      storage_backend_->Init() → IsEnableOffloading() → MountLocalDiskSegment(result)
+  FileStorage::Heartbeat: OffloadObjectHeartbeat(enable_offloading_)   // 锁存的 bool，不再调用 backend
+  ```
+- **配额/容量只在 `BatchOffload` 内逐批/逐 key 做**：超限 key 跳过，返回 `expected(success_count)`/`expected(0)`；下一轮心跳重试。
+- **绝不返回 `KEYS_ULTRA_LIMIT`**：该码会令 `FileStorage` 永久关闭 offload；其他硬错误会中断整个心跳周期（`file_storage.cpp:612-625`）。
+- **24-bit 上限**：`tensorSizes[0] <= 0xFFFFFF`，最大 `16,776,704`，对应 `payload_size <= 16,776,680`。原默认 `max_payload_bytes = 16 MiB` 不可用，建议默认 2 MiB。
+- **`PARTIAL_FAILED` 保守处理**：可能存在“entryStatus=OK 但子批未发送”，本块整体不发布；`Wait` 超时的 tensor 区间隔离，不复用。
+- **`mrKey` 不由后端填**：`BuildKvBuffers` 留空，SDK 的 `SubmitAsync` 按 `buffer.handle` 解析 `tokenId`，transport 组 SQE 时读取。
+- **`FindPersistentHandle`**：返回包含该 tensor 子区间的注册区域 handle；找不到说明分配越界，本批不提交。`RegisterRegions` 在 transports 为空时返回 OK + 空 vector，必须当失败。
+- **一个对象一个 `Shard`/tensor**：`BatchLoad` 只给一个连续 `Slice`，`vector<Slice>` 边界不持久化；整体作为一个 tensor 可以不做 per-slice 布局索引。未来要 per-slice entry 时再引入 `ObjectLayout`。
+- **`complete_handler` 失败**：数据已在 ASU、Master 未登记；本版不回滚，重试 Put 覆盖。
+
+**关键错误映射**
+
+| SDK 状态 | Mooncake | 处理 |
+| --- | --- | --- |
+| `BUFFER_NOT_REGISTERED` / `BUFFER_NOT_SUPPORTED` | `INVALID_PARAMS` | handle 错误/注册失败；按实现 bug 告警 |
+| `PARTIAL_FAILED` | 首个失败 entry 的错误 | 本块不发布 |
+| `TIMEOUT` / `TASK_NOT_FOUND` | `RPC_TIMEOUT` | tensor 区间隔离 |
+| `RESOURCE_BUSY` / `CQE_OUT_OF_CREATE_SIZE` | `UNAVAILABLE_IN_CURRENT_STATUS` | 本批跳过，下一轮重试 |
+| Query `exists=0` + `ENTRY_KEY_NOT_EXIST` | `expected(false)` | 未命中不是失败 |
+| Query `exists=0` + `IO_ERROR` 等 | `unexpected(...)` | 不能当不存在 |
+| Delete `CQE_KEY_NOT_EXIST` | 成功 | 幂等删除 |
+| Delete `ENTRY_DELETE_FAILED` | `FILE_WRITE_FAIL` | 失败日志/重试 |
+
+---
+
+### 3.2 读：`BatchLoad`
+
+#### 3.2.1 类图
+
+```mermaid
+classDiagram
+    class FileStorage {
+        +BatchLoad(slices)
+    }
+    class KvClientStorageBackend {
+        +BatchLoad(slices)
+        -BuildTaskDesc(slices) TaskDesc
+        -BuildKvBuffers(task, tensorSizes) Entries
+        -FindPersistentHandle(region) MRHandle
+        -DecodeRecord(buffer) Record
+    }
+    class TaskDesc
+    class Shard
+    class KvClient {
+        +BatchLoadAsync(entries, taskId)
+        +Wait(taskId, timeout, result)
+    }
+    FileStorage --> KvClientStorageBackend : BatchLoad
+    KvClientStorageBackend ..> TaskDesc : builds
+    TaskDesc *-- Shard
+    KvClientStorageBackend --> KvClient : BatchLoadAsync + Wait
+```
+
+#### 3.2.2 时序图
 
 ```mermaid
 sequenceDiagram
     autonumber
-    participant RPC as RpcWorker
     participant FS as FileStorage
     participant BE as Backend
-    participant SA as StagingArena
     participant KC as kv::KvClient
     participant TR as Transport
     participant ASU as ASU
 
-    RPC->>FS: batch_get_offload_object
     FS->>BE: BatchLoad(map<scoped_key, Slice>)
-    BE->>BE: 校验 slice.ptr/size；payload_hint=slice.size
-    BE->>BE: transfer=align_up(24+payload_hint,512)
-    BE->>SA: AcquireSlots(N)
-    SA-->>BE: N slots（addr, handle）
-
-    loop 每个 key
-        BE->>BE: 构造 KVBuffer{key, region{HOST,slot.addr,transfer}, handle, offset=0, mrKey=nullopt}
+    loop 每个对象
+        BE->>BE: block = MakeBlockId(scoped_key)
+        BE->>BE: tensor_size = align_up(24 + slice.size, 512)
+        BE->>BE: tensor_addr = AllocateTensor(tensor_size)
+        BE->>BE: task.push_back(Shard{block, 0, {tensor_addr}})
     end
+    BE->>BE: entries = BuildKvBuffers(task, tensorSizes)
+    BE->>BE: FindPersistentHandle(region) 取 buffer.handle；offset=0；mrKey 留空
 
     BE->>KC: BatchLoadAsync(entries, taskId)
     loop 每个 entry
@@ -426,148 +356,406 @@ sequenceDiagram
             BE->>BE: 只拷贝前缀 slice.size；payload CRC 不可校验
         end
     else PARTIAL_FAILED / TIMEOUT
-        BE->>BE: 本块不返回数据；TIMEOUT 的 slot 隔离
+        BE->>BE: 本块不返回数据；TIMEOUT 的 tensor 区间隔离
     end
-    BE->>SA: Release 或 Quarantine
+    BE->>BE: Release 或 Quarantine tensor 区间
     BE-->>FS: OK / first_error
 ```
 
-Load 与 Store 的 entry 构造、`buffer.handle` 和 mrKey 流程完全一致；差别只有两点：`transfer_size` 由 `slice.size` 推导，以及 `Wait` 后要从 slot 解析记录并拷回调用方 buffer。
-
-### 4.6 mrKey 的写与读（明确到代码）
-
-| 阶段 | 执行者 | 动作 | 证据 |
-| --- | --- | --- | --- |
-| 构造 entry | backend | `mrKey` 留空 / `reset()` | `kv_types.h:122-128` |
-| 提交 | `KvClientImpl::SubmitAsync` | 忽略调用方传入值，`mrKey.reset()`；按 `buffer.handle` 查 `registeredRegions_`，命中则 `mrKey = tokenId` | `kv_client_impl.cc:451-459` |
-| 校验 | transport | `ValidateSqeMrKeys`：任一 entry 没有 `mrKey` → `BUFFER_NOT_REGISTERED` | `sqe_request.cc:45-52` |
-| 组 SQE | transport | `*entry.mrKey` 写入 SQE 的 `mr_key` 字段 | `sqe_request.cc:189, 207, 224, 250` |
-
-**后端不要自己填 `mrKey`，也不要缓存 `tokenId` 后手工赋值**：SDK 会无条件 `reset()` 再用 handle 解析。后端唯一要保证的是 `buffer.handle` 是 `RegisterRegions` 返回的 canonical handle，而不是自己编的 slot id。
-
-### 4.7 Wait、部分成功与 slot 回收
-
-| 情况 | 处理 |
-| --- | --- |
-| `Submit` 失败（`RESOURCE_BUSY`/`NOT_INITIALIZED`） | 没有 task，立即释放 slot；可下一轮重试 |
-| `Wait` 返回 OK | 逐 `entryStatus` 判定；只发布 OK 的 entry |
-| `Wait` 返回 `PARTIAL_FAILED` | 本块整体不发布（“entryStatus=OK 但实际未发送”的保守处理）；释放 slot |
-| `Wait` 返回 `TIMEOUT`/`TASK_NOT_FOUND` | task 已被移除、底层可能仍在飞；slot 进入 `Quarantined`，不复用、不注销 |
-| `CONNECTION_ERROR`/`IO_ERROR`/`CANCELED` | task 已结束；释放 slot；不发布；返回错误 |
-
-`Wait` 是破坏性读：成功、失败、超时都会移除 task（`task_manager.cc:108-116`），二次 `Wait` 得到 `TASK_NOT_FOUND`。`Wait(id, 0)` 表示使用默认 100ms（`kv_client_impl.cc:301-303`），不是无限等待；必须显式传 `wait_timeout_ms`。
-
-### 4.8 错误映射（只列关键）
-
-| SDK 状态 | Mooncake | 说明 |
-| --- | --- | --- |
-| `BUFFER_NOT_REGISTERED` / `BUFFER_NOT_SUPPORTED` | `INVALID_PARAMS` | handle 错误或注册失败；属于实现 bug，应告警 |
-| `PARTIAL_FAILED` | 首个失败 entry 的错误 | 写/读本块不发布 |
-| `TIMEOUT` / `TASK_NOT_FOUND` | `RPC_TIMEOUT` | slot 隔离 |
-| `RESOURCE_BUSY` / `CQE_OUT_OF_CREATE_SIZE` | `UNAVAILABLE_IN_CURRENT_STATUS` | 本批跳过，下一轮重试 |
-| Query `exists=0` + `ENTRY_KEY_NOT_EXIST` | `expected(false)` | 未命中不是失败 |
-| Query `exists=0` + `IO_ERROR` 等 | `unexpected(...)` | **不能当不存在**，否则 probe 误删 Master 元数据 |
-| Delete `CQE_KEY_NOT_EXIST` | 成功 | 幂等删除 |
-| Delete `ENTRY_DELETE_FAILED` | `FILE_WRITE_FAIL` | 保留索引/日志 |
-
----
-
-## 5. Init / IsEnableOffloading / BatchOffload 的边界
-
-### 5.1 Init
-
-- 三态 `atomic<InitState>`：`kUninit → kInitializing → kReady`；二次 `Init` 返回 `INTERNAL_ERROR`。
-- 任一步失败：`Shutdown` client、`reset` 指针、回滚 `kUninit`；重试时新建 client，不复用失败实例。
-- **不建 backend 线程池**；连接/视图/transport 线程由 `KvClient` 内部管理，backend 只持有 staging slot 池。
-
-### 5.2 IsEnableOffloading（已定）
-
-调用链（`file_storage.cpp`）：
-
-```text
-FileStorage::Init
-  storage_backend_->Init()                 // backend 进入 kReady
-  IsEnableOffloading()                     // 只在这里调用一次
-  enable_offloading_ = result
-  MountLocalDiskSegment(enable_offloading_)
-       -> Master: RegisterClient(client_id, enabled)
-       -> mailbox.enable_offloading_ = enabled
-
-FileStorage::Heartbeat（每次 tick）
-  OffloadObjectHeartbeat(enable_offloading_, ...)
-       -> Master: SetOffloadingAndTakePending(client_id, enabled)
-       -> enabled=false 时：EnqueueOffload 返回 UNABLE_OFFLOADING；
-          已排队的 offload 任务在下一次心跳被取走并清理
-```
-
-- `IsEnableOffloading` **只在 `FileStorage::Init` 调用一次**（`file_storage.cpp:148-168`），返回值被冻结到成员 `enable_offloading_`，之后每次心跳都用这个 bool（`file_storage.cpp:815`）。
-- 代码里唯一再次修改 `enable_offloading_` 的地方是 `KEYS_ULTRA_LIMIT` 时置 false（`file_storage.cpp:615`）；**没有任何路径把它设回 true，也没有再次调用 `IsEnableOffloading()`**。因此 Init 时返回 false 等价于本进程直到重启都不再 offload。
-- `MountLocalDiskSegment(false)` 不是“暂时不接活”：Master 侧 `RegisterClient(client_id, false)` 后，mailbox 的 `EnqueueOffload` 直接返回 `UNABLE_OFFLOADING`（`local_ssd/manager.cpp:16-18`），Master 不会给这个 client 派 offload 任务。
-
-**确定方案**：
+#### 3.2.3 伪代码
 
 ```cpp
-tl::expected<bool, ErrorCode> KvClientStorageBackend::IsEnableOffloading() {
-    if (initialized_.load(std::memory_order_acquire) != InitState::kReady) {
-        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+tl::expected<void, ErrorCode> BatchLoad(std::unordered_map<std::string, Slice>& slices) {
+    Detail::TaskDesc task;
+    std::vector<std::size_t> tensorSizes;
+    std::vector<Slice*> sliceList;
+    std::vector<std::uintptr_t> tensorAddrs;
+    for (auto& [scoped_key, slice] : slices) {
+        if (slice.ptr == nullptr || slice.size == 0) return INVALID_PARAMS;
+
+        const auto block = MakeBlockId(scoped_key);
+        const auto tensor_size = AlignUp(kRecordHeaderSize + slice.size,
+                                         kv::kAlignmentBytes);
+        auto tensor_addr = AllocateTensor(tensor_size);  // 读入目标区间
+        task.push_back(Detail::Shard{block, 0, {tensor_addr}});
+        tensorSizes.push_back(tensor_size);
+        sliceList.push_back(&slice);
+        tensorAddrs.push_back(tensor_addr);
     }
-    return true;
+
+    auto entries = BuildKvBuffers(task, tensorSizes);
+    kv::TaskId taskId{};
+    auto submit = client_->BatchLoadAsync(entries, taskId);
+    if (!submit.ok()) {
+        ReleaseTensors(task);
+        return Map(submit);
+    }
+
+    kv::TaskResult result;
+    auto st = client_->Wait(taskId, wait_timeout_ms, result);   // 只 Wait 一次
+    if (!st.ok() || result.status.code == TIMEOUT ||
+        result.status.code == TASK_NOT_FOUND) {
+        QuarantineTensors(task);
+        return Map(st);
+    }
+    if (result.status.code == PARTIAL_FAILED) {
+        ReleaseTensors(task);                           // 本块不返回数据
+        return Map(result.status);
+    }
+
+    std::optional<ErrorCode> first_error;
+    for (std::size_t i = 0; i < entries.size(); ++i) {
+        if (!result.entryStatus[i].ok()) { first_error = Map(result.entryStatus[i]); continue; }
+        auto record = DecodeRecord(tensorAddrs[i]);     // magic/version/flags/头 CRC
+        if (!record) { first_error = record.error(); continue; }
+        if (sliceList[i]->size > record->payload_size) { first_error = INVALID_PARAMS; continue; }
+        if (sliceList[i]->size == record->payload_size && !VerifyPayloadCrc(record)) {
+            first_error = CHECKSUM_MISMATCH; continue;
+        }
+        std::memcpy(sliceList[i]->ptr, record->payload, sliceList[i]->size);
+    }
+    ReleaseTensors(task);
+    return first_error ? tl::make_unexpected(*first_error) : tl::expected<void, ErrorCode>{};
 }
 ```
 
-- `kReady` 后直接返回 true；`kUninit` / `kInitializing` / Init 失败返回错误，让 `FileStorage::Init` 明确失败。
-- **不读 `total_keys_` / `total_size_`，不查 ASU 容量/水位**。该方法是一次性特性门槛，不是实时配额探针；用动态量返回 false 会把一次瞬时状态变成永久关闭。
-- 容量/配额控制放到 `BatchOffload`：逐批/逐 key 检查，超限 key 跳过，返回 `expected(success_count)`/`expected(0)`；下一轮心跳重试；**绝不返回 `KEYS_ULTRA_LIMIT`**（它会触发 `enable_offloading_ = false`，永久关闭 offload）。
+#### 3.2.4 注意事项
 
-### 5.3 BatchOffload 不得中断心跳
-
-- `FileStorage` 只放行 `INVALID_READ`/`OBJECT_ALREADY_EXISTS` 作为软错误；其他错误会 `abort_error` 并中断整个心跳周期（`file_storage.cpp:612-625`）。
-- **配额/容量控制在这里逐批/逐 key 做**：`total_keys_ >= total_keys_limit` 或 `total_size_ + transfer_size > total_size_limit` 时跳过该 key；本批全部跳过返回 `expected(0)`。计数只作本地硬上限参考，重启归零，不代表 ASU 实际容量；本版不做写前淘汰。
-- 可恢复情形一律返回 `expected(success_count)`；**绝不返回 `KEYS_ULTRA_LIMIT`**，该码会永久关闭 offload。
-- 0 个成功也返回 `expected(0)`，不要返回硬错误。
-
----
-
-## 6. 测试与验收
-
-### 6.1 关键测试
-
-| 编号 | 场景 | 通过标准 |
-| --- | --- | --- |
-| TC-ENTRY-01 | 注册后提交 Store | transport 收到的 entry `mrKey` 非空且等于注册返回的 `tokenId`；`region.size` 512B 对齐；`handle` 为 arena handle |
-| TC-ENTRY-02 | 用未注册/伪造 handle 提交 | `BUFFER_NOT_REGISTERED`；不发布；slot 释放；无泄漏 |
-| TC-ENTRY-03 | 同一 arena 的多个子区间 slot | 每个 entry 的 `addr` 不同、`handle` 相同；transport 按子区间寻址成功（真机确认） |
-| TC-ENTRY-04 | `payload_size` 超 24-bit / 超 slot | 该 key 跳过；不提交；其他 key 正常 |
-| TC-STORE-01 | OK / `PARTIAL_FAILED` / `Wait` 超时 | 只发布 OK；PARTIAL 不发布；超时 slot 隔离且不复用 |
-| TC-LOAD-01 | 全长读 + payload CRC | 字节一致；CRC 通过 |
-| TC-LOAD-02 | 前缀读（`slice.size < payload_size`） | 返回前缀；头 CRC 通过；不越界 |
-| TC-QUERY-01 | `exists=0` + `IO_ERROR` | 返回 `unexpected`，不返回 false |
-| TC-QUOTA-01 | `kReady` 后调 `IsEnableOffloading`；再构造 `kUninit`/`kInitializing` | `kReady` 返回 true，且未调用 ASU/计数；未就绪返回错误 |
-| TC-QUOTA-02 | 计数超 `total_keys_limit`/`total_size_limit` 时调 `BatchOffload` | 超限 key 跳过；返回 `expected(success_count)`/`expected(0)`；不返回 `KEYS_ULTRA_LIMIT`；handler 只收到成功 key |
-| TC-DEL-01（选 A） | 多 client、非 owner 调用 Remove | Master 通知 owner；owner 删除；调用方不直接删；254 分块；`CQE_KEY_NOT_EXIST` 成功 |
-| TC-DEL-02（选 B） | `Client::Remove` 后 ASU 值仍在 | 行为与文档一致；再次 Put 覆盖；不崩溃 |
-| TC-CONC-01 | 多读并发 + 写 | TSAN/ASAN 干净；slot 全部归还；无 use-after-free |
-
-### 6.2 验收标准
-
-- 写 → 读回字节一致（含前缀读）。
-- 不出现 `BUFFER_NOT_REGISTERED`（除非注入未注册 handle）。
-- `Wait` 超时后 slot 不再被复用；进程退出前不提前 `UnregisterRegions`。
-- `IsEnableOffloading` 只依赖初始化状态：`kReady` 返回 true，未就绪返回错误；超配额只在 `BatchOffload` 内跳过并返回成功计数，不返回 `KEYS_ULTRA_LIMIT`。
-- 删除选项与第 3 节的决策一致：选 A 则容量回收可观测；选 B 则明确“不回收”。
+- **前缀读必须支持**：Mooncake LOCAL_DISK ranged read 会传 `src_offset + size`（`real_client.cpp:5128-5138`），`slice.size` 可能小于对象全长。规则是 `slice.size <= payload_size`，按 `slice.size` 拷贝，不能要求 `payload_size == slice.size`。
+- **长度契约**：请求长度 `align_up(24 + slice.size, 512)` 隐含 `slice.size <= 对象实际 payload_size`；V1 依赖调用方契约，不做本地长度索引。
+- **CRC**：全长读校验 payload CRC；前缀读只能校验头 CRC（payload CRC 覆盖完整 value）。
+- **不要改写 `slice.ptr` / `slice.size`**；后端只写它们指向/描述的内存。
+- **`PARTIAL_FAILED` 不返回任何数据**；`Wait` 超时的 tensor 区间隔离。
+- **未命中**：`ENTRY_KEY_NOT_FOUND`/`CQE_KEY_NOT_EXIST` → `OBJECT_NOT_FOUND`；本版无索引，无需清索引。
+- **并发读**：多个 RPC worker 共享注册区域；`Wait` 期间不持锁。
 
 ---
 
-## 7. 风险与待确认
+### 3.3 查：`IsExist`
+
+#### 3.3.1 类图
+
+```mermaid
+classDiagram
+    class FileStorage {
+        +Exists(scoped_key)
+    }
+    class KvClientStorageBackend {
+        +IsExist(scoped_key)
+        -MakeBlockId(scoped_key) BlockId
+        -MakeAsuKey(block) CacheKey
+    }
+    class KvClient {
+        +QueryAsync(keys, taskId)
+        +Wait(taskId, timeout, result)
+    }
+    FileStorage --> KvClientStorageBackend : IsExist
+    KvClientStorageBackend --> KvClient : QueryAsync + Wait
+```
+
+#### 3.3.2 时序图
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant FS as FileStorage
+    participant BE as Backend
+    participant KC as kv::KvClient
+    participant ASU as ASU
+
+    FS->>BE: IsExist(scoped_key)
+    BE->>BE: block = MakeBlockId(scoped_key)
+    BE->>BE: key = MakeAsuKey(block)
+    BE->>KC: QueryAsync({key}, taskId)
+    KC-->>BE: taskId
+    BE->>KC: Wait(taskId, query_timeout_ms)
+    KC-->>BE: TaskResult{exists, entryStatus}
+    alt exists == 1 && entryStatus == ENTRY_KEY_EXIST
+        BE-->>FS: expected(true)
+    else exists == 0 && entryStatus == ENTRY_KEY_NOT_EXIST
+        BE-->>FS: expected(false)
+    else IO_ERROR / CONNECTION_ERROR / TIMEOUT / 其他
+        BE-->>FS: unexpected(mapped_error)
+    end
+```
+
+#### 3.3.3 伪代码
+
+```cpp
+tl::expected<bool, ErrorCode> IsExist(const std::string& scoped_key) {
+    if (!ready) return INTERNAL_ERROR;
+
+    const auto block = MakeBlockId(scoped_key);
+    const auto key = MakeAsuKey(block);
+
+    kv::TaskId taskId{};
+    auto submit = client_->QueryAsync({key}, taskId);
+    if (!submit.ok()) return Map(submit);
+
+    kv::TaskResult result;
+    auto st = client_->Wait(taskId, query_timeout_ms, result);   // 只 Wait 一次
+    if (!st.ok()) return Map(st);
+    if (!result.queryResult || result.queryResult->exists.size() != 1) {
+        return INTERNAL_ERROR;
+    }
+
+    const bool exists = result.queryResult->exists[0] != 0;
+    const auto entry = result.entryStatus[0];
+    if (exists && entry.code == ENTRY_KEY_EXIST) return true;
+    if (!exists && entry.code == ENTRY_KEY_NOT_EXIST) return false;
+    return tl::make_unexpected(Map(entry));   // 分片失败不能当“不存在”
+}
+```
+
+#### 3.3.4 注意事项
+
+- **查询超时/传输错误绝不能返回 false**：dangling replica probe 会把 false 当“对象不存在”并删 Master 元数据；必须返回 `unexpected`。
+- **Query 只有存在性，没有长度**：读长度仍以 Master 的 `slice.size` 为准。
+- **同时看 `exists` 与 `entryStatus`**：`exists=0` + `IO_ERROR` 是分片失败，不是未命中。
+- **`prefixHitKeys` 不使用**：它只是连续前缀命中数，不是总命中数。
+- **无副作用**：`IsExist` 不做懒修复、不删索引、不触发删除。
+- **`Wait` 是破坏性读**：超时/`TASK_NOT_FOUND` 返回错误；本路径不需要注册内存。
+
+---
+
+### 3.4 删
+
+#### 3.4.1 类图
+
+```mermaid
+classDiagram
+    class Client {
+        +Remove(key, force)
+        +BatchRemove(keys, force)
+    }
+    class Master {
+        +Remove(key, force)
+        +BatchRemove(keys, force)
+        -EraseMetadata()
+        -EnqueueDelete(owner, scoped_key)
+    }
+    class LocalSsdTaskMailbox {
+        +EnqueueDelete(scoped_key)
+        +TakeDeleteTasks()
+    }
+    class FileStorage {
+        +BatchRemoveKeys(scoped_keys)
+    }
+    class KvClientStorageBackend {
+        +BatchRemoveKeys(scoped_keys)
+        -MakeBlockId(scoped_key) BlockId
+        -MakeAsuKey(block) CacheKey
+    }
+    class KvClient {
+        +DeleteAsync(keys, taskId)
+        +Wait(taskId, timeout, result)
+    }
+    Client --> Master : Remove / BatchRemove
+    Master --> LocalSsdTaskMailbox : 方案 A（未实现）
+    FileStorage ..> LocalSsdTaskMailbox : owner 拉取删除任务
+    FileStorage --> KvClientStorageBackend : BatchRemoveKeys
+    KvClientStorageBackend --> KvClient : DeleteAsync + Wait
+```
+
+#### 3.4.2 时序图
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant U as User
+    participant C as Client
+    participant MS as Master
+    participant MB as owner mailbox
+    participant FS as FileStorage
+    participant BE as Backend
+    participant KC as kv::KvClient
+    participant ASU as ASU
+
+    U->>C: Remove(key) / BatchRemove(keys)
+    C->>MS: Remove / BatchRemove RPC
+    alt V1：逻辑删除
+        MS->>MS: EraseMetadata（删 Master 元数据）
+        MS-->>C: per-key result
+        Note over MS: 链路到此为止；ASU 上的 value 仍在
+    else 方案 A：按 key 物理删除（未实现）
+        MS->>MS: 在 EraseMetadata 之前捕获 LOCAL_DISK owner
+        MS->>MB: EnqueueDelete(owner, scoped_key)
+        FS->>MB: owner 心跳拉取删除任务
+        FS->>BE: BatchRemoveKeys(scoped_keys)
+        BE->>BE: scoped_key → BlockId → MakeAsuKey；按 254 切块
+        BE->>KC: DeleteAsync(keys, taskId)
+        KC->>ASU: Delete
+        KC-->>BE: taskId
+        BE->>KC: Wait(taskId, timeout)
+        KC-->>BE: per-entry status
+        BE-->>FS: per-key result
+    end
+```
+
+#### 3.4.3 伪代码
+
+```cpp
+// V1：逻辑删除（当前实现）
+// Client::Remove / BatchRemove 只发 Master RPC；Master 删元数据；
+// 不调用 FileStorage / StorageBackendInterface / KvClient。
+
+// 方案 A：按 key 物理删除（未实现；需要接口 + 路由）
+// Master::BatchRemove:
+//   owners = CollectLocalDiskOwners(metadata);   // 必须在 EraseMetadata 之前
+//   EraseMetadata();
+//   for (owner : owners) EnqueueDelete(owner, scoped_key);
+
+// owner 心跳：
+//   for (task : TakeDeleteTasks()) {
+//       keys = task.scoped_keys.map(k => MakeAsuKey(MakeBlockId(k)));
+//       for (chunk : Chunk(keys, 254)) {
+//           DeleteAsync(chunk, taskId);
+//           Wait(taskId, wait_timeout_ms, result);   // 每块只 Wait 一次
+//           for (i : chunk) {
+//               if (result.entryStatus[i].ok()) success;
+//               else if (whole_cqe == CQE_KEY_NOT_EXIST) success;  // 幂等
+//               else failed;   // 保留索引/日志
+//           }
+//       }
+//   }
+```
+
+#### 3.4.4 注意事项
+
+**现状：按 key 删除到不了后端**
+
+| 用户操作 | 实际动作 | 到 `StorageBackendInterface`？ | 证据 |
+| --- | --- | --- | --- |
+| `Client::Remove(key)` | 删 Master 元数据 + hot cache；物理删除调用被注释 | **否** | `client_service.cpp:3795-3812`，`3801-3803` 为注释 |
+| `Client::BatchRemove(keys)` | Master 逐 key 删元数据 | **否** | `client_service.cpp:3848-3870`；`master_service.cpp:7437-7530` |
+| `Client::RemoveByRegex` | Master 扫描删元数据 | **否** | `client_service.cpp:3814-3831` |
+| `Client::RemoveAll` | Master 删元数据；客户端物理清空当前不可达 | **否（当前 HEAD）** | `file_storage.cpp:912-921` 零调用者；`RequestRemoveAll` 也无调用者 |
+| `EvictAboveDiskWatermark` | 后端选 key，通知 Master 后物理删 | 是，但**不是用户按 key** | `storage_backend.h:323-328` |
+| KvClient | `DeleteAsync(vector<CacheKey>)` | 是（若被调用） | `kv_client.h:50` |
+
+- `Client::Remove` 里被注释的 `storage_backend_` 是客户端本地文件后端的 `std::shared_ptr<StorageBackend>`（`client_service.h:1178`），不是 `FileStorage` 持有的 `StorageBackendInterface`（`file_storage.h:291`）。即使取消注释也不会到达 offload 后端。
+- `RemoveAll` 链路两端都是死的：`RequestRemoveAll()`、`FileStorage::RemoveAll()`、`Client::PollRemoveAll()` 均无调用者；RPC 还在，但标志位永远不会被置起。
+- `KvClient` 没有 `RemoveAll`/drop/scan；只能按 8 字节 key 调 `DeleteAsync`。
+
+**接口能否承载按 key 删除**
+
+`StorageBackendInterface` 能到达后端的只有 `BatchOffload` / `BatchLoad` / `IsExist` / `GetObjectDataSize` / `RemoveAll` / `EvictAboveDiskWatermark`；没有任何方法能携带“要删除的 key 集合”。因此：
+
+- **要按 key 物理删除，必须扩展后端契约并补 Master→owner 路由**；只加接口方法不接路由，方法永远没有调用者。
+- **不改接口只能做逻辑删除**：`Remove` 后 ASU value 仍在，靠同 key 覆盖写 / ASU GC / 命名空间轮转回收。
+
+| 方案 | 做法 | 按 key 物理删除 | 容量回收 | 改动面 | 结论 |
+| --- | --- | --- | --- | --- | --- |
+| A. 扩展基类接口 + 路由 | `StorageBackendInterface` 加 `BatchRemoveKeys`（默认 `NOT_SUPPORTED`）；Master 删除前捕获 owner、投递按 key 任务 | 是 | 立即 | 约 500–900 行 / 10 文件 | 需要容量回收时唯一正确方案 |
+| A'. 旁路能力接口 + 同样路由 | 不动基类，新增 `KeyDeleteCapable`，`FileStorage` `dynamic_cast` | 是 | 立即 | 同 A（路由成本不变） | 不想动公共基类时的备选 |
+| B. 逻辑删除 | 不改接口；`Remove` 只删元数据 | 否 | 靠覆盖/GC/命名空间轮转 | 0 | **V1 推荐**，需明确口径 |
+| C. 本地 key 集合 + `RemoveAll` 全清 | 记录本进程写过的 key，`RemoveAll` 时按 254 分批 `DeleteAsync` | 否（只能全清） | 全清 | 需新增 key 集合 + 恢复两端接线 | 只适合运维重置 |
+| D. 哨兵复用 `BatchOffload` | Master 把删除 key 当 offload 任务下发，空 slice 表示删除 | 名义上是 | 是 | 仍需 Master 路由 | 语义滥用，否决 |
+
+**建议 V1 选 B（逻辑删除），物理删除单列 P1；若评审要求“删除必须释放 ASU 容量”，则选 A（或 A'）。**
+
+**若选 A：最小改动清单**
+
+| 层 | 改动 |
+| --- | --- |
+| `storage_backend.h` | 新增 `virtual BatchRemoveKeys(const vector<string>& scoped_keys)`，默认逐 key `NOT_SUPPORTED` |
+| `file_storage.{h,cpp}` | 转发 `BatchRemoveKeys`；提供删除任务消费入口 |
+| `local_ssd/manager.{h,cpp}` | 新增按 key 删除任务邮箱/队列（现有只有 `RemoveAll` 布尔位） |
+| `master_service.{h,cpp}` | `Remove`/`BatchRemove` 在 `EraseMetadata` 之前捕获 LOCAL_DISK owner，投递按 key 任务 |
+| `rpc_service` / `master_client` / `RpcNameTraits` | 新增拉取删除任务的 RPC，或扩展心跳响应 |
+| `client_service` / `FileStorage::Heartbeat` | 拉取删除任务并调用 backend |
+| `kv_client/backend.cpp` | `scoped_key → BlockId → MakeAsuKey`；按 254 切块；`CQE_KEY_NOT_EXIST` 视为成功 |
+
+**其他约束**
+
+- Master 必须在 `EraseMetadata` **之前**捕获 owner；HA/oplog 路径要把“捕获 owner”和“元数据删除”放在同一持久化语义里。
+- 非 owner 的调用方不能直接算 ASU key（`key_namespace` 只有 owner 知道），必须 Master→owner 路由。
+- 本版没有持久化删除任务队列，owner 重启会丢任务；需要带外清理兜底。
+- 删除按 key 幂等；重复删除返回 `CQE_KEY_NOT_EXIST`，归一为成功；`ENTRY_DELETE_FAILED` 才是失败。
+- 单次 `DeleteAsync` 按 `deleteIoNum` 默认 254 切块；后端自己切；删除不需要注册内存，不走注册区域/tensor 区间。
+- **选 B（V1）时必须写进对外口径**：`Remove` 不释放 ASU 容量；ASU 残留由同 key 覆盖写 / ASU GC / 命名空间轮转回收；禁止宣称“删除释放 ASU 空间”。
+
+---
+
+## 4. SFMEA 分析与测试设计
+
+### 4.1 失效模式与影响
+
+> 严重度：S1 数据损坏/误删；S2 功能不可用/永久停；S3 性能/配额退化；S4 可观测性。
+
+| ID | 功能 | 失效模式 | 影响 | 严重度 | 检测/缓解 | 测试 |
+| --- | --- | --- | --- | --- | --- | --- |
+| FM-INIT-01 | Init | `KvClient::Init` 或 `RegisterKVCaches` 失败 | 后端不可用，FileStorage Init 失败 | S2 | 失败回滚 `kUninit`、`Shutdown` client；不进入 `kReady` | TC-INIT-01 |
+| FM-INIT-02 | Init | `RegisterRegions` 返回 OK + 空 vector（无 transport） | 后续提交全部 `BUFFER_NOT_REGISTERED` | S2 | 空结果当失败；Init 失败并回滚 | TC-INIT-01 |
+| FM-INIT-03 | Init | 二次 Init / 并发 Init | 状态、计数、注册区域被重置 | S2 | CAS `kUninit → kInitializing`；第二次返回 `INTERNAL_ERROR` | TC-INIT-02 |
+| FM-ENTRY-01 | BuildKvBuffers | `FindPersistentHandle` 找不到包含该 tensor 的注册区域 | entry handle 非法，提交失败 | S1/S2 | 检查 `region.addr + size` 边界；找不到不提交 | TC-ENTRY-02 |
+| FM-ENTRY-02 | Key | `MakeAsuKey` 全零或 64-bit 碰撞 | 写错对象/覆盖先写 | S1 | 全零重映射；碰撞作为已知风险接受 | TC-ENTRY-05 |
+| FM-ENTRY-03 | BuildKvBuffers | `tensorSizes[0]` 超 24-bit 或未 512B 对齐 | SDK `INVALID_ARGUMENT` | S2 | 提交前校验长度/对齐；超限 key 跳过 | TC-ENTRY-04 |
+| FM-ENTRY-04 | 内存 | `buffer.handle` 不是 `FindPersistentHandle` 返回值 | `BUFFER_NOT_REGISTERED` | S2 | 只用注册区域 handle；不手工编 handle | TC-ENTRY-01 |
+| FM-WRITE-01 | 写 | `complete_handler` 失败 | 数据在 ASU、Master 未登记 | S2 | 返回错误、记日志；不回滚，重试 Put 覆盖 | TC-STORE-02 |
+| FM-WRITE-02 | 写 | `PARTIAL_FAILED` 下把 OK entry 当成功 | Master 指向未发送的数据（假成功） | S1 | 本块整体不发布；释放 tensor 区间 | TC-STORE-01 |
+| FM-WRITE-03 | 写 | `Wait` 超时/`TASK_NOT_FOUND` 后复用 tensor | 数据串写 / use-after-free | S1 | tensor 区间隔离，不复用、不注销 | TC-STORE-01 |
+| FM-WRITE-04 | 写 | `BatchStoreAsync` 提交失败 | 无 task、本批失败 | S2 | 立即释放 tensor；下一轮心跳重试 | TC-STORE-03 |
+| FM-WRITE-05 | 配额 | 返回 `KEYS_ULTRA_LIMIT` 或硬错误 | offload 永久关闭 / 心跳中断 | S2 | 逐 key 跳过，返回 `expected(count)`；绝不返回该码 | TC-QUOTA-02 |
+| FM-WRITE-06 | 配置 | 默认 16 MiB 超过 24-bit 上限 | 满尺寸写全部失败 | S2 | 默认 2 MiB；硬上限 `payload_size ≤ 16,776,680` | TC-ENTRY-04 |
+| FM-READ-01 | 读 | 要求 `payload_size == slice.size` | 合法前缀读全部失败 | S2 | 允许 `slice.size <= payload_size`；按前缀拷贝 | TC-LOAD-02 |
+| FM-READ-02 | 读 | magic/version/flags/头 CRC 损坏 | 返回错误数据 | S1 | 头校验失败 → `INVALID_READ`，不拷贝 | TC-LOAD-03 |
+| FM-READ-03 | 读 | payload CRC 不匹配 | 撕裂/位翻转被当有效数据 | S1 | 全长读校验 payload CRC → `CHECKSUM_MISMATCH` | TC-LOAD-04 |
+| FM-READ-04 | 读 | `slice.size > payload_size` | 请求超过存储长度 | S2 | 解析头后拒绝，返回 `INVALID_PARAMS` | TC-LOAD-05 |
+| FM-QUERY-01 | 查 | `exists=0` + `IO_ERROR` 当“不存在” | probe 误删 Master 元数据 | S1 | 同时看 `entryStatus`；非 `ENTRY_KEY_NOT_EXIST` 返回 `unexpected` | TC-QUERY-01 |
+| FM-QUERY-02 | 查 | `Wait` 超时/传输错误返回 false | probe 误删 Master 元数据 | S1 | 超时/错误一律 `unexpected`，绝不返回 false | TC-QUERY-01 |
+| FM-DEL-01 | 删 | V1 只做逻辑删除 | ASU value 残留，容量不释放 | S2（接受） | 明确对外口径；同 key 覆盖/ASU GC/namespace 轮转 | TC-DEL-02 |
+| FM-DEL-02 | 删 | owner 路由错误或 `key_namespace` 不匹配 | 删不到或删错对象 | S1 | Master 记录 owner；按 `scoped_key` 校验；审计 | TC-DEL-01 |
+| FM-DEL-03 | 删 | `DeleteAsync` 逐 entry 失败 | 残留对象；计数不释放 | S3 | 逐 entry 状态；失败日志；幂等重试 | TC-DEL-03 |
+| FM-DEL-04 | 删 | owner 重启丢失删除任务 | ASU 残留 | S2（接受） | 本版无持久化队列；带外清理兜底 | TC-DEL-04 |
+| FM-CONC-01 | 并发 | `Wait` 期间持有 `regions_mutex_` | 读写互相阻塞/心跳超时 | S2 | 任何 `Wait` 不持锁；短临界区 | TC-CONC-01 |
+| FM-CONC-02 | 并发 | tensor 未完成就释放/复用 | 数据损坏 | S1 | 正常完成释放；超时/任务丢失隔离 | TC-CONC-01 |
+| FM-LIFE-01 | 关停 | 有在途 task 就 `UnregisterRegions` | 崩溃/数据损坏 | S1 | 先 drain 所有 task；隔离区间不注销 | TC-LIFE-01 |
+| FM-OBS-01 | 可观测性 | 无 `task_id`/`entryStatus` 日志 | 无法定位 | S4 | 结构化日志：op/keys/task_id/entry 下标/首错 | TC-OBS-01 |
+
+### 4.2 测试用例与验收点
+
+| 编号 | 场景 | 注入/前置 | 验收点 |
+| --- | --- | --- | --- |
+| TC-INIT-01 | Init 注册失败 / 无 transport | `RegisterKVCaches` 返回错误或空 vector | Init 返回错误、回滚 `kUninit`、不进入 `kReady`；FileStorage Init 失败 |
+| TC-INIT-02 | 连续两次 Init | 正常 Init 两次 | 第一次 OK；第二次 `INTERNAL_ERROR`；状态/计数不变 |
+| TC-ENTRY-01 | 注册后提交 Store | 正常注册区域 | transport 收到的 entry `mrKey` 非空且等于注册返回 `tokenId`；`region.size` 512B 对齐；`handle` 来自 `FindPersistentHandle` |
+| TC-ENTRY-02 | 未注册/伪造 handle 提交 | 伪造 `buffer.handle` | `BUFFER_NOT_REGISTERED`；不发布；tensor 区间释放；无泄漏 |
+| TC-ENTRY-03 | 同一 `KVCacheRegistration` 多个子区间 tensor | 同一注册区域分配多个 tensor | 每个 entry `addr` 不同、`handle` 相同；transport 子区间寻址成功（真机确认） |
+| TC-ENTRY-04 | 超 24-bit / 超 tensor 区间 | `payload_size` 超限 | 该 key 跳过、不提交；其他 key 正常 |
+| TC-ENTRY-05 | Key 编码稳定性 | 同一 `scoped_key` 走写/读/查 | 三次得到同一非零 `MakeAsuKey(BlockId)`；不同 namespace 得到不同 key |
+| TC-STORE-01 | OK / `PARTIAL_FAILED` / `Wait` 超时 | 注入部分失败/延迟 | OK 只发布成功 entry；PARTIAL 本块不发布；超时 tensor 区间隔离且不复用 |
+| TC-STORE-02 | `complete_handler` 失败 | handler 返回错误 | 数据仍可读；返回错误；不回滚；日志记录 |
+| TC-STORE-03 | `BatchStoreAsync` 返回 `RESOURCE_BUSY` | 注入提交失败 | 不调用 `Wait`；tensor 区间立即释放；下一轮可重试 |
+| TC-LOAD-01 | 全长读 + payload CRC | 写入后按全长读 | 字节一致；head/payload CRC 通过；不越界 |
+| TC-LOAD-02 | 前缀读（`slice.size < payload_size`） | 只读对象前缀 | 返回前缀；头 CRC 通过；不越界 |
+| TC-LOAD-03 | 头损坏 | 篡改 magic/version/头 CRC | 返回 `INVALID_READ`；不拷贝 payload |
+| TC-LOAD-04 | payload 损坏 | 篡改一个字节 | 返回 `CHECKSUM_MISMATCH`；不拷贝 |
+| TC-LOAD-05 | `slice.size > payload_size` | 请求长度超过存储 | 返回 `INVALID_PARAMS`；不拷贝 |
+| TC-QUERY-01 | `exists=0` + `IO_ERROR` / 超时 | 注入分片失败/延迟 | 返回 `unexpected`；绝不返回 false；Master 元数据不变 |
+| TC-QUOTA-01 | `kReady` / 未就绪 | 构造 `kUninit`/`kInitializing` | `kReady` 返回 true 且不读计数/不调 ASU；未就绪返回错误 |
+| TC-QUOTA-02 | 计数超 `total_keys_limit`/`total_size_limit` | 构造超限计数 | 超限 key 跳过；返回 `expected(success_count)`/`expected(0)`；不返回 `KEYS_ULTRA_LIMIT` |
+| TC-DEL-01（选 A） | 多 client、非 owner 调用 Remove | 两个 client，A 删 B 拥有的 key | Master 通知 owner；owner 删除；调用方不直接删；254 分块；`CQE_KEY_NOT_EXIST` 成功 |
+| TC-DEL-02（选 B） | `Client::Remove` 后 ASU 值仍在 | V1 逻辑删除 | 行为与文档一致；再次 Put 覆盖；不崩溃 |
+| TC-DEL-03（选 A） | `DeleteAsync` 逐 entry 失败 | 注入删除失败 | 失败 key 有日志；重复删除幂等；计数只扣成功 key |
+| TC-DEL-04（选 A） | owner 重启丢失删除任务 | 入队后重启 owner | 任务丢失、ASU 残留；不崩溃；行为与文档一致 |
+| TC-CONC-01 | 多读并发 + 写 | 多线程读写 + 单 tensor 区间 | TSAN/ASAN 干净；tensor 区间全部归还；无 use-after-free |
+| TC-LIFE-01 | 有在途 task 时 Shutdown | 延长 `Wait` | 等待 task 完成；不提前 `UnregisterRegions`；无崩溃 |
+| TC-OBS-01 | 注入一次 entry 失败 | 检查日志 | 日志含 `op`、`task_id`、entry 下标/状态、首错、key |
+| TC-E2E-01 | 写 → 读回 | 正常 Object | 字节一致（含前缀读）；Master 可见 `LOCAL_DISK` 副本 |
+
+---
+
+## 5. 风险与待确认
 
 | # | 风险 | 影响 | 处置 |
 | --- | --- | --- | --- |
 | R1 | 删除方案未拍板 | V1 范围可能膨胀到跨层协议改造 | 评审先定 B 或 A |
 | R2 | 前缀读的 payload CRC 无法覆盖完整 value | 完整性拦截面收窄 | V1 接受并文档化；或用本地长度索引做全长读（多 I/O） |
 | R3 | 默认 16 MiB 超过 24-bit 传输上限 | 满尺寸写全部失败 | 默认改 2 MiB，硬上限 `16,776,680` |
-| R4 | 64-bit `asu_key` 哈希碰撞 | 后写覆盖先写，读错对象 | 默认假设不发生；P1 可加碰撞检测/版本化 key |
-| R5 | `Wait` 超时后 slot 永久隔离 | 反复超时会耗尽 staging | 监控 `Quarantined` 数量；P1 研究取消/回收 |
-| R6 | 子区间 MR 寻址未被真机验证 | 可能只能每 slot 单独注册 | 真机确认；不支持则退化注册 |
+| R4 | 64-bit `MakeAsuKey(BlockId)` 哈希碰撞 | 后写覆盖先写，读错对象 | 默认假设不发生；P1 可加碰撞检测/版本化 key |
+| R5 | `Wait` 超时后 tensor 区间永久隔离 | 反复超时会耗尽注册区域 | 监控隔离区间数量；P1 研究取消/回收 |
+| R6 | 子区间 MR 寻址未被真机验证 | 可能只能每个 tensor 区间单独注册 | 真机确认；不支持则退化注册 |
 | R7 | `ScanMeta` 不实现 | Master 丢元数据后无法重建账本 | 已明确不在本版；文档化 |
 | R8 | HEAD 漂移 / `RemoveAll` 死代码 | 行号与可达性变化 | 评审前重新核对；不要引用旧行号 |
 | R9 | ASU 同 key 覆盖写语义未验证 | 若 Store 对已存在 key 返回 `CQE_KEY_ALREADY_EXISTED`，Put 覆盖会失败，B 方案的“覆盖回收”也不成立 | 真机验证；必要时先 `DeleteAsync` 再 `StoreAsync`（代价是一次额外删除） |
@@ -576,4 +764,4 @@ tl::expected<bool, ErrorCode> KvClientStorageBackend::IsEnableOffloading() {
 
 ## 附：一句话总结
 
-写、读、查可以闭环；entry 构造的关键是“整块注册 + 子区间 slot + 后端不填 mrKey”；删除的关键不是接口本身，而是“后端有没有收到 key”——不改接口就只能逻辑删除，要物理删除就必须补 Master→owner 的按 key 路由。
+写、读、查可以闭环；entry 构造的关键是“`KVCacheRegistration` 整块注册 + 子区间 tensor + `BuildKvBuffers` + 后端不填 mrKey”；删除的关键不是接口本身，而是“后端有没有收到 key”——不改接口就只能逻辑删除，要物理删除就必须补 Master→owner 的按 key 路由。
