@@ -581,8 +581,6 @@ tl::expected<...> BatchRemoveKeys(scoped_keys) {
 
 #### 3.4.4 注意事项
 
-3.4.1 / 3.4.2 / 3.4.3 按“按 key 删除已接入”绘制；当前 HEAD 的实际状态如下。
-
 **现状：按 key 删除到不了后端**
 
 | 用户操作 | 实际动作 | 到 `StorageBackendInterface`？ | 证据 |
@@ -608,34 +606,7 @@ tl::expected<...> BatchRemoveKeys(scoped_keys) {
 | 方案 | 做法 | 按 key 物理删除 | 容量回收 | 改动面 | 结论 |
 | --- | --- | --- | --- | --- | --- |
 | A. 扩展基类接口 + 路由 | `StorageBackendInterface` 加 `BatchRemoveKeys`（默认 `NOT_SUPPORTED`）；Master 删除前捕获 owner、投递按 key 任务 | 是 | 立即 | 约 500–900 行 / 10 文件 | 需要容量回收时唯一正确方案 |
-| A'. 旁路能力接口 + 同样路由 | 不动基类，新增 `KeyDeleteCapable`，`FileStorage` `dynamic_cast` | 是 | 立即 | 同 A（路由成本不变） | 不想动公共基类时的备选 |
-| B. 逻辑删除 | 不改接口；`Remove` 只删元数据 | 否 | 靠覆盖/GC/命名空间轮转 | 0 | **V1 推荐**，需明确口径 |
-| C. 本地 key 集合 + `RemoveAll` 全清 | 记录本进程写过的 key，`RemoveAll` 时按 254 分批 `DeleteAsync` | 否（只能全清） | 全清 | 需新增 key 集合 + 恢复两端接线 | 只适合运维重置 |
-| D. 哨兵复用 `BatchOffload` | Master 把删除 key 当 offload 任务下发，空 slice 表示删除 | 名义上是 | 是 | 仍需 Master 路由 | 语义滥用，否决 |
-
-**建议 V1 选 B（逻辑删除），物理删除单列 P1；若评审要求“删除必须释放 ASU 容量”，则选 A（或 A'）。**
-
-**若选 A：最小改动清单**
-
-| 层 | 改动 |
-| --- | --- |
-| `storage_backend.h` | 新增 `virtual BatchRemoveKeys(const vector<string>& scoped_keys)`，默认逐 key `NOT_SUPPORTED` |
-| `file_storage.{h,cpp}` | 转发 `BatchRemoveKeys`；提供删除任务消费入口 |
-| `local_ssd/manager.{h,cpp}` | 新增按 key 删除任务邮箱/队列（现有只有 `RemoveAll` 布尔位） |
-| `master_service.{h,cpp}` | `Remove`/`BatchRemove` 在 `EraseMetadata` 之前捕获 LOCAL_DISK owner，投递按 key 任务 |
-| `rpc_service` / `master_client` / `RpcNameTraits` | 新增拉取删除任务的 RPC，或扩展心跳响应 |
-| `client_service` / `FileStorage::Heartbeat` | 拉取删除任务并调用 backend |
-| `kv_client/backend.cpp` | `scoped_key → BlockId → MakeAsuKey`；按 254 切块；`CQE_KEY_NOT_EXIST` 视为成功 |
-
-**其他约束**
-
-- Master 必须在 `EraseMetadata` **之前**捕获 owner；HA/oplog 路径要把“捕获 owner”和“元数据删除”放在同一持久化语义里。
-- 非 owner 的调用方不能直接算 ASU key（`key_namespace` 只有 owner 知道），必须 Master→owner 路由。
-- 本版没有持久化删除任务队列，owner 重启会丢任务；需要带外清理兜底。
-- 删除按 key 幂等；重复删除返回 `CQE_KEY_NOT_EXIST`，归一为成功；`ENTRY_DELETE_FAILED` 才是失败。
-- 单次 `DeleteAsync` 按 `deleteIoNum` 默认 254 切块；后端自己切；删除不需要注册内存，不走注册区域/tensor 区间。
-- **选 B（V1）时必须写进对外口径**：`Remove` 不释放 ASU 容量；ASU 残留由同 key 覆盖写 / ASU GC / 命名空间轮转回收；禁止宣称“删除释放 ASU 空间”。
-
+| B. 旁路能力接口 + 同样路由 | 不动基类，新增 `KeyDeleteCapable`，`FileStorage` `dynamic_cast` | 是 | 立即 | 同 A（路由成本不变） | 不想动公共基类时的备选 |
 ---
 
 ## 4. SFMEA 分析与测试设计
@@ -697,9 +668,3 @@ tl::expected<...> BatchRemoveKeys(scoped_keys) {
 | R7 | `ScanMeta` 不实现 | Master 丢元数据后无法重建账本 | 已明确不在本版；文档化 |
 | R8 | HEAD 漂移 / `RemoveAll` 死代码 | 行号与可达性变化 | 评审前重新核对；不要引用旧行号 |
 | R9 | ASU 同 key 覆盖写语义未验证 | 若 Store 对已存在 key 返回 `CQE_KEY_ALREADY_EXISTED`，Put 覆盖会失败，B 方案的“覆盖回收”也不成立 | 真机验证；必要时先 `DeleteAsync` 再 `StoreAsync`（代价是一次额外删除） |
-
----
-
-## 附：一句话总结
-
-写、读、查可以闭环；entry 构造的关键是“`KVCacheRegistration` 整块注册 + 子区间 tensor + `BuildKvBuffers` + 后端不填 mrKey”；删除的关键不是接口本身，而是“后端有没有收到 key”——不改接口就只能逻辑删除，要物理删除就必须补 Master→owner 的按 key 路由。
