@@ -55,27 +55,6 @@ flowchart TB
     KC --> VIEW["ASU View Service"]
     KC --> ASU["ASU nodes"]
 ```
-
-- UCM 头只在 `backend.cpp` 包含；`backend.h` 只前置声明 `namespace kv { class KvClient; }`。
-- 不新增端口层/适配器层；key 编码、记录编解码、注册区域内的 tensor 区间分配都是 `backend.cpp` 的私有 helper。
-- `backend.h` 不暴露 `kv::` 类型，避免 UCM 头进入 Mooncake 公共头。
-
-### 2.2 线程与锁
-
-| 线程 | 入口 | 行为 |
-| --- | --- | --- |
-| Heartbeat | `BatchOffload` | 串行写 |
-| RPC worker（多） | `BatchLoad` | 并发读 |
-| dangling probe | `IsExist` | 低频并发查 |
-| SDK worker | `KvClientImpl` 内部 | 提交/等待，不回调 Mooncake |
-
-锁纪律：
-
-1. `write_mutex_` 只串行化写路径与 tensor 区间分配。
-2. `regions_mutex_` 只保护注册区域的空闲/隔离 tensor 区间集合，**绝不覆盖 `Wait`**。
-3. 任何 ASU `Wait` 期间不持锁；`complete_handler` 回调期间不持锁。
-4. 无索引锁——读长度以 Master 的 `slice.size` 为准，不依赖本地索引。
-
 ---
 
 ## 3. 功能实现
