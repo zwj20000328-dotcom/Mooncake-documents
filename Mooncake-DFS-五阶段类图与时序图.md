@@ -128,11 +128,14 @@ sequenceDiagram
     C->>MC: PutStart(key, slice_lengths, cfg)
     MC->>MS: PutStart
     MS->>MS: AllocateAndInsertMetadata
+    MS->>MS: AllocateReplicas
     MS->>DA: Allocate(key, value_length)
     DA-->>MS: DistributedFSDescriptor{file_path, offset, object_size, aligned_size, shard_idx}
-    MS-->>C: replicas（DFS 状态 PROCESSING）
+    MS-->>MC: replicas
+    MC-->>C: replicas（DFS 状态 PROCESSING）
 
     C->>C: 先写 MEMORY / NoF（TransferWrite）
+    Note over C: DFS 写只在非 DFS 副本全部成功后执行（NonDfsTransfersSucceeded）
     C->>C: WriteDfsReplicas；device slice 先 D2H 到 PinnedBufferPool
     C->>BE: BatchWrite(DfsWriteRequest[])
     BE->>BE: IsDfsDescriptorRangeValid / IsBucketDescriptorRangeValid
@@ -153,7 +156,8 @@ sequenceDiagram
         AD->>DFS: pwritev / USRBIO write
         opt 短写
             alt bucket batch
-                BE->>AD: TransferAll 重试
+                BE->>BE: TransferAll 续写（短写循环）
+                BE->>AD: WriteAt(fd, iov, iovcnt, offset)
             else shard batch
                 BE->>BE: 短写按 FILE_WRITE_FAIL
             end
@@ -186,10 +190,14 @@ sequenceDiagram
         C->>MC: PutEnd(ALL)
         MC->>MS: PutEnd
         MS->>MS: DFS replica PROCESSING → COMPLETE
+        MS-->>MC: OK
+        MC-->>C: OK
     else 任一副本失败
         C->>MC: PutRevoke(ALL)
         MC->>MS: PutRevoke
         MS->>DA: Free(key, descriptor)
+        MS-->>MC: OK
+        MC-->>C: OK
     end
 ```
 
@@ -303,13 +311,16 @@ sequenceDiagram
     participant AD as FileSystemAdapter
     participant DFS as DFS(POSIX/3FS)
 
-    RC->>MC: Query / BatchQuery
+    RC->>C: Query(key) / BatchQuery(keys)
+    C->>MC: GetReplicaList / BatchGetReplicaList
     MC->>MS: GetReplicaList / BatchGetReplicaList
     MS->>MS: ReadReplicaList → GetReadableReplicaDescriptors
     opt 存在 DFS replica
         MS->>MS: dfs_allocator_->UpdateAccess(key, desc)
     end
-    MS-->>RC: replicas（含 DistributedFSDescriptor）
+    MS-->>MC: replicas
+    MC-->>C: replicas（含 DistributedFSDescriptor）
+    C-->>RC: QueryResult
 
     RC->>RS: SelectBestReplica(replicas, local_endpoints)
     RS-->>RC: best replica
@@ -318,7 +329,8 @@ sequenceDiagram
 
     RC->>C: Get(key, filtered_qr, slices)
     C->>C: replica.is_dfs_replica()
-    C->>BE: ReadDfsReplica → BatchRead(DfsReadRequest[])
+    C->>C: ReadDfsReplica(key, desc, slices)
+    C->>BE: BatchRead(DfsReadRequest[])
     BE->>BE: range check；按 object_size 裁剪 slices
 
     alt SupportsBatchIo() == true
@@ -336,7 +348,8 @@ sequenceDiagram
         AD->>DFS: preadv / USRBIO read
         opt 短读
             alt bucket batch
-                BE->>AD: TransferAll 重试
+                BE->>BE: TransferAll 续读（短读循环）
+                BE->>AD: ReadAt(fd, iov, iovcnt, offset)
             else shard batch
                 BE->>BE: 短读按 FILE_READ_FAIL
             end
@@ -451,10 +464,12 @@ sequenceDiagram
         MC->>MS: ExistKey
         MS->>MS: ExistKeyImpl → MetadataAccessorRO.Exists()
         alt 对象不存在
-            MS-->>C: false
+            MS-->>MC: false
+            MC-->>C: false
         else 对象存在
             MS->>MS: ReadExistence → HasReadableReplica
-            MS-->>C: true / false
+            MS-->>MC: true / false
+            MC-->>C: true / false
         end
         C-->>RC: expected<bool>
     else 元数据查询：Query / BatchQuery
@@ -465,7 +480,8 @@ sequenceDiagram
         opt 存在 DFS replica
             MS->>DA: UpdateAccess(key, desc)
         end
-        MS-->>C: replicas（含 DFS descriptor）
+        MS-->>MC: replicas
+        MC-->>C: replicas（含 DFS descriptor）
         C-->>RC: QueryResult
     end
 
@@ -579,7 +595,8 @@ sequenceDiagram
             DA->>DA: ImmutableBucketAllocator::Free → TombstoneLocked
         end
         Note over MS,AD: 按对象删除不调用 FileSystemAdapter::DeleteFile
-        MS-->>C: OK
+        MS-->>MC: OK
+        MC-->>C: OK
         C-->>RC: OK
     else RemoveAll
         RC->>C: RemoveAll(force)
@@ -590,7 +607,9 @@ sequenceDiagram
             MS->>RW: Erase → EraseMetadata → FreeDfsReplicas
             MS->>DA: Free(key, descriptor)
         end
-        MS-->>C: removed_count
+        MS-->>MC: removed_count
+        MC-->>C: removed_count
+        C-->>RC: removed_count
     end
 
     opt bucket 整桶淘汰（Master 内部 DFS 淘汰）
@@ -653,14 +672,13 @@ sequenceDiagram
     participant OS as ObjectStorageAdapter
     participant MS as Master
 
-    alt DFS 模式（UsesObjectStorage() == false）
-        FS->>BE: ScanMeta(handler)
-        BE->>BE: !UsesObjectStorage() → NOT_SUPPORTED
-        BE-->>FS: unexpected(NOT_SUPPORTED)
-        opt FileStorage::Init
-            Note over FS: enable_dfs 在更早处 return，Init 不会走到 ScanMeta
-        end
-        opt ReRegisterOffloadedObjects
+    alt DFS 模式
+        Note over FS: Init 在 enable_dfs 时提前返回（file_storage.cpp:142-148），不调用 ScanMeta
+        Note over FS: Heartbeat 线程不启动，ReRegisterOffloadedObjects 也不会被触发
+        opt 若被外部或未来入口调用
+            FS->>BE: ScanMeta(handler)
+            BE->>BE: !UsesObjectStorage() → NOT_SUPPORTED
+            BE-->>FS: unexpected(NOT_SUPPORTED)
             FS->>FS: enable_dfs + NOT_SUPPORTED → 记录 INFO 并返回成功
         end
     else 对象存储模式（OSS/S3，同一函数的另一分支）
