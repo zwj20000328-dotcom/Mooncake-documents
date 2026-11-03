@@ -606,7 +606,79 @@ KvClient 分配”，且要自己管理注册生命周期和 512B 对齐。v1 �
 - `entries` 的向量顺序就是 `TaskResult.entryStatus` 的下标顺序；不需要额外传 batch index。
 - `mrKey` 可留空：KvClient 从 `buffer.handle` 解析（`kv_types.h:122-127`）。
 
-#### 3.3.1 KvClient 调用语义与后端必须遵守的约束
+#### 3.3.1 entry / KVBuffer / Buffer / MemoryRegion / handle / mrKey 的结构关系
+
+```mermaid
+classDiagram
+    class KVBuffer {
+        +CacheKey key
+        +Buffer buffer
+        +uint32 offset
+        +optional mrKey
+    }
+    class Buffer {
+        +MemoryRegion region
+        +MRHandle handle
+    }
+    class MemoryRegion {
+        +MemoryType memoryType
+        +uint64 addr
+        +uint64 size
+        +int32 deviceId
+        +int32 numaNode
+    }
+    class RegisteredMemory {
+        +MemoryRegion region
+        +MRHandle handle
+        +uint32 tokenId
+    }
+    class TaskResult {
+        +Status status
+        +vector entryStatus
+        +optional queryResult
+    }
+    KVBuffer *-- Buffer
+    Buffer *-- MemoryRegion
+    RegisteredMemory ..> Buffer : supplies handle
+    KVBuffer ..> TaskResult : entryStatus index
+```
+
+| 层级 | 字段 | 谁填写 | 含义 | 本设计取值 |
+| --- | --- | --- | --- | --- |
+| entry | `entries[i]` | backend | 一次写/读的一条 key 描述；N 个 key = N 个 entry | 每个 `scoped_key` 一个 |
+| entry | `KVBuffer.key` | backend | 远端 ASU 的逻辑 key（8B） | `asu_key` |
+| entry | `KVBuffer.buffer` | backend | 本地内存描述 | `Buffer` 结构 |
+| buffer | `Buffer.region` | backend | 本地内存区间：类型/地址/长度/设备/NUMA | staging slot 子区间 |
+| region | `MemoryRegion.memoryType` | backend | `HOST` / `HOST_PINNED` / `DEVICE` | v1 用 `HOST` |
+| region | `MemoryRegion.addr` | backend | 本地虚拟地址（写=源，读=目标） | `slot.addr` |
+| region | `MemoryRegion.size` | backend | **本次传输长度**（不是整个注册区域） | `transfer_size` |
+| region | `MemoryRegion.deviceId/numaNode` | backend | 设备/NUMA | `-1` / `-1` |
+| buffer | `Buffer.handle` | backend | `RegisterRegions` 返回的 canonical handle | arena 的 handle |
+| entry | `KVBuffer.offset` | backend | **远端 value 内偏移**，不是本地指针偏移 | `0` |
+| entry | `KVBuffer.mrKey` | KvClient `SubmitAsync` 解析 | 硬件 token；调用方传入值会被重置 | `nullopt` |
+| 注册 | `RegisteredMemory.handle` | `RegisterRegions` | 客户端账本句柄；`Buffer.handle` 必须用它 | `staging_.handle` |
+| 结果 | `TaskResult.entryStatus[i]` | KvClient | 第 i 条 entry 的真实结果；顺序与 `entries` 对齐 | 逐 key 判断 |
+| 结果 | `TaskResult.status` | KvClient | 聚合状态（通常 OK/PARTIAL_FAILED） | 决定是否整块发布 |
+
+关系要点：
+
+1. **一次批量调用**：`vector<KVBuffer> entries` → 一个 `ClientTask` → 按 key 路由成多个
+   `TransportTask` → 每个 transport 再按 ioNum 切 `TransportSubBatch`。上层只看到
+   `TaskResult.entryStatus[i]` 与 `entries[i]` 一一对应。
+2. **entries 被拷贝，内存不被拷贝**：`SubmitAsync` 把 `entries` 复制进 `ClientTask`；但
+   `buffer.region.addr` 指向的本地内存必须保持有效到 task 完成（`Wait` 返回）。
+3. **handle 是账本键，mrKey 是硬件 token**：`handle` 由 `RegisterRegions` 返回，用于在
+   `registeredRegions_` 里查 `tokenId`；`SubmitAsync` 把调用方传入的 `mrKey` 清空后按
+   `handle` 重新解析。后端只需要填 `handle`，`mrKey` 留空。
+4. **region.size 是单条传输长度**：不是整个 staging arena 的大小。arena 注册一次后，每个 slot
+   用 `{addr=slot.addr, size=transfer_size}` 的子区间和同一个 `handle`。
+5. **offset 是远端 value 偏移**：不是本地地址偏移。本设计每条记录一个 value，`offset=0`。
+6. **写/读的 region 语义相反**：写时 `region` 是源（backend 先拷进去）；读时 `region` 是目标
+   （KvClient 写进来，backend 再拷给调用方）。
+7. **Query/Delete 没有 KVBuffer**：它们走 keys 路径，只传 `vector<CacheKey>`，不需要
+   region/handle/mrKey/offset。
+
+#### 3.3.2 KvClient 调用语义与后端必须遵守的约束
 
 来源：`kvclient_deep_read.md` 第 3/7/8/9/10/11/13/14/15/17 章。
 

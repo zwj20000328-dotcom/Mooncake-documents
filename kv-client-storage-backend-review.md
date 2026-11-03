@@ -394,9 +394,9 @@ sequenceDiagram
     KC-->>BE: taskId
     BE->>KC: Wait(taskId, query_timeout_ms)
     KC-->>BE: TaskResult{exists, entryStatus}
-    alt exists == 1 && entryStatus == ENTRY_KEY_EXIST
+    alt exists == 1 且 entryStatus == ENTRY_KEY_EXIST
         BE-->>FS: expected(true)
-    else exists == 0 && entryStatus == ENTRY_KEY_NOT_EXIST
+    else exists == 0 且 entryStatus == ENTRY_KEY_NOT_EXIST
         BE-->>FS: expected(false)
     else IO_ERROR / CONNECTION_ERROR / TIMEOUT / 其他
         BE-->>FS: unexpected(mapped_error)
@@ -566,6 +566,11 @@ KvClientStorageBackend::BatchRemoveKeys(const std::vector<std::string>& scoped_k
 | `DistributedStorageBackend`（OSS/S3） | 对象存储 LIST | 远端 LIST | 可恢复 | 无本地扫描锁；非流式 | 每页 1000；任一分页失败整次失败；posix/hf3fs → `NOT_SUPPORTED` | 依赖外部对象索引 |
 | `NvmeKvStorageBackend` | 无枚举 | 不读盘 | 不可恢复 | 无 | 未初始化 → `INTERNAL_ERROR`；handler 零调用 | 与本后端最接近：设备无 enumerate |
 
+> **关于"前置阶段"**：`BucketStorageBackend` 与 `OffsetAllocatorStorageBackend` 的 `ScanMeta` 本身不读盘，
+> 遍历的是 `Init()` 重建出来的内存索引。因此这两节的时序图把 **Init 阶段**也画了进去；
+> `StorageBackendAdaptor` 相反——`Init` 不重建 key 元数据，key 只有在 `ScanMeta` 扫目录时才被读出来。
+> 这个差别决定了"`ScanMeta` 返回 OK 但零回调"到底是正常（空盘）还是故障（索引没恢复）。
+
 #### 3.5.2 StorageBackendAdaptor —— 扫目录 + 读文件内容
 
 ```mermaid
@@ -592,6 +597,7 @@ sequenceDiagram
 ```
 
 - 数据来源：文件内容里的 `KVEntry.key`；文件名是 `SanitizeKey` 后的有损形式，不能反解。
+- `Init` 不重建 key 元数据：`StorageBackendAdaptor::Init` 只创建底层 `StorageBackend`；开启淘汰时后者会递归扫目录建立 `file_write_queue_`，但每条记录的 key 是空串，要等 `ScanMeta` 读到文件内容后由 `UpdateFileRecordKey` 回填。所以本节没有“阶段 1”。
 - 代价：O(总字节数) 的磁盘读；handler 里的同步 RPC 全程持 `mutex_`。
 - 失败：单文件读失败静默跳过；坏文件可能让 `struct_pb::from_pb` 抛异常。
 - handler 返回非 OK 会提前返回，`meta_scanned_` 不会置 true。
@@ -604,10 +610,22 @@ sequenceDiagram
     autonumber
     participant FS as FileStorage
     participant BE as Bucket
+    participant META as BucketMetaFiles
     participant IDX as BucketIndex
     participant MS as Master
 
-    Note over BE: 前置：Init() 已扫 *.meta 重建内存索引
+    Note over FS,META: 阶段 1：Init() —— 从 *.meta 重建内存索引（先于 ScanMeta）
+    FS->>BE: Init()
+    BE->>META: 递归遍历 storage_path_ 下的 *.meta
+    META-->>BE: BucketMetadata（data_size、keys、每 key 的 offset / key_size / data_size）
+    BE->>BE: 重建 buckets_ / object_bucket_map_ / total_size_
+    opt .meta 解析失败
+        BE->>META: 删除该桶的 .meta 与 .bucket
+    end
+    BE->>META: 校验 .meta 与 .bucket 成对，删除孤儿 .bucket
+    BE-->>FS: OK（索引已可用，但 Master 尚不知道这些对象）
+
+    Note over FS,MS: 阶段 2：ScanMeta() —— 只遍历内存索引，不读盘
     FS->>BE: ScanMeta(handler)
     loop next_bucket_ != 0
         BE->>BE: HasNext()  // iterator_mutex_
@@ -620,11 +638,12 @@ sequenceDiagram
     BE-->>FS: OK
 ```
 
-- 数据来源：Init 时从 `<id>.meta` 重建的 `buckets_`；`ScanMeta` 本身不读盘。
+- 数据来源：阶段 1 从 `<id>.meta` 重建的 `buckets_`；阶段 2 的 `ScanMeta` 本身不读盘。
+- 两个阶段是**串行依赖**：`Init` 没跑或 `.meta` 全丢时，`ScanMeta` 会"成功返回但零回调"——这正是本后端与 NvmeKv 的差别所在（差别在 `Init`，不在 `ScanMeta`）。
 - 游标初值 `-1`、`0` 为结束；扫完必须 `ResetScanIterator()` 才能再扫。
 - 单桶是原子单位；单个桶超过 `scanmeta_iterator_keys_limit` 直接 `KEYS_EXCEED_BUCKET_LIMIT`。
 - handler 在 `iterator_mutex_` 内执行；`BucketScan` 的 `mutex_` shared 锁在拷贝完成后释放。
-- 代码：`storage_backend.cpp:2279-2301`（ScanMeta）、`2303-2331`（BucketScan）、`3601-3629`（HandleNext/HasNext）。
+- 代码：`storage_backend.cpp:2279-2301`（ScanMeta）、`2303-2331`（BucketScan）、`3601-3629`（HandleNext/HasNext）；阶段 1 的元数据重建见 `BucketStorageBackend::Init` 中的 `.meta` 加载（`LoadBucketMetadata`）。
 
 #### 3.5.4 OffsetAllocatorStorageBackend —— 内存 shard 快照
 
@@ -633,10 +652,28 @@ sequenceDiagram
     autonumber
     participant FS as FileStorage
     participant BE as OffsetAllocator
+    participant META as KvcacheMeta
+    participant DATA as KvcacheData
     participant SH as ShardMaps
     participant MS as Master
 
-    Note over BE: 前置：Init() 从 kv_cache.meta 恢复（persist_mode != kDisabled）
+    Note over FS,META: 阶段 1：Init() —— 先恢复内存 map，否则 ScanMeta 无内容可扫
+    FS->>BE: Init()
+    alt persist_mode != kDisabled
+        BE->>META: 读 kv_cache.meta（version 必须为 kOffsetAllocatorPersistVersion）
+        META-->>BE: allocator_state / insert_seq / fifo_entries
+        BE->>BE: 反序列化 allocator，visit_used_nodes 得到已用 extent
+        BE->>DATA: 每个 extent 跳读 24 字节 RecordHeader + key
+        DATA-->>BE: key / value_len / seq / flags / crc32
+        BE->>BE: 仅 kFlagHasCrc 时校验 CRC；丢弃 seq >= checkpoint 的撕裂写
+        BE->>BE: 重建 shard.map / fifo / total_keys / total_size
+    else persist_mode == kDisabled（默认）
+        BE->>META: 删除 kv_cache.meta
+        BE->>DATA: O_TRUNC 截断 kv_cache.data
+        BE->>BE: map 为空 → 后续 ScanMeta 零回调
+    end
+
+    Note over FS,MS: 阶段 2：ScanMeta() —— 只遍历内存 map
     FS->>BE: ScanMeta(handler)
     BE->>SH: 对 1024 个分片加 shared_lock
     loop 遍历每个 shard.map
@@ -650,11 +687,12 @@ sequenceDiagram
     BE-->>FS: OK
 ```
 
-- 数据来源：内存 `shards_[i].map`；源码注释明确 “no disk scanning”。
-- 默认 `persist_mode = kDisabled` → map 为空 → 零回调、零告警。
+- 数据来源：阶段 1 恢复出来的 `shards_[i].map`；阶段 2 的 `ScanMeta` 源码注释明确 “no disk scanning”。
+- **两个阶段是串行依赖**：`ScanMeta` 的"可恢复性"完全由阶段 1 决定——`Init` 没恢复出 map，`ScanMeta` 就返回 OK 但零回调。
+- 默认 `persist_mode = kDisabled` → 走 `else` 分支（删 meta + 截断数据文件）→ map 为空 → 零回调、零告警。
 - 循环内 flush 时 handler 仍在全部 shard 的共享锁内，会阻塞 `BatchOffload` 的索引提交。
 - 尾批在释放锁之后发送。
-- 代码：`storage_backend.cpp:5518-5601`；默认 `persist_mode` 见 `offset_allocator_backend_config.h:52`。
+- 代码：`storage_backend.cpp:5518-5601`；默认 `persist_mode` 见 `offset_allocator_backend_config.h:52`；阶段 1 的恢复实现见 `TryRecoverFromMetadata` / `RebuildShardMapsFromAllocator`。
 
 #### 3.5.5 DistributedStorageBackend（OSS/S3）—— 远端 LIST
 
@@ -672,7 +710,7 @@ sequenceDiagram
     BE->>BE: initialized_? 否 → INTERNAL_ERROR
     BE->>AD: ListKeys()
     loop 每页 1000 条，continuation-token
-        AD->>OSS: GET /?list-type=2&max-keys=1000&prefix=…&encoding-type=url
+        AD->>OSS: GET /?list-type=2（query：prefix、max-keys=1000、encoding-type=url、continuation-token）
         OSS-->>AD: XML（Contents/Key/Size）
         AD->>AD: UriDecode(Key) → 去前缀 → UriDecode → scoped key
         AD->>AD: stoull(Size)
@@ -709,12 +747,6 @@ sequenceDiagram
 - 设备侧只有 Store/Retrieve/Delete，没有 enumerate，不是实现取舍。
 - 读不依赖索引（XXH64 派生 key + slot 0..63 探测），所以客户端重启无害；Master 丢元数据即孤儿。
 - 代码：`nvme_kv/backend.cpp:1516-1525`；slot 数见 `nvme_kv/key_codec.h:18`。
-
-#### 3.5.7 对本后端的结论
-
-- ASU 的 `kv::KvClient` 没有 enumerate，只有按 key 的 Query/Load/Store/Delete；没有外部索引就无法重建 `(scoped_key, size)` 清单。
-- 因此 `KvClientStorageBackend` 的 `ScanMeta` 与 `NvmeKvStorageBackend` 同类：返回 OK、零回调、不恢复账本；Master 丢元数据即孤儿。
-- 若后续要求恢复，只有两条路：另建外部 key 索引（本地或 ASU 上的独立 key），或接受“无恢复”；不在 V1 范围。
 
 ---
 
