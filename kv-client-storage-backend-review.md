@@ -2,6 +2,51 @@
 
 ## 1. 背景与边界
 
+`KvClientStorageBackend` 是 Mooncake Store 的一个 `StorageBackendInterface` 实现类。它把 `FileStorage` 后面的 offload/restore 数据面从本地 SSD 换成 UCM 的 `kv::KvClient` → ASU：
+
+- **写**：`BatchOffload` 把 Mooncake 内存副本编码成 `KVBuffer`，`BatchStoreAsync` 写入 ASU；
+- **读**：`BatchLoad` 按 Master 给的 `key + size` 从 ASU `BatchLoadAsync` 读回；
+- **查**：`IsExist` 用 `QueryAsync` 判断存在性；
+- **删**：backend 内新增非 override 成员 `BatchRemoveKeys`，按 key `DeleteAsync`；`FileStorage` 接线暂不做。
+- **`ScanMeta`**：本版为空实现，不恢复账本；5 种现有后端方案见 3.5。
+
+它不改变 Master 的副本模型：Master 仍只看到 `LOCAL_DISK` 副本，不需要感知后端是本地文件还是 ASU。
+
+```mermaid
+classDiagram
+    class StorageBackendInterface {
+        <<interface>>
+        +Init()
+        +BatchOffload()
+        +BatchLoad()
+        +IsExist()
+        +IsEnableOffloading()
+        +ScanMeta()
+    }
+    class KvClientStorageBackend {
+        -config_
+        -client_
+        -persistentRegions_
+        +Init()
+        +BatchOffload()
+        +BatchLoad()
+        +IsExist()
+        +IsEnableOffloading()
+        +ScanMeta()
+        +BatchRemoveKeys()
+    }
+    class FileStorage
+    class KvClient
+    class ASU
+    StorageBackendInterface <|-- KvClientStorageBackend
+    FileStorage --> KvClientStorageBackend : BatchOffload / BatchLoad / IsExist
+    FileStorage ..> KvClientStorageBackend : BatchRemoveKeys（暂不接线）
+    KvClientStorageBackend --> KvClient : Store / Load / Query / Delete + Wait
+    KvClient --> ASU : 数据面
+    note for KvClient "UCM SDK：kv::KvClient"
+    note for KvClientStorageBackend "BatchRemoveKeys 是新增成员，不是 override"
+```
+
 ### 1.1 链路
 
 ```mermaid
