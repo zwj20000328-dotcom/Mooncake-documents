@@ -6,7 +6,7 @@
 
 ```mermaid
 flowchart LR
-    FS["FileStorage<br/>BatchOffload / BatchLoad / IsExist / BatchRemoveKeys"]
+    FS["FileStorage<br/>BatchOffload / BatchLoad / IsExist"]
     BE["KvClientStorageBackend<br/>BuildKvBuffers + FindPersistentHandle"]
     KC["kv::KvClient"]
     ASU["ASU"]
@@ -23,12 +23,12 @@ flowchart LR
     BE -->|"③ QueryAsync + Wait"| KC
     KC -->|"③ 查"| ASU
 
-    FS -.->|"④ BatchRemoveKeys（方案 A，未实现）"| BE
-    BE -.->|"④ DeleteAsync + Wait"| KC
-    KC -.->|"④ 删"| ASU
+    FS -.->|"④ 按 key 删除（暂不接线）"| BE
+    BE -->|"④ BatchRemoveKeys → DeleteAsync + Wait"| KC
+    KC -->|"④ 删"| ASU
 ```
 
-默认是“写完即下沉”：`PutEnd` 成功后 Master 把对象放进 owner 的 offload 队列，下一次心跳由 `FileStorage` 调 `BatchOffload` 写入 ASU；内存副本在 `NotifyOffloadSuccess` 前不可淘汰。本后端不感知触发时机。
+默认是“写完即下沉”：`PutEnd` 成功后 Master 把对象放进 owner 的 offload 队列，下一次心跳由 `FileStorage` 调 `BatchOffload` 写入 ASU；内存副本在 `NotifyOffloadSuccess` 前不可淘汰。
 
 ### 1.2 本版范围
 
@@ -37,20 +37,9 @@ flowchart LR
 | 写 `BatchOffload` | `BuildKvBuffers` 编码进 tensor 区间，`BatchStoreAsync` + `Wait`，只上报成功 key |
 | 读 `BatchLoad` | `BuildKvBuffers` + `BatchLoadAsync` + `Wait`，校验记录头，支持前缀读 |
 | 查 `IsExist` | `QueryAsync` + `Wait`，同时看 `exists` 与 `entryStatus` |
-| 删 | 逻辑删除；物理删除 |
-| `Init` / `IsEnableOffloading` | 注册 `KVCacheRegistration`；`IsEnableOffloading` 在 `kReady` 后返回 true，未就绪返回错误；不查 ASU、不读计数 |
-| `ScanMeta` | **不实现枚举**，返回 OK 空扫描；本文不讨论恢复 |
-
-### 1.3 与现有后端的关系
-
-| 后端 | 删除能力 | 恢复能力 |
-| --- | --- | --- |
-| `StorageBackendAdaptor` | `RemoveAll` | `ScanMeta` 目录扫描 |
-| `BucketStorageBackend` | `RemoveAll` / 水位淘汰 | 内存索引 + 持久化元数据 |
-| `NvmeKvStorageBackend` | 无 | 无（`ScanMeta` 空实现） |
-| `KvClientStorageBackend` | 见 3.4 节 | 无（`ScanMeta` 空实现） |
-
----
+| 删（backend 内） | 新增**非 override** 成员函数 `BatchRemoveKeys(scoped_keys)`：backend → `kv::KvClient::DeleteAsync` + `Wait`；FileStorage / Master 接线暂不做 |
+| `Init` / `IsEnableOffloading` | 注册 `KVCacheRegistration`；`IsEnableOffloading` 在 `kReady` 后返回 true，未就绪返回错误|
+| `ScanMeta` | **不实现枚举**，返回 OK 空扫描；3.5 5种当前scanMeta方案 |
 
 ## 2. 总体设计
 
@@ -62,7 +51,7 @@ flowchart TB
     FAC["CreateStorageBackend"] --> BE
     BE --> CFG["KvClientBackendConfig"]
     BE --> H1["私有 helper：KeyCodec / RecordCodec / BuildKvBuffers / FindPersistentHandle"]
-    BE -->|"RegisterKVCaches<br/>Store/Load/Query/Delete<br/>Wait"| KC["kv::KvClient"]
+    BE -->|"RegisterRegions（Init）<br/>Store/Load/Query/Delete<br/>Wait"| KC["kv::KvClient"]
     KC --> VIEW["ASU View Service"]
     KC --> ASU["ASU nodes"]
 ```
@@ -96,7 +85,7 @@ entry 构造沿用 asuStore 命名：
 - `BlockId`（16B）由 `key_namespace + '\0' + scoped_key` 的 128-bit 哈希派生；
 - `MakeAsuKey(BlockId)` 生成 8B `kv::CacheKey`；
 - 一个 Mooncake 对象 = 一个 `Shard` + 一个 tensor：`tensorSizes[0] = align_up(24 + Σ slice.size, 512)`，`offset = 0`；
-- 注册内存 = `KVCacheRegistration`，Init 时 `RegisterKVCaches` 注册一次，返回 `RegisteredPersistentRegion{region, handle}`；
+- 注册内存 = `KVCacheRegistration`，Init 时 `RegisterKVCaches`（backend helper，封装 `kv::KvClient::RegisterRegions`）注册一次，返回 `RegisteredPersistentRegion{region, handle}`；
 - `BuildKvBuffers(TaskDesc, tensorSizes)` 生成 `vector<kv::KVBuffer>`；`buffer.handle` 由 `FindPersistentHandle(region)` 解析；`mrKey` 留空，由 SDK 提交时写入。
 
 ---
@@ -198,7 +187,7 @@ sequenceDiagram
 ```cpp
 // Init：注册区域
 KVCacheRegistration reg{kv_cache_addr, kv_cache_size};
-RegisterKVCaches(&reg, 1);   // -> RegisteredPersistentRegion{region, handle}
+RegisterKVCaches(&reg, 1);   // backend helper -> kv::RegisterRegions
 
 // BatchOffload
 tl::expected<int64_t, ErrorCode> BatchOffload(batch, complete_handler, ...) {
@@ -466,29 +455,25 @@ tl::expected<bool, ErrorCode> IsExist(const std::string& scoped_key) {
 
 ### 3.4 删
 
+**已定方案**：`KvClientStorageBackend`继承 `StorageBackendInterface` 后，新增一个**非 override** 成员函数
+`BatchRemoveKeys(scoped_keys)`：按批接收 key、逐 key 返回结果，只打通 **backend → `kv::KvClient`** 的按 key 删除流程。
+`FileStorage` / `Master` 与 backend 之间的接线**暂不实现**；因此该方法当前没有生产调用者，只能由测试或后续调用方直接调用。
+
 #### 3.4.1 类图
 
 ```mermaid
 classDiagram
-    class Client {
-        +Remove(key, force)
-        +BatchRemove(keys, force)
-    }
-    class Master {
-        +Remove(key, force)
-        +BatchRemove(keys, force)
-        -EraseMetadata()
-        -EnqueueDelete(owner, scoped_keys)
-    }
-    class LocalSsdTaskMailbox {
-        +EnqueueDelete(scoped_keys)
-        +TakeDeleteTasks()
-    }
-    class FileStorage {
-        +BatchRemoveKeys(scoped_keys)
+    class StorageBackendInterface {
+        <<interface>>
+        +BatchOffload(...)
+        +BatchLoad(...)
+        +IsExist(...)
     }
     class KvClientStorageBackend {
-        +BatchRemoveKeys(scoped_keys)
+        +BatchOffload(...)
+        +BatchLoad(...)
+        +IsExist(...)
+        +BatchRemoveKeys(scoped_keys) DeleteResults
         -MakeBlockId(scoped_key) BlockId
         -MakeAsuKey(block) CacheKey
     }
@@ -496,11 +481,11 @@ classDiagram
         +DeleteAsync(keys, taskId)
         +Wait(taskId, timeout, result)
     }
-    Client --> Master : Remove / BatchRemove
-    Master --> LocalSsdTaskMailbox : EnqueueDelete
-    FileStorage ..> LocalSsdTaskMailbox : TakeDeleteTasks
-    FileStorage --> KvClientStorageBackend : BatchRemoveKeys
+    class FileStorage
+    StorageBackendInterface <|-- KvClientStorageBackend
+    FileStorage ..> KvClientStorageBackend : 按 key 删除
     KvClientStorageBackend --> KvClient : DeleteAsync + Wait
+    
 ```
 
 #### 3.4.2 时序图
@@ -508,29 +493,20 @@ classDiagram
 ```mermaid
 sequenceDiagram
     autonumber
-    participant U as User
-    participant C as Client
-    participant MS as Master
-    participant MB as LocalSsdTaskMailbox
-    participant FS as FileStorage
+    participant C as Caller / Test
     participant BE as Backend
     participant KC as kv::KvClient
     participant TR as Transport
     participant ASU as ASU
 
-    U->>C: Remove(key) / BatchRemove(keys)
-    C->>MS: Remove / BatchRemove RPC
-    MS->>MS: 捕获 LOCAL_DISK owner（在 EraseMetadata 之前）
-    MS->>MS: EraseMetadata（删 Master 元数据）
-    MS->>MB: EnqueueDelete(owner, scoped_keys)
-    MS-->>C: per-key result
+    Note over C,BE: FileStorage → Backend 的按 key 调用暂不接线
+    C->>BE: BatchRemoveKeys(scoped_keys)
+    loop 每个 scoped_key
+        BE->>BE: block = MakeBlockId(scoped_key)
+        BE->>BE: key = MakeAsuKey(block)
+    end
 
-    FS->>MB: owner 心跳 TakeDeleteTasks()
-    MB-->>FS: delete tasks
-    FS->>BE: BatchRemoveKeys(scoped_keys)
-    BE->>BE: scoped_key → BlockId → MakeAsuKey；按 254 切块
-
-    loop 每个 chunk
+    loop 每个 chunk（<= 254）
         BE->>KC: DeleteAsync(keys, taskId)
         KC-->>BE: taskId
         KC->>TR: dispatch
@@ -539,72 +515,228 @@ sequenceDiagram
         KC-->>BE: entryStatus
         BE->>BE: per-entry：OK 或 CQE_KEY_NOT_EXIST → 成功；否则失败
     end
-    BE-->>FS: per-key result
+    BE-->>C: DeleteResults
     Note over KC,TR: Delete 不需要 mrKey / 注册内存
 ```
 
 #### 3.4.3 实现
 
 ```cpp
-// Master::BatchRemove（删除按 key 已接入的形态）
-//   owners = CollectLocalDiskOwners(metadata);   // 必须在 EraseMetadata 之前
-//   EraseMetadata();
-//   for (owner : owners) EnqueueDelete(owner, scoped_keys);
+// 新增成员函数，不是 StorageBackendInterface::BatchRemoveKeys 的 override。
+// FileStorage / Master 的调用暂不接线；本函数只负责 backend -> KvClient。
+std::vector<tl::expected<void, ErrorCode>>
+KvClientStorageBackend::BatchRemoveKeys(const std::vector<std::string>& scoped_keys) {
+    std::vector<tl::expected<void, ErrorCode>> results(scoped_keys.size());
+    if (initialized_ != InitState::kReady) {
+        std::fill(results.begin(), results.end(),
+                  tl::make_unexpected(ErrorCode::INTERNAL_ERROR));
+        return results;
+    }
 
-// owner 心跳拉取删除任务，调用 backend：
-tl::expected<...> BatchRemoveKeys(scoped_keys) {
+    std::vector<kv::CacheKey> keys;
+    keys.reserve(scoped_keys.size());
     for (const auto& scoped_key : scoped_keys) {
         const auto block = MakeBlockId(scoped_key);
-        const auto key = MakeAsuKey(block);       // 与写/读/查同一套 key 编码
-        keys.push_back(key);
+        keys.push_back(MakeAsuKey(block));   // 与写/读/查同一套 key 编码
     }
 
-    for (chunk : Chunk(keys, 254)) {              // deleteIoNum 默认 254
+    constexpr std::size_t kDeleteIoNum = 254;   // deleteIoNum 默认值
+    for (std::size_t begin = 0; begin < keys.size(); begin += kDeleteIoNum) {
+        const auto end = std::min(begin + kDeleteIoNum, keys.size());
+        std::vector<kv::CacheKey> chunk(keys.begin() + begin, keys.begin() + end);
+
         kv::TaskId taskId{};
-        if (!client_->DeleteAsync(chunk, taskId).ok()) {
-            // 提交失败：没有 task，本块 key 全部记失败
+        auto submit = client_->DeleteAsync(chunk, taskId);
+        if (!submit.ok()) {                     // 没有 task；本 chunk 全部失败
+            for (std::size_t i = begin; i < end; ++i)
+                results[i] = tl::make_unexpected(Map(submit));
             continue;
         }
-        kv::TaskResult result;
-        client_->Wait(taskId, wait_timeout_ms, result);   // 每块只 Wait 一次
 
-        for (i : chunk) {
-            if (result.entryStatus[i].ok()) success;
-            else if (whole_cqe == CQE_KEY_NOT_EXIST) success;  // 幂等
-            else failed;   // 记日志，交给后续重试
+        kv::TaskResult result;
+        auto st = client_->Wait(taskId, wait_timeout_ms, result);   // 每 chunk 只 Wait 一次
+        if (!st.ok()) {                         // 超时/任务丢失：本 chunk 全部失败
+            for (std::size_t i = begin; i < end; ++i)
+                results[i] = tl::make_unexpected(Map(st));
+            continue;
+        }
+
+        for (std::size_t i = begin; i < end; ++i) {
+            const auto& entry = (i - begin < result.entryStatus.size())
+                                    ? result.entryStatus[i - begin]
+                                    : result.status;
+            const bool ok = entry.ok() ||
+                            entry.code == kv::StatusCode::CQE_KEY_NOT_EXIST;  // 幂等
+            results[i] = ok ? tl::expected<void, ErrorCode>{}
+                            : tl::make_unexpected(Map(entry));
         }
     }
+    return results;
 }
 ```
+---
+### 3.5 ScanMeta：已落地的 5 种方案（对照）
 
-#### 3.4.4 注意事项
+#### 3.5.1 总结表
 
-**现状：按 key 删除到不了后端**
+| 后端 | 数据来源 | 是否读盘/远端 | 恢复能力 | 锁与阻塞 | 主要边界/失败 | 对本后端的启示 |
+| --- | --- | --- | --- | --- | --- | --- |
+| `StorageBackendAdaptor` | 文件内容里的 `KVEntry.key` | 读盘，O(总字节) | 可恢复 | `mutex_` 整段扫描；handler 同步 RPC 持锁 | 单文件读失败静默跳过；`from_pb` 可能抛 | 文件名是 `SanitizeKey` 后的有损形式，必须读内容；代价最高 |
+| `BucketStorageBackend` | Init 从 `*.meta` 重建的 `buckets_` | 不读盘 | 可恢复 | `iterator_mutex_`；`BucketScan` 持 `mutex_` shared | 单桶 > limit → `KEYS_EXCEED_BUCKET_LIMIT`；扫完要 `ResetScanIterator` | 需要持久元数据 + 内存索引 |
+| `OffsetAllocatorStorageBackend` | 内存 `shards_[i].map` | 不读盘 | 取决于 `persist_mode`；默认 `kDisabled` → 空 | 1024 个 shard 全部 shared_lock；handler 在锁区 | 默认空扫描；handler 阻塞写索引提交 | checkpoint 决定可恢复性 |
+| `DistributedStorageBackend`（OSS/S3） | 对象存储 LIST | 远端 LIST | 可恢复 | 无本地扫描锁；非流式 | 每页 1000；任一分页失败整次失败；posix/hf3fs → `NOT_SUPPORTED` | 依赖外部对象索引 |
+| `NvmeKvStorageBackend` | 无枚举 | 不读盘 | 不可恢复 | 无 | 未初始化 → `INTERNAL_ERROR`；handler 零调用 | 与本后端最接近：设备无 enumerate |
 
-| 用户操作 | 实际动作 | 到 `StorageBackendInterface`？ | 证据 |
-| --- | --- | --- | --- |
-| `Client::Remove(key)` | 删 Master 元数据 + hot cache；物理删除调用被注释 | **否** | `client_service.cpp:3795-3812`，`3801-3803` 为注释 |
-| `Client::BatchRemove(keys)` | Master 逐 key 删元数据 | **否** | `client_service.cpp:3848-3870`；`master_service.cpp:7437-7530` |
-| `Client::RemoveByRegex` | Master 扫描删元数据 | **否** | `client_service.cpp:3814-3831` |
-| `Client::RemoveAll` | Master 删元数据；客户端物理清空当前不可达 | **否（当前 HEAD）** | `file_storage.cpp:912-921` 零调用者；`RequestRemoveAll` 也无调用者 |
-| `EvictAboveDiskWatermark` | 后端选 key，通知 Master 后物理删 | 是，但**不是用户按 key** | `storage_backend.h:323-328` |
-| KvClient | `DeleteAsync(vector<CacheKey>)` | 是（若被调用） | `kv_client.h:50` |
+#### 3.5.2 StorageBackendAdaptor —— 扫目录 + 读文件内容
 
-- `Client::Remove` 里被注释的 `storage_backend_` 是客户端本地文件后端的 `std::shared_ptr<StorageBackend>`（`client_service.h:1178`），不是 `FileStorage` 持有的 `StorageBackendInterface`（`file_storage.h:291`）。即使取消注释也不会到达 offload 后端。
-- `RemoveAll` 链路两端都是死的：`RequestRemoveAll()`、`FileStorage::RemoveAll()`、`Client::PollRemoveAll()` 均无调用者；RPC 还在，但标志位永远不会被置起。
-- `KvClient` 没有 `RemoveAll`/drop/scan；只能按 8 字节 key 调 `DeleteAsync`。
+```mermaid
+sequenceDiagram
+    autonumber
+    participant FS as FileStorage
+    participant BE as Adaptor
+    participant DIR as DirectoryTree
+    participant MS as Master
 
-**接口能否承载按 key 删除**
+    FS->>BE: ScanMeta(handler)
+    BE->>BE: MutexLocker(mutex_)  // 整段扫描持锁
+    loop 三层 directory_iterator
+        BE->>DIR: 遍历 regular file
+        DIR-->>BE: path, file_size
+        BE->>BE: LoadObject(path)  // 整文件读入
+        BE->>BE: struct_pb::from_pb → KVEntry.key / value.size()
+        Note over BE: 每满 scanmeta_iterator_keys_limit（默认 20000）或每个叶子目录结束 → flush
+        BE->>FS: handler(keys, metas)
+        FS->>MS: NotifyOffloadSuccess
+    end
+    BE->>BE: meta_scanned_ = true
+    BE-->>FS: OK
+```
 
-`StorageBackendInterface` 能到达后端的只有 `BatchOffload` / `BatchLoad` / `IsExist` / `GetObjectDataSize` / `RemoveAll` / `EvictAboveDiskWatermark`；没有任何方法能携带“要删除的 key 集合”。因此：
+- 数据来源：文件内容里的 `KVEntry.key`；文件名是 `SanitizeKey` 后的有损形式，不能反解。
+- 代价：O(总字节数) 的磁盘读；handler 里的同步 RPC 全程持 `mutex_`。
+- 失败：单文件读失败静默跳过；坏文件可能让 `struct_pb::from_pb` 抛异常。
+- handler 返回非 OK 会提前返回，`meta_scanned_` 不会置 true。
+- 代码：`storage_backend.cpp:1411-1496`；`LoadObject` 在 1466-1468。
 
-- **要按 key 物理删除，必须扩展后端契约并补 Master→owner 路由**；只加接口方法不接路由，方法永远没有调用者。
-- **不改接口只能做逻辑删除**：`Remove` 后 ASU value 仍在，靠同 key 覆盖写 / ASU GC / 命名空间轮转回收。
+#### 3.5.3 BucketStorageBackend —— 内存索引游标
 
-| 方案 | 做法 | 按 key 物理删除 | 容量回收 | 改动面 | 结论 |
-| --- | --- | --- | --- | --- | --- |
-| A. 扩展基类接口 + 路由 | `StorageBackendInterface` 加 `BatchRemoveKeys`（默认 `NOT_SUPPORTED`）；Master 删除前捕获 owner、投递按 key 任务 | 是 | 立即 | 约 500–900 行 / 10 文件 | 需要容量回收时唯一正确方案 |
-| B. 旁路能力接口 + 同样路由 | 不动基类，新增 `KeyDeleteCapable`，`FileStorage` `dynamic_cast` | 是 | 立即 | 同 A（路由成本不变） | 不想动公共基类时的备选 |
+```mermaid
+sequenceDiagram
+    autonumber
+    participant FS as FileStorage
+    participant BE as Bucket
+    participant IDX as BucketIndex
+    participant MS as Master
+
+    Note over BE: 前置：Init() 已扫 *.meta 重建内存索引
+    FS->>BE: ScanMeta(handler)
+    loop next_bucket_ != 0
+        BE->>BE: HasNext()  // iterator_mutex_
+        BE->>IDX: BucketScan(cursor, limit)  // mutex_ shared，整桶拷贝
+        IDX-->>BE: keys + metadatas
+        BE->>FS: handler(keys, metas)  // 持 iterator_mutex_
+        FS->>MS: NotifyOffloadSuccess
+        BE->>BE: next_bucket_ = 下一个桶 id（handler 成功才推进）
+    end
+    BE-->>FS: OK
+```
+
+- 数据来源：Init 时从 `<id>.meta` 重建的 `buckets_`；`ScanMeta` 本身不读盘。
+- 游标初值 `-1`、`0` 为结束；扫完必须 `ResetScanIterator()` 才能再扫。
+- 单桶是原子单位；单个桶超过 `scanmeta_iterator_keys_limit` 直接 `KEYS_EXCEED_BUCKET_LIMIT`。
+- handler 在 `iterator_mutex_` 内执行；`BucketScan` 的 `mutex_` shared 锁在拷贝完成后释放。
+- 代码：`storage_backend.cpp:2279-2301`（ScanMeta）、`2303-2331`（BucketScan）、`3601-3629`（HandleNext/HasNext）。
+
+#### 3.5.4 OffsetAllocatorStorageBackend —— 内存 shard 快照
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant FS as FileStorage
+    participant BE as OffsetAllocator
+    participant SH as ShardMaps
+    participant MS as Master
+
+    Note over BE: 前置：Init() 从 kv_cache.meta 恢复（persist_mode != kDisabled）
+    FS->>BE: ScanMeta(handler)
+    BE->>SH: 对 1024 个分片加 shared_lock
+    loop 遍历每个 shard.map
+        SH-->>BE: key, entry.offset / value_size
+        Note over BE: 每满 limit → flush（仍在锁区内）
+        BE->>FS: handler(keys, metas)
+        FS->>MS: NotifyOffloadSuccess
+    end
+    BE->>SH: 释放全部共享锁
+    BE->>FS: handler(剩余尾批)
+    BE-->>FS: OK
+```
+
+- 数据来源：内存 `shards_[i].map`；源码注释明确 “no disk scanning”。
+- 默认 `persist_mode = kDisabled` → map 为空 → 零回调、零告警。
+- 循环内 flush 时 handler 仍在全部 shard 的共享锁内，会阻塞 `BatchOffload` 的索引提交。
+- 尾批在释放锁之后发送。
+- 代码：`storage_backend.cpp:5518-5601`；默认 `persist_mode` 见 `offset_allocator_backend_config.h:52`。
+
+#### 3.5.5 DistributedStorageBackend（OSS/S3）—— 远端 LIST
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant FS as FileStorage
+    participant BE as Distributed
+    participant AD as ObjectStorageAdapter
+    participant OSS as ObjectStore
+    participant MS as Master
+
+    FS->>BE: ScanMeta(handler)
+    BE->>BE: UsesObjectStorage()? 否 → NOT_SUPPORTED
+    BE->>BE: initialized_? 否 → INTERNAL_ERROR
+    BE->>AD: ListKeys()
+    loop 每页 1000 条，continuation-token
+        AD->>OSS: GET /?list-type=2&max-keys=1000&prefix=…&encoding-type=url
+        OSS-->>AD: XML（Contents/Key/Size）
+        AD->>AD: UriDecode(Key) → 去前缀 → UriDecode → scoped key
+        AD->>AD: stoull(Size)
+    end
+    AD-->>BE: KeyInfo[]（logical_key, size）
+    loop 每满 scanmeta_iterator_keys_limit
+        BE->>FS: handler(keys, metas)
+        FS->>MS: NotifyOffloadSuccess
+    end
+    BE-->>FS: OK
+```
+
+- 数据来源：对象存储服务端维护的对象索引，不是 Mooncake 写的任何元数据。
+- 两层分页：HTTP 页 1000 / 回调批 `scanmeta_iterator_keys_limit`。
+- 非流式：全部页攒成 `vector` 才返回；任一分页失败 → 整次失败。
+- posix/hf3fs 模式返回 `NOT_SUPPORTED`。
+- 代码：`distributed_storage_backend.cpp:863-904`；OSS `ListKeys` 见 `oss_adapter.cpp:876-921`。
+
+#### 3.5.6 NvmeKvStorageBackend —— 空实现
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant FS as FileStorage
+    participant BE as NvmeKv
+
+    FS->>BE: ScanMeta(handler)
+    BE->>BE: initialized_? 否 → INTERNAL_ERROR
+    BE->>BE: (void)handler
+    BE-->>FS: OK（handler 零调用，无日志）
+    Note over BE: 设备只有 Store/Retrieve/Delete，没有 enumerate；读靠 XXH64 派生 key + slot 0..63 探测
+```
+
+- 设备侧只有 Store/Retrieve/Delete，没有 enumerate，不是实现取舍。
+- 读不依赖索引（XXH64 派生 key + slot 0..63 探测），所以客户端重启无害；Master 丢元数据即孤儿。
+- 代码：`nvme_kv/backend.cpp:1516-1525`；slot 数见 `nvme_kv/key_codec.h:18`。
+
+#### 3.5.7 对本后端的结论
+
+- ASU 的 `kv::KvClient` 没有 enumerate，只有按 key 的 Query/Load/Store/Delete；没有外部索引就无法重建 `(scoped_key, size)` 清单。
+- 因此 `KvClientStorageBackend` 的 `ScanMeta` 与 `NvmeKvStorageBackend` 同类：返回 OK、零回调、不恢复账本；Master 丢元数据即孤儿。
+- 若后续要求恢复，只有两条路：另建外部 key 索引（本地或 ASU 上的独立 key），或接受“无恢复”；不在 V1 范围。
+
 ---
 
 ## 4. SFMEA 分析与测试设计
@@ -626,8 +758,8 @@ tl::expected<...> BatchRemoveKeys(scoped_keys) {
 | FM-READ-01 | 读 | 前缀读被拒绝 / `slice.size > payload_size` | ranged read 失败或超读 | S2 | 允许 `slice.size <= payload_size` | TC-LOAD-02 |
 | FM-READ-02 | 读 | 头 / payload CRC 损坏 | 返回错误数据 | S1 | 头 CRC + payload CRC | TC-LOAD-03 |
 | FM-QUERY-01 | 查 | `IO_ERROR`/超时返回 false | probe 误删 Master 元数据 | S1 | 一律 `unexpected`，绝不返回 false | TC-QUERY-01 |
-| FM-DEL-01 | 删 | V1 逻辑删除不释放 ASU | 容量残留 | S2（接受） | 明确对外口径；覆盖/GC/namespace 轮转 | TC-DEL-03 |
-| FM-DEL-02 | 删 | owner 路由错误或 `DeleteAsync` 失败 | 漏删/删错/残留 | S1/S3 | Master→owner；逐 key 日志；幂等重试 | TC-DEL-01/02 |
+| FM-DEL-01 | 删 | key 编码与写/读/查不一致 | 删错/漏删 | S1 | 复用同一 `BlockId` + `MakeAsuKey` | TC-DEL-01 |
+| FM-DEL-02 | 删 | `DeleteAsync` 失败/超时/部分失败 | 残留对象；结果不准 | S3 | 逐 key 结果；失败日志；幂等重试 | TC-DEL-02 |
 | FM-CONC-01 | 并发 | `Wait` 持锁 / tensor 未完成就复用 | 心跳阻塞 / 数据损坏 | S1/S2 | `Wait` 不持锁；超时隔离 | TC-CONC-01 |
 
 ### 4.2 测试用例与验收点
@@ -646,9 +778,8 @@ tl::expected<...> BatchRemoveKeys(scoped_keys) {
 | TC-LOAD-02 | 前缀读 | `slice.size < payload_size` | 返回前缀；不越界 |
 | TC-LOAD-03 | 数据损坏 | 篡改头 / payload | `INVALID_READ` / `CHECKSUM_MISMATCH`；不拷贝 |
 | TC-QUERY-01 | 查询错误 | `exists=0` + `IO_ERROR` / 超时 | 返回 `unexpected`；绝不返回 false |
-| TC-DEL-01 | 按 key 删除 | 多 client，非 owner 调用 | master 通知 owner；owner 删除；254 分块；`CQE_KEY_NOT_EXIST` 成功 |
-| TC-DEL-02 | 删除失败 / 重复删除 | 注入 `ENTRY_DELETE_FAILED` | 失败有日志；重复删除幂等；计数只扣成功 key |
-| TC-DEL-03 | V1 逻辑删除（若选 B） | `Client::Remove` 后检查 ASU | ASU value 仍在；行为与文档一致；再次 Put 覆盖 |
+| TC-DEL-01 | backend 按 key 删除 | 直接调用 `BatchRemoveKeys(N keys)` | 与写/读/查同一套 key 编码；254 分块；`DeleteAsync` + 每块 `Wait` 一次；逐 key 结果 |
+| TC-DEL-02 | 删除失败 / 超时 / 部分失败 | 注入 `ENTRY_DELETE_FAILED`、`PARTIAL_FAILED`、`Wait` 超时 | 失败 key 有错误结果/日志；`CQE_KEY_NOT_EXIST` 归一成功；不自动重试；不崩溃 |
 | TC-CONC-01 | 多读并发 + 写 | 多线程读写 | TSAN/ASAN 干净；tensor 区间全部归还 |
 
 ---
@@ -657,12 +788,12 @@ tl::expected<...> BatchRemoveKeys(scoped_keys) {
 
 | # | 风险 | 影响 | 处置 |
 | --- | --- | --- | --- |
-| R1 | 删除方案未拍板 | V1 范围可能膨胀到跨层协议改造 | 评审先定 B 或 A |
+| R1 | FileStorage 接线未做，生产删除仍为逻辑删除 | ASU 残留；backend `BatchRemoveKeys` 暂无生产调用者 | 后续接 FileStorage/Master；当前文档化 |
 | R2 | 前缀读的 payload CRC 无法覆盖完整 value | 完整性拦截面收窄 | V1 接受并文档化；或用本地长度索引做全长读（多 I/O） |
 | R3 | 默认 16 MiB 超过 24-bit 传输上限 | 满尺寸写全部失败 | 默认改 2 MiB，硬上限 `16,776,680` |
 | R4 | 64-bit `MakeAsuKey(BlockId)` 哈希碰撞 | 后写覆盖先写，读错对象 | 默认假设不发生；P1 可加碰撞检测/版本化 key |
 | R5 | `Wait` 超时后 tensor 区间永久隔离 | 反复超时会耗尽注册区域 | 监控隔离区间数量；P1 研究取消/回收 |
 | R6 | 子区间 MR 寻址未被真机验证 | 可能只能每个 tensor 区间单独注册 | 真机确认；不支持则退化注册 |
-| R7 | `ScanMeta` 不实现 | Master 丢元数据后无法重建账本 | 已明确不在本版；文档化 |
+| R7 | `ScanMeta` 不实现 | Master 丢元数据后无法重建账本 | 已明确不在本版；3.5 对照现有 5 种方案；文档化 |
 | R8 | HEAD 漂移 / `RemoveAll` 死代码 | 行号与可达性变化 | 评审前重新核对；不要引用旧行号 |
-| R9 | ASU 同 key 覆盖写语义未验证 | 若 Store 对已存在 key 返回 `CQE_KEY_ALREADY_EXISTED`，Put 覆盖会失败，B 方案的“覆盖回收”也不成立 | 真机验证；必要时先 `DeleteAsync` 再 `StoreAsync`（代价是一次额外删除） |
+| R9 | ASU 同 key 覆盖写语义未验证 | 若 Store 对已存在 key 返回 `CQE_KEY_ALREADY_EXISTED`，逻辑删除后的同 key 覆盖也会失败 | 真机验证；必要时先 `DeleteAsync` 再 `StoreAsync` |

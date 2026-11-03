@@ -11,6 +11,9 @@
 - 2026-11-02 entry 构造改为对齐 asuStore 命名：`BlockId` / `Shard` / `TaskDesc` /
   `KVCacheRegistration` / `RegisteredPersistentRegion` / `FindPersistentHandle` /
   `BuildKvBuffers`；以 `kv-client-storage-backend-review.md` 的 3.1 / 3.2 节为准。
+- 2026-11-03 删除决策：`KvClientStorageBackend` 继承 `StorageBackendInterface` 后新增**非 override**
+  成员 `BatchRemoveKeys`，只打通 backend → `kv::KvClient::DeleteAsync`；FileStorage / Master
+  接线暂不做。以 `kv-client-storage-backend-review.md` 的 3.4 节为准。
 - 适用代码：`mooncake-store`（C++）
 - 接口基线：`mooncake-store/include/storage_backend.h`
 - 参考实现：`NvmeKvStorageBackend`（KV 客户端型后端）
@@ -1427,6 +1430,10 @@ sequenceDiagram
 7. `prefixHitKeys` 只是“连续前缀命中数”，不是总命中数，本后端不使用。
 
 ### 4.5 删：仅支持 `Client::Remove` / `Client::BatchRemove`
+
+> 2026-11-03 决策：本节描述的 Master→owner / FileStorage 路由**暂不实现**；当前只实现
+> `KvClientStorageBackend` 的非 override 成员 `BatchRemoveKeys` 与 `kv::KvClient::DeleteAsync`。
+> 以 `kv-client-storage-backend-review.md` 的 3.4 节为准。
 
 本版删除只支持两种用户操作：
 
