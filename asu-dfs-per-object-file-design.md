@@ -1,80 +1,35 @@
-# ASU DFS 路线设计方案（每对象一文件、单 key）
-
-> 代码基线：Mooncake `main` @ `522b716e`；ASU SDK `DramPool/unified-cache-management/kv_semantics`
-> 的 `kv_client.h` / `kv_types.h` 与 `dramPool_documents/kvclient_deep_read.md`。
-> 本文所有行为、限制与接口均给出代码或文档出处。
-
----
+# ASU DFS 路线设计方案
 
 ## 1. 概述
 
 ### 1.1 需求分析
 
-**为什么需要**
-
 Mooncake 现有 DFS 路线通过 `DfsAllocatorInterface` 分配 `(file_path, offset)`，客户端用
-`DistributedStorageBackend` + `FileSystemAdapter` 做 positional I/O：
-
-- `DfsAllocatorInterface::Allocate/Free` 定义在 `dfs_allocator_interface.h:45-79`；
-- `DfsWriteRequest` / `DfsReadRequest` 携带 `key + descriptor + slices`，见
-  `distributed_storage_backend.h:25-35`；
-- `Client::WriteDfsReplicas` / `ReadDfsReplica` 走该路径，见 `client_service.cpp:3050-3165`、`5196-5220`。
-
-现有 DFS 数据布局是**共享文件**：
-
-- `ShardAllocator` 预分配 `dfs_shard_<idx>.data`，在文件内分配 offset，见
-  `shard_allocator.cpp:136-137`、`254-303`；
-- `ImmutableBucketAllocator` 把多个对象追加进 `bucket_<id>.data`，见
-  `immutable_bucket_allocator.cpp:131-132`、`187-215`；
-- 按对象删除只调用 `dfs_allocator_->Free`，不删数据：`FreeDfsReplicas` 见
-  `master_service.cpp:7583-7590`；shard `Free` 只延迟归还 offset（`shard_allocator.cpp:381-407`），
-  bucket `Free` 只打 tombstone（`immutable_bucket_allocator.cpp:356-362`）。
+`DistributedStorageBackend` + `FileSystemAdapter` 做 positional I/O，现有 DFS 数据布局是**共享文件**： `ShardAllocator` 预分配 `dfs_shard_<idx>.data`，在文件内分配 offset，`ImmutableBucketAllocator` 把多个对象追加进 `bucket_<id>.data`，按对象删除只调用 `dfs_allocator_->Free`，不删数据，shard `Free` 只延迟归还 offset，bucket `Free` 只打 tombstone。
 
 这导致两个能力缺口：
 
 | 缺口 | 代码事实 |
 | --- | --- |
 | 按对象物理删除 | 按对象路径没有 `DeleteFile`；shard 只归还 offset，bucket 只 tombstone |
-| 按对象数据级 Exist | `DistributedStorageBackend::IsExist` 在 filesystem 模式返回 `NOT_SUPPORTED`，见 `distributed_storage_backend.cpp:847-856` |
+| 按对象数据级 Exist | `DistributedStorageBackend::IsExist` 在 filesystem 模式返回 `NOT_SUPPORTED`|
 
 而 ASU/KvClient 的原语是 **key 粒度**：
-
-- key 固定 8B：`kv_types.h:39-40`；
-- `DeleteAsync(vector<CacheKey>)`、`QueryAsync(vector<CacheKey>)` 只接受 key：
-  `kv_client.h:41`、`50`；
-- 没有 range delete、没有枚举：`kvclient_deep_read.md` §10、§11。
+- key 固定 8B；
+- `DeleteAsync(vector<CacheKey>)`、`QueryAsync(vector<CacheKey>)` 只接受 key；
 
 因此本方案改为：**一个 object key = 一个 `file_path` = 一个 ASU key**，使写、读、查、删都能落到对象粒度。
 
-**单对象 16,776,704B 上限的来源**
-
-- SQE `length` 是 24-bit，超过 `0xFFFFFF` 被拒绝：`kv_protocol.cc:207-215`；
-- `buffer_length` 必须 512B 对齐：`kv_protocol.cc:192-196`；
-- 批量 entry 的 `length` 同样是 24-bit、512B 对齐：`kv_protocol.cc:122-160`。
-
-```text
-0xFFFFFF = 16,777,215 B
-floor(0xFFFFFF / 512) * 512 = 16,776,704 B
-align_up(object_size, 512) <= 16,776,704  ⇒  object_size <= 16,776,704
-```
-
 ### 1.2 用户使用场景分析
 
-| 场景 | 参与者 | 主要流程 | 依据 |
-| --- | --- | --- | --- |
-| Put 时写 DFS 副本 | Client / Master / ASU | `PutStart` 分配 descriptor；客户端同步 `WriteDfsReplicas`；`PutEnd` 置 COMPLETE | `client_service.cpp:2053-2168`、`master_service.cpp:5199-5320` |
-| 内存副本淘汰后读 DFS | Client / ASU | `Query` 取 descriptor；`SelectBestReplica` 选 DFS；`ReadDfsReplica` 读 ASU | `client_service.cpp:1311-1320`、`5196-5220`；`replica_selection.h:122` |
-| 按对象删除 | Client / Master / ASU | Master `Remove` 删元数据并 `Free` 账本；客户端 `BatchRemoveKeys` 删 ASU key | `master_service.cpp:7170-7203`、`7583-7590`；本方案 6 |
-| 数据级存在性检查 | Client / ASU | `IsExistData` → backend `IsExist` → `QueryAsync([oid])` | 本方案 5；`kv_client.h:41` |
+| 场景 | 参与者 | 主要流程 |
+| --- | --- | --- |
+| Put 时写 DFS 副本 | Client / Master / ASU | `PutStart` 分配 descriptor；客户端同步 `WriteDfsReplicas`；`PutEnd` 置 COMPLETE |
+| 内存副本淘汰后读 DFS | Client / ASU | `Query` 取 descriptor；`SelectBestReplica` 选 DFS；`ReadDfsReplica` 读 ASU | 
+| 按对象删除 | Client / Master / ASU | Master `Remove` 删元数据并 `Free` 账本；客户端 `BatchRemoveKeys` 删 ASU key |
+| 数据级存在性检查 | Client / ASU | `IsExistData` → backend `IsExist` → `QueryAsync([oid])` | 
 | DFS 淘汰 | Master / Client / ASU | per-object LRU 淘汰；待删队列由客户端消费（P1） | 本方案 6.3 |
-| DFS 模式启动 | Client / Master | FileStorage 只启动 GC，不跑 offload 心跳；ScanMeta 不调用 | `file_storage.cpp:142-148`、`distributed_storage_backend.cpp:863-870` |
-
-约束：
-
-- DFS 要求单租户：`master_service.cpp:770-776`；
-- 单对象 ≤ 16,776,704B（1.1）；
-- `RemoveAll` 只返回 count，不返回 key 列表（`master_service.cpp:7347-7405`），物理删除需扩展 RPC；
-- `DeleteAsync` 在生产路径缺少验证：`kvclient_deep_read.md` §11.9 明确“`AsuStore` 从不调用 Delete”。
+| DFS 模式启动 | Client / Master | FileStorage 只启动 GC，不跑 offload 心跳；ScanMeta 不调用 |
 
 ---
 
@@ -122,7 +77,8 @@ flowchart TB
 - **Master**：`ObjectFileAllocator` 实现 `DfsAllocatorInterface`，只生成 `file_path` / descriptor、
   维护 per-object LRU 与容量；不持有 `kv::KvClient`。
 - **Client**：`DistributedStorageBackend` 负责 DFS 请求编排；`AsuKvFsAdapter` 负责
-  `file_path ↔ object_id`、单 key 读写、`QueryAsync` / `DeleteAsync`。
+  `file_path ↔ object_id`、**把一批 `FdIoRequest` 构造成一批 `kv::KVBuffer` entries**，
+  再调用 `BatchStoreAsync` / `BatchLoadAsync`；`QueryAsync` / `DeleteAsync` 同样按批次收 key。
 - **共享**：`asu_object_file_layout` 只依赖 XXH64，不依赖 SDK，Master 与 Client 共用。
 
 **类图**
@@ -171,6 +127,7 @@ classDiagram
         +ReadAt(fd, iov, iovcnt, offset)
         +BatchWriteAt(requests) results
         +BatchReadAt(requests) results
+        -BuildKvBuffers(requests, object_ids, totals, lease, begin, count) entries
         -QueryKeys(keys) bool
         -DeleteKeys(keys)
         -MapKvStatus(status, direction) ErrorCode
@@ -205,16 +162,6 @@ classDiagram
     AsuKvFsAdapter --> KvClient
 ```
 
-**命名约定**
-
-| 层 | 命名 |
-| --- | --- |
-| 上行（Mooncake） | `object_key`、`descriptor`、`file_path`、`BatchWrite`、`BatchRead`、`BatchRemoveKeys`、`IsExist`、`ErrorCode` |
-| 内部 | `object_id`、`asu_key`、`MakeObjectId`、`MakeObjectFilePath`、`MakeObjectKey`、`ParseObjectId`、`slot` |
-| 下行（KvClient） | `kv::CacheKey`、`kv::KVBuffer`、`kv::TaskId`、`kv::TaskResult`、`kv::StatusCode`、`BatchStoreAsync`、`BatchLoadAsync`、`QueryAsync`、`DeleteAsync`、`Wait` |
-
-不使用 `block` / `chunk` / `segment` / `manifest` / `part` 作为数据单位；本方案一个对象一个 key。
-
 ### 2.2 业务交互流程
 
 ```mermaid
@@ -226,8 +173,8 @@ flowchart LR
         P4 --> P5["写 MEMORY / NoF"]
         P5 --> P6["WriteDfsReplicas"]
         P6 --> P7["DistributedStorageBackend::BatchWrite"]
-        P7 --> P8["AsuKvFsAdapter::BatchWriteAt"]
-        P8 --> P9["BatchStoreAsync([oid])"]
+        P7 --> P8["AsuKvFsAdapter::BatchWriteAt<br/>BuildKvBuffers(entries)"]
+        P8 --> P9["BatchStoreAsync(entries)"]
         P9 --> P10["PutEnd / PutRevoke"]
     end
 
@@ -237,8 +184,8 @@ flowchart LR
         G3 --> G4["Client::Get"]
         G4 --> G5["ReadDfsReplica"]
         G5 --> G6["DistributedStorageBackend::BatchRead"]
-        G6 --> G7["AsuKvFsAdapter::BatchReadAt"]
-        G7 --> G8["BatchLoadAsync([oid])"]
+        G6 --> G7["AsuKvFsAdapter::BatchReadAt<br/>BuildKvBuffers(entries)"]
+        G7 --> G8["BatchLoadAsync(entries)"]
     end
 
     subgraph Remove["删"]
@@ -257,13 +204,6 @@ flowchart LR
         E5 --> E6["QueryAsync([oid])"]
     end
 ```
-
-依据：
-
-- Put/Get 调用链见 `client_service.cpp:2053-2168`、`1311-1320`、`5196-5220`；
-- Remove 见 `master_service.cpp:7170-7203`、`7583-7590`；
-- Query/Exist 见 `master_service.cpp:2824-2860`、`4561-4600`；
-- `BatchStoreAsync`/`BatchLoadAsync`/`QueryAsync`/`DeleteAsync` 见 `kv_client.h:41-54`。
 
 ### 2.3 运行设计
 
@@ -327,21 +267,22 @@ sequenceDiagram
     BE->>AD: OpenFile(file_path) → fd
     AD->>AD: ParseObjectId(file_path)
     BE->>AD: BatchWriteAt(FdIoRequest[])
-    AD->>AD: total = Σiov_len；aligned = align_up(total,512)
-    AD->>SL: Acquire(1)
-    AD->>AD: Gather iov → slot，尾部补零
-    AD->>KC: BatchStoreAsync([entry])
-    Note over KC: entry.key = MakeObjectKey(object_id)<br/>entry.offset = 0
-    KC->>ASU: Store(object_id, slot, aligned, 0)
+    AD->>AD: 对每个 request：fd→object_id；total=Σiov_len；aligned=align_up(total,512)
+    AD->>AD: BuildKvBuffers(requests) → entries[n]
+    AD->>SL: Acquire(n)
+    AD->>AD: 每个 request Gather iov → 对应 slot，尾部补零
+    AD->>KC: BatchStoreAsync(entries)
+    Note over KC: 一个 FdIoRequest → 一个 entry<br/>entry.key = MakeObjectKey(object_id)<br/>entry.offset = 0
+    KC->>ASU: Store(object_id_i, slot_i, aligned_i, 0) × n
     KC-->>AD: task_id
     AD->>KC: Wait(task_id, timeout_ms, task_result)
     KC-->>AD: TaskResult{status, entryStatus}
-    alt OK
+    alt 全部 entry OK
         AD->>SL: Release
-        AD-->>BE: expected<size_t>(total)
-    else 失败
+        AD-->>BE: 每个 request 的 expected<size_t>(total)
+    else 任一 entry 失败
         AD->>SL: Release / Poison（超时）
-        AD-->>BE: unexpected
+        AD-->>BE: 每个 request 的 expected / unexpected
     end
     BE-->>C: 每个 request 的 expected
     alt 全部成功
@@ -352,8 +293,10 @@ sequenceDiagram
     end
 ```
 
-说明：一个对象一个 entry；`Store` 的 `offset=0`，长度 `align_up(object_size,512)`；失败时
-`PutRevoke` 只释放账本，已写入的 key 成为孤儿（本方案 6.3）。
+说明：`BatchWriteAt` 的设计是**批量构造 entries**：每个 `FdIoRequest` 对应一个 `object_id`、一个
+`kv::KVBuffer`；多个请求合并到一个 `BatchStoreAsync(entries)`（按 `slot_count` 分组），一次 `Wait`。
+`Store` 的 `offset=0`，长度 `align_up(object_size,512)`。失败时 `PutRevoke` 只释放账本，已写入的
+key 成为孤儿（本方案 6.3）。
 
 #### 2.3.3 读
 
@@ -382,19 +325,20 @@ sequenceDiagram
     BE->>AD: OpenFile(file_path) → fd
     AD->>AD: ParseObjectId(file_path)
     BE->>AD: BatchReadAt(FdIoRequest[])
-    AD->>AD: total = Σiov_len；aligned = align_up(total,512)
-    AD->>SL: Acquire(1)
-    AD->>KC: BatchLoadAsync([entry])
-    Note over KC: entry.key = MakeObjectKey(object_id)<br/>entry.offset = 0
-    KC->>ASU: Retrieve(object_id, slot, aligned, 0)
+    AD->>AD: 对每个 request：fd→object_id；total=Σiov_len；aligned=align_up(total,512)
+    AD->>AD: BuildKvBuffers(requests) → entries[n]
+    AD->>SL: Acquire(n)
+    AD->>KC: BatchLoadAsync(entries)
+    Note over KC: 一个 FdIoRequest → 一个 entry<br/>entry.key = MakeObjectKey(object_id)<br/>entry.offset = 0
+    KC->>ASU: Retrieve(object_id_i, slot_i, aligned_i, 0) × n
     KC-->>AD: TaskResult
-    alt OK
-        AD->>AD: Scatter 前 total 字节
+    alt 全部 entry OK
+        AD->>AD: 每个 request Scatter 前 total 字节
         AD->>SL: Release
-        AD-->>BE: expected<size_t>(total)
+        AD-->>BE: 每个 request 的 expected<size_t>(total)
     else 缺失 / 错误 / 超时
         AD->>SL: Release / Poison
-        AD-->>BE: unexpected
+        AD-->>BE: 每个 request 的 expected / unexpected
     end
     BE-->>C: expected
     C-->>RC: OK / 错误
@@ -518,57 +462,20 @@ sequenceDiagram
 
 说明：淘汰删除与按对象删除共用客户端 `DeleteAsync`；P1 引入待删队列，V1 可先只释放账本。
 
-#### 2.3.7 ScanMeta
-
-```mermaid
-sequenceDiagram
-    autonumber
-    participant FS as FileStorage
-    participant BE as DistributedStorageBackend
-
-    alt DFS 模式
-        Note over FS: Init 在 enable_dfs 时提前返回，不调用 ScanMeta
-        Note over FS: Heartbeat 不启动，ReRegisterOffloadedObjects 不会被触发
-        opt 外部或未来入口调用
-            FS->>BE: ScanMeta(handler)
-            BE-->>FS: unexpected(NOT_SUPPORTED)
-        end
-        Note over BE: 没有 ListKeys；per-key 派生不能枚举
-    else 对象存储模式（对照）
-        FS->>BE: ScanMeta(handler)
-        BE->>BE: ListKeys() → handler 分批
-        BE-->>FS: OK
-    end
-```
-
-说明：`DistributedStorageBackend::ScanMeta` 在 filesystem 模式返回 `NOT_SUPPORTED`
-（`distributed_storage_backend.cpp:863-870`）；DFS 模式 `FileStorage::Init` 提前返回
-（`file_storage.cpp:142-148`）。
-
 ### 2.4 SFMEA分析
 
 | 用例编号 | 故障模式 | 是否涉及 | 故障影响 | 容错措施 | 故障注入方法 | 备注 |
 | --- | --- | --- | --- | --- | --- | --- |
-| SFMEA-01 | `KvClient::Init` 失败 | 是 | 后端初始化失败，节点不参与 DFS | 立即失败，不进入 ready | Fake provider 返回 Init 错误 | `kv_client.h:37-39`；`distributed_storage_backend.cpp:174-215` |
-| SFMEA-02 | `RegisterRegions` 失败或返回空 | 是 | 无 MR，写入报 `BUFFER_NOT_REGISTERED` | 空结果当失败；Init 失败 | Fake provider 返回空/错误 | `kv_client_impl.cc:337-340`、`454-457` |
-| SFMEA-03 | `object_id` 碰撞 | 是（低概率） | 两个对象共用 key，互相覆盖 | namespace 盐 + XXH64；P1 碰撞检测 | 构造相同 oid 的两个 key | 64-bit 生日界；`kvclient_deep_read.md` §1.5 |
-| SFMEA-04 | `file_path` 与 object key 不匹配 | 是 | 写/读到错误对象 | `IsObjectFileDescriptorValid` 校验 oid/path | 篡改 descriptor.file_path | `distributed_storage_backend.cpp:236-247` |
-| SFMEA-05 | 对象超过 16,776,704B | 是 | 无法单 key 写入/读取 | `Allocate` / `WriteAt` / `ReadAt` 拒绝 | `object_size = 16,776,705` | `kv_protocol.cc:122-160`、`192-215` |
-| SFMEA-06 | `Store` 部分失败 / `PARTIAL_FAILED` | 是 | 对象不可读 | 不写元数据；`PutRevoke` 释放账本 | Fake provider 返回 `CQE_WRITE_FAULT` | `kvclient_deep_read.md` §8、§16 |
-| SFMEA-07 | `CQE_KEY_ALREADY_EXISTED` | 是 | 重 Put 失败 | 先 `DeleteAsync([oid])` 再写 | Fake provider 返回该状态 | 真机覆盖语义待确认 |
-| SFMEA-08 | `Wait` 超时 | 是 | 结果未知；slot 可能仍被读 | slot Poison，request 失败 | Fake provider 延迟完成 | `kvclient_deep_read.md` §17 |
-| SFMEA-09 | 读缺失 key | 是 | 读失败 | 映射 `FILE_NOT_FOUND` | 先 `DeleteAsync` 再读 | `kv_client.h:46`；`kvclient_deep_read.md` §16.2 |
-| SFMEA-10 | Query 分片失败但 `exists=0` | 是 | 误判“不存在” | 同时检查 task/entry，返回 `unexpected` | Fake transport 分片失败 | `kvclient_deep_read.md` §10.8 |
-| SFMEA-11 | Master Remove 成功、客户端删除失败 | 是 | ASU 孤儿 key | 记录 metric/log；P1 待删队列 | Fake provider 返回 Delete 错误 | `master_service.cpp:7583-7590` |
-| SFMEA-12 | `RemoveAll` 无 key 列表 | 是 | 只删元数据，ASU 孤儿 | 文档化；P1 扩展 RPC 返回 keys | 调用 `RemoveAll` | `master_service.cpp:7347-7405` |
-| SFMEA-13 | 淘汰后无人删数据 | 是 | 空间不回收 | P1 待删队列 | 强制淘汰 | 本方案 2.3.6 |
-| SFMEA-14 | slot 池耗尽 / 毒化累积 | 是 | I/O 失败或挂起 | `Acquire(n, timeout)` 快速失败 | 连续超时毒化全部 slot | 本方案 8.4.1 |
-| SFMEA-15 | Master 重启丢账本 | 是 | 无法恢复对象列表 | per-key 删/查仍可用；ScanMeta 不可用 | 重启 Master | `master_service.cpp:763-768` |
-| SFMEA-16 | 尾部 padding 越过相邻对象 | 否 | 无相邻对象 | 一个对象一个 key，不存在共享区间 | — | 本方案 2.2 |
-| SFMEA-17 | manifest 损坏 | 否 | 本方案无 manifest | — | — | 本方案 0.4 |
-| SFMEA-18 | 删除一个对象影响同块其它对象 | 否 | 一个 key 只属于一个对象 | — | — | 本方案 2.2 |
-| SFMEA-19 | `GetFileSize` 不可用 | 是 | 调用方拿不到大小 | 读长度用 `descriptor.object_size` | 调用 `GetFileSize` | ASU Query 不返回长度 |
-| SFMEA-20 | 同一对象并发 Put | 是 | 后写覆盖先写/`ALREADY_EXISTED` | DFS 副本 PROCESSING；按对象串行 | 并发 Put 同一 key | `master_service.cpp:5199-5320` |
+| SFMEA-01 | `KvClient::Init` / `RegisterRegions` 失败或空结果 | 是 | 后端不可用，节点不参与 DFS | 立即失败；空结果当失败 | Fake provider 返回 Init 错误/空注册 | `kv_client.h:37-39`；`kv_client_impl.cc:337-340`、`454-457` |
+| SFMEA-02 | `object_id` 碰撞或 `file_path` 与 key 不一致 | 是（低概率/可校验） | 对象互相覆盖或读写错对象 | namespace 盐 + XXH64；`IsObjectFileDescriptorValid` 校验 oid/path | 构造相同 oid；篡改 `descriptor.file_path` | `distributed_storage_backend.cpp:236-247`；`kvclient_deep_read.md` §1.5 |
+| SFMEA-03 | 对象超过 16,776,704B | 是 | 无法放入单个 ASU value | `Allocate` / `WriteAt` / `ReadAt` 拒绝 | `object_size = 16,776,705` | `kv_protocol.cc:122-160`、`192-215` |
+| SFMEA-04 | `Store` 部分失败 / `PARTIAL_FAILED` | 是 | 对象不可读 | 不写元数据；`PutRevoke` 释放账本 | Fake provider 返回 `CQE_WRITE_FAULT` | `kvclient_deep_read.md` §8、§16 |
+| SFMEA-05 | `CQE_KEY_ALREADY_EXISTED` | 是 | 重 Put 失败 | 先 `DeleteAsync([oid])` 再写 | Fake provider 返回该状态 | 真机覆盖语义待确认 |
+| SFMEA-06 | `Wait` 超时 | 是 | 结果未知；slot 可能仍被读 | slot Poison，request 失败 | Fake provider 延迟完成 | `kvclient_deep_read.md` §17 |
+| SFMEA-07 | Query 分片失败但 `exists=0` | 是 | 误判“不存在” | 同时检查 task/entry，返回 `unexpected` | Fake transport 分片失败 | `kvclient_deep_read.md` §10.8 |
+| SFMEA-08 | Master Remove 成功、客户端/淘汰删除失败 | 是 | ASU 孤儿 key；`RemoveAll` 只删元数据 | 记录 metric/log；P1 待删队列；幂等重试 | Fake provider 返回 Delete 错误；调用 `RemoveAll` | `master_service.cpp:7583-7590`、`7347-7405` |
+| SFMEA-09 | slot 池耗尽 / 毒化累积 | 是 | I/O 失败或挂起 | `Acquire(n, timeout)` 快速失败 | 连续超时毒化全部 slot | 本方案 3.3.1 |
+| SFMEA-10 | Master 重启丢账本 | 是 | 无法恢复对象列表 | 已知 key 可查/删；`ScanMeta` 不可用 | 重启 Master | `master_service.cpp:763-768`；`distributed_storage_backend.cpp:863-870` |
 
 ### 2.5 可定位设计
 
@@ -671,6 +578,15 @@ kv::CacheKey MakeObjectKey(uint64_t object_id) {
 }
 ```
 
+| 名称 | 输入 | 输出 | 作用 | 约束 |
+| --- | --- | --- | --- | --- |
+| `asu_object_file_layout` | — | 共享 header/namespace | oid/path/key 的统一编码契约，Master 与 Client 共用 | 无状态，不依赖 SDK |
+| `MakeObjectId(key_namespace, object_key)` | namespace 字符串、object key 字符串 | `uint64_t object_id` | `XXH64(ns + '\0' + key)`，把任意长度 key 变成稳定 64-bit；0 映射为 1 | 两端必须用同一份实现；64-bit 碰撞是残余风险 |
+| `MakeObjectFilePath(fsdir, object_id)` | 虚拟根、object_id | `file_path` 字符串 | 生成 `<fsdir>/objects/<hex16(object_id)>.data`，作为 DFS 的虚拟文件 | 必须编码 oid；`lexically_normal`；父目录与文件名可校验 |
+| `MakeObjectKey(object_id)` | object_id | `kv::CacheKey`（8B） | 把 oid 原样放进 8 字节 ASU key | 不二次哈希；`object_id != 0` |
+| `ParseObjectId(file_path)` | `file_path` | `object_id` 或错误 | 从虚拟路径反解 oid，供 adapter 写/读时恢复对象身份 | 校验 `objects/` 前缀、16 位 hex、父目录 |
+| `Hex16(object_id)` | object_id | 16 位小写 hex | 让路径可读、可解析 | 零填充，不能截断 |
+
 依据：
 
 - key 固定 8B：`kv_types.h:39-40`；
@@ -768,6 +684,34 @@ AsuKvFsAdapter::Init(const std::string& mount_path) {
 说明：`RegisterRegions` 由 `AsuKvSlotPool::Init` 调用；失败或空结果都返回错误
 （`kv_client_impl.cc:337-340`、`454-457`）。
 
+#### 3.3.1 辅助类型
+
+```cpp
+class AsuKvSlotPool {
+   public:
+    struct Lease {
+        size_t size() const;
+        char* Addr(size_t index) const;
+        void Release();
+        void Poison();
+    };
+
+    tl::expected<void, ErrorCode> Init(kv::KvClient& client,
+                                       size_t slot_bytes, size_t slot_count);
+    tl::expected<Lease, ErrorCode> Acquire(size_t count,
+                                           uint32_t timeout_ms);
+    kv::MRHandle Handle() const;
+    size_t Capacity() const;
+};
+
+class FdTable {
+   public:
+    tl::expected<int, ErrorCode> Insert(uint64_t object_id);
+    tl::expected<uint64_t, ErrorCode> Resolve(int fd) const;
+    void Erase(int fd);
+};
+```
+
 ### 3.4 写路径
 
 ```cpp
@@ -804,21 +748,14 @@ AsuKvFsAdapter::BatchWriteAt(std::span<const FdIoRequest> requests) {
             break;
         }
 
-        std::vector<kv::KVBuffer> entries;
-        entries.reserve(n);
+        // 先把本组请求的 iov 收进 slot，再统一构造一批 entries。
         for (size_t k = 0; k < n; ++k) {
             const size_t i = begin + k;
             Gather(lease->Addr(k), requests[i].iov, requests[i].iovcnt,
                    totals[i]);
-            kv::KVBuffer entry{};
-            entry.key = MakeObjectKey(object_ids[i]);
-            entry.buffer.region = kv::MemoryRegion{
-                kv::MemoryType::HOST_PINNED, lease->Addr(k),
-                AlignUp(totals[i], kAsuAlignmentBytes)};
-            entry.buffer.handle = slots_.Handle();
-            entry.offset = 0;
-            entries.push_back(entry);
         }
+        auto entries = BuildKvBuffers(requests, object_ids, totals,
+                                      *lease, begin, n);
 
         kv::TaskId task_id{};
         auto submit = client_->BatchStoreAsync(entries, task_id);
@@ -878,22 +815,130 @@ void AsuKvFsAdapter::Gather(char* dst, const iovec* iov, int iovcnt,
 }
 ```
 
+#### 3.4.1 `BuildKvBuffers`：一批请求 → 一批 entries
+
+写和读共用同一个映射：一个 `FdIoRequest` 对应一个 `object_id`、一个 `kv::KVBuffer`；
+多个请求的 entries 放进同一个 `BatchStoreAsync` / `BatchLoadAsync`。
+
+```cpp
+std::vector<kv::KVBuffer> AsuKvFsAdapter::BuildKvBuffers(
+    std::span<const FdIoRequest> requests,
+    std::span<const uint64_t> object_ids,
+    std::span<const uint64_t> totals,
+    AsuKvSlotPool::Lease& lease,
+    size_t begin, size_t count) {
+    std::vector<kv::KVBuffer> entries;
+    entries.reserve(count);
+    for (size_t k = 0; k < count; ++k) {
+        const size_t i = begin + k;
+        kv::KVBuffer entry{};
+        entry.key = MakeObjectKey(object_ids[i]);
+        entry.buffer.region = kv::MemoryRegion{
+            kv::MemoryType::HOST_PINNED, lease.Addr(k),
+            AlignUp(totals[i], kAsuAlignmentBytes)};
+        entry.buffer.handle = slots_.Handle();
+        entry.offset = 0;   // 每对象一 key，offset 恒为 0
+        entries.push_back(entry);
+    }
+    return entries;
+}
+```
+
+说明：
+
+- `entries` 的数量就是本组请求数 `n`，不是“每个对象拆多条”；
+- 同一个 `BatchStoreAsync` / `BatchLoadAsync` 最多带 `n = min(slot_count, 剩余请求数)` 条；
+- `QueryAsync` / `DeleteAsync` 也是同样的批量模型：`vector<kv::CacheKey>` 一次传多个 oid。
+
 ### 3.5 读路径
 
 ```cpp
 std::vector<tl::expected<size_t, ErrorCode>>
 AsuKvFsAdapter::BatchReadAt(std::span<const FdIoRequest> requests) {
     std::vector<tl::expected<size_t, ErrorCode>> results(requests.size());
-    // 1. fd -> object_id；offset 必须为 0
-    // 2. total = Σiov_len；aligned = AlignUp(total, 512)
-    //    校验 aligned <= kAsuMaxObjectBytes 且 aligned <= slot_bytes
-    // 3. Acquire(1)；BatchLoadAsync([entry{key=oid, region=slot, size=aligned}])
-    // 4. Wait；OK -> Scatter 前 total 字节
-    //    缺失 -> FILE_NOT_FOUND；其他 -> MapKvStatus
-    //    超时 -> Poison
-    // 5. 成功返回 total
-}
+    std::vector<uint64_t> object_ids(requests.size(), 0);
+    std::vector<uint64_t> totals(requests.size(), 0);
+    std::vector<std::optional<ErrorCode>> failures(requests.size());
 
+    for (size_t i = 0; i < requests.size(); ++i) {
+        auto object_id = fd_table_.Resolve(requests[i].fd);
+        if (!object_id) { failures[i] = object_id.error(); continue; }
+
+        uint64_t total = 0;
+        for (int k = 0; k < requests[i].iovcnt; ++k)
+            total += requests[i].iov[k].iov_len;
+        if (total == 0 || requests[i].offset != 0 ||
+            AlignUp(total, kAsuAlignmentBytes) > kAsuMaxObjectBytes ||
+            AlignUp(total, kAsuAlignmentBytes) > asu_config_.slot_bytes) {
+            failures[i] = ErrorCode::INVALID_PARAMS;
+            continue;
+        }
+        object_ids[i] = *object_id;
+        totals[i] = total;
+    }
+
+    for (size_t begin = 0; begin < requests.size();) {
+        const size_t n = std::min(slots_.Capacity(), requests.size() - begin);
+        auto lease = slots_.Acquire(n, asu_config_.acquire_timeout_ms);
+        if (!lease) {
+            for (size_t k = begin; k < requests.size(); ++k)
+                failures[k] = lease.error();
+            break;
+        }
+
+        auto entries = BuildKvBuffers(requests, object_ids, totals,
+                                      *lease, begin, n);
+
+        kv::TaskId task_id{};
+        auto submit = client_->BatchLoadAsync(entries, task_id);
+        if (!submit.ok()) {
+            for (size_t k = 0; k < n; ++k)
+                failures[begin + k] = MapKvStatus(submit, IoDirection::Read);
+            lease->Release();
+            begin += n;
+            continue;
+        }
+
+        kv::TaskResult task_result;
+        auto wait = client_->Wait(task_id, asu_config_.wait_timeout_ms,
+                                  task_result);
+        if (!wait.ok() ||
+            task_result.status.code == kv::StatusCode::TIMEOUT ||
+            task_result.status.code == kv::StatusCode::TASK_NOT_FOUND) {
+            for (size_t k = 0; k < n; ++k)
+                failures[begin + k] = MapKvStatus(
+                    wait.ok() ? task_result.status : wait, IoDirection::Read);
+            lease->Poison();
+            begin += n;
+            continue;
+        }
+
+        for (size_t k = 0; k < n; ++k) {
+            const size_t i = begin + k;
+            const auto& status = k < task_result.entryStatus.size()
+                                     ? task_result.entryStatus[k]
+                                     : task_result.status;
+            if (!status.ok()) {
+                failures[i] = MapKvStatus(status, IoDirection::Read);
+                continue;
+            }
+            Scatter(lease->Addr(k), requests[i].iov, requests[i].iovcnt,
+                    totals[i]);
+        }
+        lease->Release();
+        begin += n;
+    }
+
+    for (size_t i = 0; i < requests.size(); ++i) {
+        results[i] = failures[i]
+                         ? tl::make_unexpected(*failures[i])
+                         : tl::expected<size_t, ErrorCode>{totals[i]};
+    }
+    return results;
+}
+```
+
+```cpp
 void AsuKvFsAdapter::Scatter(const char* src, iovec* iov, int iovcnt,
                              uint64_t total) {
     std::size_t copied = 0;
@@ -1101,39 +1146,16 @@ tl::expected<bool, ErrorCode> Client::IsExistData(const std::string& key) {
 
 | 用例编号 | 用例名称 | 前置条件 | 步骤 | 预期结果 | 依据/备注 |
 | --- | --- | --- | --- | --- | --- |
-| TC-01 | Init 注册成功 | Fake provider 可用 | 启动 FileStorage，配置 `object_file` + `asu` | 后端 Init 成功；`RegisterRegions` 返回非空 handle | 本方案 2.3.1；`kv_client_impl.cc:322-410` |
-| TC-02 | Init 注册失败 | Fake provider Init/Register 失败 | 启动 | `FileStorage::Init` 失败，不进入 ready | SFMEA-01/02 |
-| TC-03 | `object_id` 稳定性 | 同一 `key_namespace + object_key` | 两个进程/两次启动计算 oid | oid 一致；0 映射为 1；不同 namespace 不同 | 本方案 3.1 |
-| TC-04 | 路径解析 | 合法/非法 `file_path` | `ParseObjectId` | 合法返回 oid；非法返回 `INVALID_PARAMS` | 本方案 3.1 |
-| TC-05 | 1B 对象写读 | `object_size=1` | Put → 淘汰内存 → Get | 读回 1B；`aligned=512`；校验和通过 | 本方案 3.4/3.5 |
-| TC-06 | 最大对象 | `object_size=16,776,704` | Put → Get | 成功；`aligned=16,776,704` | 1.1；`kv_protocol.cc:192-215` |
-| TC-07 | 超限对象 | `object_size=16,776,705` | Put | `Allocate`/`WriteAt` 返回 `INVALID_PARAMS` | SFMEA-05 |
-| TC-08 | 非 512 对齐 | `object_size=16,776,703` | Put → Get | `aligned=16,776,704`；数据一致 | 本方案 2.2 |
-| TC-09 | 0 字节对象 | `object_size=0` | Put | `INVALID_PARAMS` | 本方案 3.2 |
-| TC-10 | 重 Put | 同一 key 已存在 | 再次 Put | 覆盖或先删后写成功；无 `ALREADY_EXISTED` 泄漏 | SFMEA-07；真机确认 |
-| TC-11 | 部分失败 | Fake provider 返回 `CQE_WRITE_FAULT` | Put | Put 失败；`PutRevoke` 释放账本；不发布对象 | SFMEA-06 |
-| TC-12 | Wait 超时 | Fake provider 延迟完成 | Put/Get | request 失败；slot Poison；后续不复用 | SFMEA-08 |
-| TC-13 | 读缺失 key | 先 `DeleteAsync([oid])` | Get | `FILE_NOT_FOUND`；不返回零数据 | SFMEA-09 |
-| TC-14 | 数据级 Exist=true | 对象已写入 | `IsExistData` | true；task OK + `ENTRY_KEY_EXIST` | 本方案 2.3.4 |
-| TC-15 | 数据级 Exist=false | key 不存在 | `IsExistData` | false；`ENTRY_KEY_NOT_EXIST` | 本方案 2.3.4 |
-| TC-16 | Query 分片失败 | Fake transport 分片失败 | `IsExistData` | `unexpected`，不能返回 false | SFMEA-10 |
-| TC-17 | 删除存在对象 | 对象已写入 | `Remove` | Master 元数据删除；`DeleteAsync([oid])` 成功 | 本方案 2.3.5 |
-| TC-18 | 删除不存在对象 | key 不存在 | `Remove` / `DeleteAsync` | 幂等成功（`KEY_NOT_EXIST` 归一） | `kvclient_deep_read.md` §11.9 |
-| TC-19 | Master Remove 后删除失败 | Fake provider 返回 Delete 错误 | `Remove` | 元数据已删；记录日志/metric；不留错误元数据 | SFMEA-11 |
-| TC-20 | RemoveAll | 多个对象 | `RemoveAll` | 只删元数据；文档化无物理删除 | SFMEA-12 |
-| TC-21 | 淘汰 | 达到高水位 | 触发 `PrepareEviction` | 候选按 LRU；删除后账本释放 | 本方案 2.3.6 |
-| TC-22 | 并发批量写读 | 多线程 `BatchWriteAt/BatchReadAt` | 并发执行 | TSAN/ASAN 干净；slot 计数守恒；无死锁 | 本方案 3.4/3.5 |
-| TC-23 | Master 重启 | 写入后重启 Master | 重启后 `IsExistData` / `Remove` | 已知 key 可查/删；`ScanMeta` 不可用 | SFMEA-15 |
-| TC-24 | Fake provider 端到端 | `seekp/read` fake | Put → 淘汰内存 → Get → Remove | 数据一致；`Delete` 后 `Query=0` | `fake_trans_provider.cc:386-456` |
-| TC-25 | posix/hf3fs 回归 | 现有 DFS 测试 | 跑原有测试 | 行为不变；`object_file` 分支不影响 shard/bucket | `UsesHostFilesystem` 默认 true |
-| TC-26 | 日志可定位 | 一次 Put/Get/Remove | 检查日志字段 | 每次操作有 `object_key/oid/task_id/stage/status/latency` | 本方案 2.5 |
+| TC-01 | Init 注册成功/失败 | Fake provider 可用；另注入 Init/Register 失败 | 启动 FileStorage，配置 `object_file` + `asu` | 成功：后端 ready、注册 handle 非空；失败：`FileStorage::Init` 失败，不进入 ready | 2.3.1；`kv_client_impl.cc:322-410` |
+| TC-02 | 对象身份与路径 | 同一 `key_namespace + object_key`；合法/非法 `file_path` | 两次计算 oid；`ParseObjectId` | oid 一致；0 映射为 1；不同 namespace 不同；非法路径返回 `INVALID_PARAMS` | 3.1 |
+| TC-03 | 写读边界 | `object_size` = 1 / 16,776,703 / 16,776,704 / 16,776,705 / 0 | Put → 淘汰内存 → Get | 1B、16,776,703、16,776,704 成功且字节一致；16,776,705 与 0 返回 `INVALID_PARAMS` | 1.1；`kv_protocol.cc:192-215` |
+| TC-04 | 批量写读 | 一批对象数 > `slot_count`（如 10） | `BatchWrite` → `BatchRead` | 一个 `FdIoRequest` 一个 entry；按 slot 分组提交 `BatchStoreAsync/BatchLoadAsync`；所有对象字节一致；slot 全部归还 | 3.4/3.4.1/3.5 |
+| TC-05 | 写部分失败 | Fake provider 返回 `CQE_WRITE_FAULT` | Put | Put 失败；`PutRevoke` 释放账本；不发布对象 | SFMEA-04 |
+| TC-06 | Wait 超时 | Fake provider 延迟完成 | Put/Get | request 失败；slot Poison；后续不复用 | SFMEA-06 |
+| TC-07 | 读缺失 key | 先 `DeleteAsync([oid])` | Get | `FILE_NOT_FOUND`；不返回零数据 | `kv_client.h:46`；`kvclient_deep_read.md` §16.2 |
+| TC-08 | 数据级 Exist | 对象已写入；删除后；Fake transport 分片失败 | `IsExistData` | 已写入 true；删除后 false；分片失败 `unexpected`（不能返回 false） | 2.3.4；SFMEA-07 |
+| TC-09 | 删除存在/不存在对象 | 对象已写入；另用不存在 key | `Remove` | 存在：元数据删除 + `DeleteAsync([oid])` 成功；不存在：幂等成功 | SFMEA-08；`kvclient_deep_read.md` §11.9 |
+| TC-10 | 删除失败/RemoveAll | Fake provider 返回 Delete 错误；多对象 | `Remove` / `RemoveAll` | 元数据已删；记录日志/metric；`RemoveAll` 只删元数据，不物理删除 | SFMEA-08 |
+| TC-11 | 并发批量写读 | 多线程 `BatchWriteAt/BatchReadAt` | 并发执行 | TSAN/ASAN 干净；slot 计数守恒；无死锁 | 3.4/3.5 |
+| TC-12 | 端到端与回归 | Fake provider；现有 posix/hf3fs DFS 测试 | Put → 淘汰内存 → Get → Remove；跑原有测试 | 数据一致；Remove 后 `Query=0`；原有 shard/bucket 行为不变 | `fake_trans_provider.cc:386-456` |
 
-边界组合（必须覆盖）：
-
-| 组合 | 期望 |
-| --- | --- |
-| `object_size` = 1 / 511 / 512 / 513 | `aligned` = 512 / 512 / 512 / 1024 |
-| `object_size` = 16,776,703 / 16,776,704 / 16,776,705 | 成功 / 成功 / 拒绝 |
-| `offset` = 0 / 1 | 接受 / `INVALID_PARAMS` |
-| `slot_bytes` < `object_size` | `INVALID_PARAMS`（配置校验/运行期保护） |
-| `object_id` = 0 | 映射为 1，写入成功 |
