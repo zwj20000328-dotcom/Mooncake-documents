@@ -1,11 +1,12 @@
-# Mooncake ASU 原生副本（ReplicaType::ASU=101）统一设计规范 v2.1：有序写 / 择优读 / 级联删
+# Mooncake ASU 原生副本（ReplicaType::ASU=101）统一设计规范 v2.3：有序写 / 择优读 / 级联删
 
-本文设计 Mooncake Store 的一种全新副本类型 `ReplicaType::ASU = 101`。ASU 通过 UCM 的 `kv::KvClient` 以 8 字节 key 与 512B 对齐的 offset 寻址，本设计让按 key 的写、读、查、删成为副本层面的一等操作，而不是文件系统语义或批量 offload 语义的模拟。v2.0 按三条要求重构了语义：**写**是「先写 memory、再写 ASU」的两阶段有序写，ASU 只在主层全部成功后进入，主层失败时零调用；**读**由 Master 返回全部可读副本、Client 按显式档位择优，选中 ASU 时直接走 `BatchLoadAsync` 批量读；**删**拆成两个方向相反的动词——删 memory 只删 memory，删 ASU 是整对象删除且必须先删 memory。Master 只铸造 48B 的 `AsuDescriptor` 并保有元数据权威，物理删除由 Master 自持的 delete-only `KvClient` 在租约宽限期后按 key 精确执行。文档覆盖需求与场景、逻辑模型与类图、交互与时序、SFMEA 与可定位设计、12 个 shard 的实现级设计以及开发自验证用例，并集中列出未经真机验证的 go/no-go 假设与需用户裁决的前提性冲突。
+本文设计 Mooncake Store 的一种全新副本类型 `ReplicaType::ASU = 101`。ASU 通过 UCM 的 `kv::KvClient` 以 8 字节 key 与 512B 对齐的 offset 寻址，本设计让按 key 的写、读、查、删成为副本层面的一等操作，而不是文件系统语义或批量 offload 语义的模拟。v2.0 按三条要求重构了语义：**写**是「先写 memory、再写 ASU」的两阶段有序写，ASU 只在主层全部成功后进入，主层失败时零调用；**读**由 Master 返回全部可读副本、Client 按显式档位择优，选中 ASU 时直接走 `BatchLoadAsync` 批量读；**删**拆成两个方向相反的动词——删 memory 只删 memory，删 ASU 是整对象删除且必须先删 memory。v2.3 进一步把粒度收敛为「一个对象一个 key 一条 entry、offset 恒 0」，并只使用 batch 接口。Master 只铸造 40B 的 `AsuDescriptor` 并保有元数据权威，物理删除由 Master 自持的 delete-only `KvClient` 在租约宽限期后按 key 精确执行。文档覆盖需求与场景、逻辑模型与类图、交互与时序、SFMEA 与可定位设计、12 个 shard 的实现级设计以及开发自验证用例，并集中列出未经真机验证的 go/no-go 假设与需用户裁决的前提性冲突。
 
 ## 目录
 
-- [v2.0 变更摘要](#v20-变更摘要)
-- [v2.1 变更摘要](#v21-变更摘要)
+- [v2.0 变更摘要（历史）](#v20-变更摘要)
+- [v2.1 变更摘要（历史）](#v21-变更摘要)
+- [v2.3 变更摘要（现行）](#v23-变更摘要)
 - [1. 概述](#1-概述)
   - [1.1 需求分析](#11-需求分析)
     - [1.1.1 背景与目标](#111-背景与目标)
@@ -34,7 +35,7 @@
     - [2.3.3 读取阶段（Master 返回全集、Client 择优、ASU 批量读）](#233-读取阶段master-返回全集client-择优asu-批量读)
     - [2.3.4 查询阶段](#234-查询阶段)
     - [2.3.5 删除阶段（删 memory 与删 ASU 两条流程）](#235-删除阶段删-memory-与删-asu-两条流程)
-    - [2.3.6 分块 512B 对齐 长度权威 与逐 entry 预检的落点](#236-分块-512b-对齐-长度权威-与逐-entry-预检的落点)
+    - [2.3.6 512B 对齐 长度权威 与逐 entry 预检的落点](#236-512b-对齐-长度权威-与逐-entry-预检的落点)
   - [2.4 SFMEA 分析](#24-sfmea-分析)
   - [2.5 可定位设计](#25-可定位设计)
     - [2.5.1 全流程生命周期 Debug 日志](#251-全流程生命周期-debug-日志)
@@ -69,9 +70,9 @@
   - [3.11 Master 集成（分配、终态、级联删除、恢复）](#311-master-集成分配终态级联删除恢复)
     - [分配：门槛之后、返回之前铸造](#分配门槛之后返回之前铸造)
     - [终态：ALL 谓词必须含 ASU](#终态all-谓词必须含-asu)
-    - [回收：FreeAsuReplicas 与 11 个挂点](#回收freeasureplicas-与-11-个挂点)
+    - [回收：FreeAsuReplicas 挂点与 ASU 删除权收口](#回收freeasureplicas-挂点与-asu-删除权收口)
     - [删 ASU：整对象删除 + memory→ASU 有序级联](#删-asu整对象删除--memoryasu-有序级联)
-    - [删 memory：新增 RemoveReplicaTier](#删-memory新增-removereplicatier)
+    - [删 ASU：新增 BatchRemoveAsuObjects（捕获→既有 Remove→入队）](#删-asu新增-batchremoveasuobjects捕获既有-remove入队)
     - [为什么不用 EvictDiskReplica](#为什么不用-evictdiskreplica)
     - [Upsert](#upsert)
     - [恢复](#恢复)
@@ -106,7 +107,7 @@
 
 | 项目 | 内容 |
 | --- | --- |
-| 版本 | v2.1 |
+| 版本 | v2.3 |
 | 日期 | 2026-11-05 |
 | 状态 | 待评审 |
 | 适用代码基线 | Mooncake main（起始 HEAD 522b716e）；KvClient SDK 基线 `D:/xiaojun/work/DramPool/unified-cache-management/kv_semantics` |
@@ -115,24 +116,25 @@
 
 > **跨节一致性裁决（装配说明）**：以下为分节写作与装配中发现、已统一或如实保留的跨节差异，读者可据此判断各节口径。
 >
-> 1. **`AsuDescriptor` 线格式**：全文统一为 **48B（含 `uint64_t object_epoch`）**，以 §3.9 的 `static_assert(sizeof(AsuDescriptor) == 48)` 为准。v1.0 曾出现的 40B 说法作废；`object_epoch` 参与 key 派生与记录头校验，是承重字段。
-> 2. **单 task 批量上限**：设计同时要求「同一对象全部 chunk 在一个 task 内提交」与「`kBatchMaxEntries=110`、`kBatchMaxBytes=64MiB`」，两者对 4GiB 对象不可同时成立。§3.6 按字节/条数预算切多个 task，并保证 chunk 0 最后单独提交；H10 的「单 `viewSnapshot`」因此只在每个 task 内成立。
-> 3. **删除接口签名**：§2.1 只列 `QueryObject`/`DeleteObject`，§3.6 补充 `DeleteObjects(std::span<const AsuDescriptor>)` 与 `Shutdown()`，供 GC 批量删除与生命周期关闭使用；`DeleteObject` 语义上以 key 为单位，一次删除该对象全部 chunk。
-> 4. **物理存在性粒度**：`QueryAsync` 的 `exists` 是 key 级位图，不能发现中间 chunk 缺失；物理存在性仅用于诊断与错误归因，不是 Mooncake 可见性权威。
-> 5. **delete-only 就绪语义**：§3.6 的 `IsReady() = initialized_ && (!register_staging_ || (arena_ != nullptr && arena_->IsAvailable()))`；§2.3.1 的 probe `Query` 用于启动探活，二者共同构成 Master 侧就绪判定。
-> 6. **默认部署可达性**：CACHELIB 默认 `kMaxSliceSize` 约 16MiB，使默认部署下 `N=1`、多 chunk 路径几乎不可达；§2.2/§2.3 的多 chunk 图只在直接单测或非 CACHELIB 配置下可执行，见第 6 章。
-> 7. **删除宽限期**：正文采用 `release_at = max(now, not_before) + max(default_kv_lease_ttl_, asu_delete_grace_ms)`；第 6 章保留「lease TTL 大于 grace」的原始张力，提请用户裁决。
-> 8. **§4.5/§4.6 与第 5/6 章的关系**：§4.5 是「假设到测试用例」的映射，§4.6 是测试维度发现的前提性冲突；第 5、6 章是规范化汇总与裁决入口，两者条目存在少量差异时以第 5、6 章为准。
-> 9. **分块公式的实现唯一性**：§3.1 的 `constexpr` 函数是唯一实现，§2.1 的 `AsuChunkPlanner` 仅为面向对象门面；实现时应只保留一份公式来源，避免两处漂移。
-> 10. **`replica_id` 透传**：记录头含 `replica_id` 字段，但 §3.6 的 `WriteObject`/`Encode` 目前以 0 填充，`ReplicaID` 位于 `Replica::Descriptor` 外层而未传入；该字段仅作诊断与 Master 日志对账，不影响读端正确性。
-> 11. **写序屏障只覆盖 MEMORY / NOF**：`NonDfsTransfersSucceeded`（client_service.cpp:321-327）不含 DFS；且 `asu_replica_num > 0` 时白名单要求 `dfs_replica_num == 0`，因此 ASU 与 DFS 不会并存，§2.1 图 1 中不存在 `DFSW → 屏障` 的边。
-> 12. **`AsuDeleteQueue` 的取用 API**：全文统一为 `TakeDue(now, max_items)`，返回 `std::vector<AsuDeleteItem>`；`timeout` 属于 GC 线程的条件变量等待，不属于队列（§3.8）。
-> 13. **读择优的调用面**：`SelectBestReplica` 在 `real_client.cpp` 共 6 个调用点；其中 4 个全对象入口（4036、4425、6776、8440）显式传 `ReadSelectionPolicy`，range（5635）与 SSD prefetch（8333）保持默认 `asu_available=false`（见 §4.6 第 4 条）。
-> 14. **术语**：记录头字段叫 `key_id`，派生物理 key 叫 `asu_key_id`；`ReplicaReadRank` 中 ASU 固定第 5 档；`TIERED_MEMORY_THEN_ASU`、`asu_degraded`、`not_before`、`RemoveReplicaTier`、`RemoveMemoryReplica` 为全文统一名称。内存注册相关术语：`RegisteredMemory`（注册返回项，含 `region` / `handle` / `tokenId`）、**canonical handle**（`RegisterRegions` 返回、被所有 `Slot::handle` 逐字拷贝的 `MRHandle`）、`tokenId`（设备侧 UB token 或 RDMA rkey，仅诊断）、`mrKey`（`KVBuffer` 的本地内存凭证，由 SDK 按 handle 回填，调用方必须留空）、`build-entry`（`BuildEntry` 构造 `kv::KVBuffer` 的动作，Store/Load 共用）。
+> 1. **`AsuDescriptor` 线格式**：全文统一为 **40B**（`key_id`、`key_fingerprint`、`object_epoch`、`object_size`、`record_version`、`flags`，4×`uint64_t` + 2×`uint32_t`），以 §3.9 的 `static_assert(sizeof(AsuDescriptor) == 40)` 为准。v2.3 按要求删除 `chunk_payload`/`chunk_count`，不保留占位字段；v1.0/v2.1 的 48B 说法作废。
+> 2. **一个对象 = 一个 key = 一条 entry**：`offset` 恒为 0，`wire_len = 512 + AlignUp(object_size, 512)`，单 entry 上限 16,776,704 B。单 task 的条数与字节上限只约束跨对象打包，绝不切开单个对象。
+> 3. **删除接口**：删 memory 复用既有 `Client::Remove` / `BatchRemove` / `MasterService::RemoveObject`，一行不改（删 memory 与元数据、不触达 ASU）；删 ASU 是新增 `Client::BatchRemoveAsuObjects(keys, force)` 与 Master 同名方法，内部先捕获 `AsuDescriptor`、再调用既有 Remove、最后入队。v2.0 的 `RemoveReplica` RPC、`RemoveMemoryReplica`、`RemoveReplicaTier` 全部删除。
+> 4. **物理存在性粒度**：`QueryAsync` 的 `exists` 是 key 级位图，恰好对应「该对象唯一 entry 是否存在」；它仍是诊断信息，不是 Mooncake 可见性权威。
+> 5. **delete-only 就绪语义**：`IsReady() = initialized_ && (!register_staging_ || (arena_ != nullptr && arena_->IsAvailable()))`；§2.3.1 的探活用于启动探测。
+> 6. **对象上限与 1,008 B 窗口**：ASU 有效对象上限是 **16,776,192 B**（= 16,776,704 − 512），比 CACHELIB 名义上限 `kMaxSliceSize = 16,777,200 B`（`types.h:468-469`）少 **1,008 B**。窗口 `(16,776,192, 16,777,200]` 由 `PrepareWriteStart` 的 ASU 校验显式拒绝为 `ASU_OBJECT_TOO_LARGE`；`S > 16,777,200` 时 CACHELIB 检查先返回 `INVALID_PARAMS`。不得写成「约 16 MiB」。
+> 7. **删除宽限期**：`release_at = max(now, not_before) + max(default_kv_lease_ttl_, asu_delete_grace_ms)`；第 6 章保留「lease TTL 大于 grace」的原始张力。
+> 8. **§4.5/§4.6 与第 5/6 章的关系**：§4.5 是假设到用例的映射，§4.6 是测试维度发现的前提性冲突；条目差异以第 5、6 章为准。
+> 9. **批量切分的唯一实现**：§3.1 的 `PlanBatches` 纯函数是「按对象边界、按条数与字节切 task」的唯一实现；其他章节只引用它，不另写公式。
+> 10. **`replica_id` 透传**：记录头含 `replica_id`，但 §3.6 的 `BatchStoreObjects` 目前以 0 填充；该字段仅作诊断与 Master 日志对账。
+> 11. **写序屏障只覆盖 MEMORY / NOF**：`NonDfsTransfersSucceeded`（`client_service.cpp:321-327`）不含 DFS；`asu_replica_num > 0` 时白名单要求 `dfs_replica_num == 0`。
+> 12. **`AsuDeleteQueue` 取用 API**：全文统一为 `TakeDue(now, max_items)`，返回 `std::vector<AsuDeleteItem>`。
+> 13. **读择优调用面**：`SelectBestReplica` 在 `real_client.cpp` 共 6 个调用点；4 个全对象入口传 `ReadSelectionPolicy`，range 与 SSD prefetch 保持默认 `asu_available=false`。
+> 14. **术语**：记录头字段叫 `key_id`，派生物理 key 叫 `asu_key_id`；ASU 固定第 5 档；`TIERED_MEMORY_THEN_ASU`、`asu_degraded`、`not_before`、`BatchRemoveAsuObjects` 为全文统一名称。内存注册术语不变。
+> 15. **仅支持 batch**：写只用 `BatchStoreAsync`、读只用 `BatchLoadAsync`、查用 `QueryAsync`、删用 `DeleteAsync`；`StoreAsync`/`LoadAsync` 不出现在任何接口或调用点。适配层只暴露 `BatchStore`/`BatchLoad`（或 `SubmitLoad`+`WaitTask`）/`Query`/`Delete`，存储后端只暴露 `BatchStoreObjects`/`BatchLoadObjects`/`BatchIsExist`/`BatchRemoveObjects`；单对象调用退化为批量为 1，不另设单条分支。
 
 ## v2.0 变更摘要
 
-v2.0 把 ASU 从 v1.0「与 memory 并行的同步副本」改为「memory 全部成功之后的第二个有序写阶段」，新增写模式 TIERED_MEMORY_THEN_ASU。为保住要求 3 的可定义性，v2 收紧配置：asu∈{0,1}，>0 时要求 replica_num>=1 且 nof==0、dfs==0，保证「有 ASU 必有 memory 主副本」。失败语义定为分层降级：主层成功而 ASU 失败 → PutEnd(MEMORY)+PutRevoke(ASU)、Put 返回成功并记 asu_degraded；主层失败 → ASU 零调用 + PutRevoke(ALL)。读侧 Master 不改（GetReadableReplicaDescriptors 已返回全部可读副本），Client 用显式 ReplicaReadRank 选择，ASU 固定第 5 档（LOCAL_DISK 之后、DFS 之前），选中后直接走 BatchLoadAsync，默认每对象一个 task。删除侧把「删 ASU」定义为整对象 Remove 的有序级联（memory 先、ASU 后），把「删 memory」定义为新增 RemoveReplica(MEMORY) 严格路径；物理删除仍由 AsuDeleteQueue/AsuGcWorker/Master delete-only KvClient 唯一承担，EvictDiskReplica 不扩白名单。本轮修掉三个致命缺陷：PutEnd/PutRevoke 的 ALL 谓词不含 ASU、Upsert Case B 绕过 ASU 分配、ASU 方向 finalize 错误被当成整体失败。结构上不引入 end_types 向量化，并复用 CheckRemovable、is_busy、BatchReplicaClear、RegisterPooledHandlers 等既有机制。
+v2.0 把 ASU 从 v1.0「与 memory 并行的同步副本」改为「memory 全部成功之后的第二个有序写阶段」，新增写模式 TIERED_MEMORY_THEN_ASU。为保住要求 3 的可定义性，v2 收紧配置：asu∈{0,1}，>0 时要求 replica_num>=1 且 nof==0、dfs==0，保证「有 ASU 必有 memory 主副本」。失败语义定为分层降级：主层成功而 ASU 失败 → PutEnd(MEMORY)+PutRevoke(ASU)、Put 返回成功并记 asu_degraded；主层失败 → ASU 零调用 + PutRevoke(ALL)。读侧 Master 不改（GetReadableReplicaDescriptors 已返回全部可读副本），Client 用显式 ReplicaReadRank 选择，ASU 固定第 5 档（LOCAL_DISK 之后、DFS 之前），选中后直接走 BatchLoadAsync。删除侧 v2.0 曾把「删 ASU」定义为整对象 Remove 的有序级联、把「删 memory」定义为新增 RemoveReplica(MEMORY) 严格路径——**该删除方案已在 v2.3 整体作废**（plain Remove 不复用为删 ASU，新增 BatchRemoveAsuObjects）。物理删除仍由 AsuDeleteQueue/AsuGcWorker/Master delete-only KvClient 唯一承担，EvictDiskReplica 不扩白名单。本轮修掉三个致命缺陷：PutEnd/PutRevoke 的 ALL 谓词不含 ASU、Upsert Case B 绕过 ASU 分配、ASU 方向 finalize 错误被当成整体失败。结构上不引入 end_types 向量化，并复用 CheckRemovable、is_busy、BatchReplicaClear、RegisterPooledHandlers 等既有机制。
 
 ### 本轮已裁决事项（19 项）
 
@@ -148,14 +150,14 @@ v2.0 把 ASU 从 v1.0「与 memory 并行的同步副本」改为「memory 全�
 | 8 | ASU 对象与 Upsert | UpsertStart 在 Case B 判定前短路：asu>0 或已有 ASU 或没有 COMPLETE memory → 强制 Case C；同时把 5986-5995 的租约闸门从「任何非 memory 副本」收窄为 DISK/LOCAL_DISK/DFS。 | Case B（master_service.cpp:5999-6040）原地复用、不调用 AllocateReplicas，会让请求 ASU 却没有 ASU 副本的对象在 finalize 被整体回滚（证伪者 F1）；强制 Case C 恢复 v1.0 FMEA-13 的换 epoch 规则。ASU 读走 descriptor 的 key_id+epoch，替换后旧 descriptor 仍有效，故 Case C 对 ASU 安全。 |
 | 9 | 读档位与 tie-break | local MEMORY(0)<local NOF(1)<remote MEMORY(2)<remote NOF(3)<LOCAL_DISK(4)<ASU(5)<DFS(6)<DISK(7)；同档平手后出现者胜出。 | ASU 读需 staging+BatchLoad+Wait+回填，胜不过直连 RDMA 的 MEMORY/NOF，也比不过 LOCAL_DISK 零拷贝 offload；只优于 DFS/DISK。last-wins 保持 tests/pybind_client_test.cpp:188-262 的既有断言，避免改测试或行为回归。 |
 | 10 | ReadReplicaSelector 改造范围 | 仅当列表含 ASU、或既有 affinity+RDMA 条件成立时才走 SelectBestReplica；其余维持 FindFirstCompleteReplica。 | 真实路径上 real_client 已先做 best-select，且 FilterQueryResult 把非 memory 收缩成单元素；全局 always-best 会改变非 RDMA/affinity-off/tcp 部署行为，并给每次读加 GetLocalEndpoints() 的锁，超出要求 2 的必要范围。 |
-| 11 | 批量读打包粒度 | 默认每对象一个 BatchLoadAsync（该对象全部 chunk 在同一 task），多对象按 `staging_slots` 在飞上限分批 submit 并逐个 Wait；不提供跨对象合并。 | 用户要求的「批量读」由 BatchLoadAsync 承接；SDK 在 BuildTransportTasks 阶段做全 key 路由校验，任一 key 不可路由会把整 task 的 entryStatus 置错，跨对象合并放大爆炸半径；H15/H16 均未真机验证。跨对象合并属范围外特性，不设配置开关。 |
+| 11 | 批量读打包粒度 | 按对象边界把多个对象合并进同一 `BatchLoadAsync`：条数 ≤ `min(batch_max_entries=110, staging_slots)` 且字节 ≤ `batch_max_bytes=64 MiB`；超限时在对象边界切 task，绝不切开单个对象。 | 用户要求「只支持 batch」；多个对象合并可摊薄 task 开销，且每个对象只贡献一条 entry，不存在同对象跨 task。早期「每对象一个 task、不跨对象合并」的裁决作废（v2.3）。 |
 | 12 | ASU 是否支持前缀/截断读 | 不支持。入口要求 slices >= object_size，否则 INVALID_PARAMS；废弃 v1.0 的截断读跳过 payload CRC 分支与 asu_partial_read_crc_skipped_total。 | 所有已接线入口都不会给 undersized slices，截断分支是死路径；保留会与 memory 副本在 TransferRead（client_service.cpp:5180-5185）的尺寸契约不一致。全对象读使 payload CRC-32C 永远可校验。 |
 | 13 | staging arena 耗尽 | 区分「瞬时占满」与「永久隔离」：数据面 `Acquire` 等待、`AcquireBatch` 原子预留，超时返回 `BUFFER_OVERFLOW`；只有全部 slot 都已 quarantine 时才立即 `ASU_SERVICE_UNAVAILABLE`，并让 `IsReady()`/`AsuReadAvailable()` 变假。 | v1.0 的 slot 进程生命周期内永不复用，默认 `staging_slots=8`。若把「free slots==0」当不可恢复，默认配置下 9 个对象的 BatchGet 会让第 9 个失败；把瞬时繁忙与永久隔离分开后，批量读可以超过 slot 数，只有真正耗尽才降级。 |
-| 14 | 「删 ASU」的 API 语义 | 不新增 RemoveAsu；「删 ASU」= 现有 Client::Remove / MasterService::RemoveObject 的整对象删除，并在其中实现 memory→ASU 有序级联。 | 用户明确删 ASU 要先删 memory，终态必然无副本、对象消失，等价整对象删除。单设 RemoveAsu 会让「无 ASU 时 no-op 还是先删 memory」无正确答案，且易误删唯一主副本。 |
-| 15 | 「删 memory」的 API | 新增 RPC RemoveReplica(key,tenant,replica_type,force) 与 Client::RemoveMemoryReplica，只接受 MEMORY；Master 新增 RemoveReplicaTier，走 master_state_mutex_+CheckRemovable+is_busy 保护+单谓词 pop；不扩展 EvictDiskReplica。 | EvictDiskReplicaImpl 是纯元数据通知路径，无 CheckRemovable、无 master_state_mutex_、无 delayed release、target_pred 依赖 LOCAL_DISK 的 client_id（master_service.cpp:6215-6336）；BatchReplicaClear 的 segment 语义不适配按类型删除。新路径约 130 行 RPC 样板。 |
+| 14 | 「删 ASU」的 API 语义 | 新增 `BatchRemoveAsuObjects(keys, force)`：先捕获每个 key 的 `AsuDescriptor`，再调用既有 `Remove` / `BatchRemove`（一行不改，仍只删 memory 与元数据），最后把捕获到的 descriptor 入 `AsuDeleteQueue`。 | 用户要求「删 ASU」必须先删 memory，且现有按 key 删 memory 的路径不得改动；新函数把「捕获→现有 Remove→删 ASU」闭合在一处。v2.0 的「不新增 RemoveAsu」裁决作废。 |
+| 15 | 「删 memory」的 API | 复用既有 `Client::Remove` / `BatchRemove` / `MasterService::RemoveObject`，一行不改：删 memory 与元数据、不触达 ASU。不再新增任何 RPC 或 Client 方法。 | 用户明确现有按 key 删 memory 的路径本身正确，只是没有到达后端；「删 memory 只删 memory」正是它今天的行为。v2.0 新造的 `RemoveReplica` RPC、`Client::RemoveMemoryReplica`、`MasterService::RemoveReplicaTier` 与约 130 行 RPC 样板全部删除（v2.3）。 |
 | 16 | 物理删除执行者 | 保留 AsuDeleteQueue+AsuGcWorker+Master delete-only KvClient 为唯一通道；EvictDiskReplica 一行不改。 | ASU 是网络可寻址 key、无 owner，LOCAL_DISK 的「client 删文件、Master 删元数据」分工（storage_backend.cpp:996-1017、file_storage.cpp:681-719）不可平移；DeleteAsync 只需 key（kv_client.h:50）。 |
-| 17 | 「先删 memory」的落点 | EraseMetadata 先捕获 ASU descriptor，再 FreeDfsReplicas/记账并 hold.TearDown()（memory buffer 释放），最后 EnqueueAsuDeletes；HA 在 FinalizeRemovedReplicasAfterDurable 内按 memory→其余 两段 pop。不变量分层：非 HA 只保证「物理删除的入队顺序」，HA 才保证「元数据移除顺序」。 | 现有 EraseMetadata 在 2110 调 FreeDfsReplicas 早于 TearDown，照抄会让 ASU 入队早于 memory 释放，与要求相反；捕获后延迟入队几行即可覆盖所有 accessor.Erase() 路径。HA 一次 pop 全部 id（1780-1795），必须拆段。非 HA 的 TearDown 一次 reset 整个 record（object_route.h:826-833），故不能声称元数据移除顺序。 |
-| 18 | FreeAsuReplicas 挂点 | 11 点全部与 FreeDfsReplicas 成对并加 not_before 参数；2110 改为捕获→teardown→入队；9535/9623 是直接 PopReplicas 路径必须字面配对。 | 证伪者核对发现 9531-9537 与 9611-9625 不经过 1753，v1.0「由 1753 自动覆盖」不成立；not_before 用既有 discarded_replicas_ 的 TTL 语义，解决 Wait 超时后 DMA 仍在飞导致的「删完又写回」。 |
+| 17 | 「先删 memory」的落点 | 既有 `Remove` / `EraseMetadata` 不捕获、不入队 ASU（plain Remove 后 ASU 成为孤儿）；只有新增 `BatchRemoveAsuObjects` 在捕获 descriptor 后调用既有 Remove，再入队 ASU。HA 在 `FinalizeRemovedReplicasAfterDurable` 内按 `enqueue_asu_deletes` 标志决定是否入队。 | 用户要求「删 memory 只删 memory」，因此 plain Remove 绝不能触发 ASU 物理删除。拥有 ASU 物理删除权的入口收口到 `BatchRemoveAsuObjects`（v2.3）。 |
+| 18 | FreeAsuReplicas 挂点 | 真实丢弃 ASU 的挂点（1753、1795、1844、1907、5257、5897、6099、7080、9535、9623）与 `FreeDfsReplicas` 成对并加 `not_before`；2110（EraseMetadata）**移出**，plain Remove 不触达 ASU。 | 2110 若继续入队会让 plain Remove 误删 ASU，违反「删 memory 只删 memory」；9531-9537 与 9611-9625 不经过 1753，必须字面配对（v2.3）。 |
 | 19 | object_epoch 单调性 | AsuAllocator 维护全局原子 64-bit epoch，进程启动用随机种子，每次分配自增；恢复时推进到已恢复 descriptor 最大 epoch+1，绝不回退。 | v1.0 依赖新 epoch 参与 key 派生避免迟到 Delete 误删新世代，但未规定 epoch 存在哪里；全局单调+随机种子同时解决进程内不重复与重启不重叠（H13），不引入持久化。 |
 
 ### v1.0 语义废弃与修改摘要
@@ -171,11 +173,11 @@ v2.0 把 ASU 从 v1.0「与 memory 并行的同步副本」改为「memory 全�
 | 前缀/截断读跳过 payload CRC 与 `asu_partial_read_crc_skipped_total` | 废弃 | 所有接线入口都给 `object_size` 大小 slices，截断分支是死路径 |
 | `TransferRead` 内新增 ASU size 分支 | 废弃 | 入口已显式拒绝 ASU，size 分支是死代码 |
 | `AsuDeleteQueue` / `AsuGcWorker` / Master delete-only `KvClient` | 保留 | ASU 无 owner、网络可寻址，物理删除只能由 Master 侧 delete-only `KvClient` 执行 |
-| `FreeAsuReplicas` 的 11 个挂点 | 修改 | 全部保留并加 `not_before`；2110 改为「捕获→TearDown→入队」；9535/9623 为直接 `PopReplicas` 路径 |
+| `FreeAsuReplicas` 的挂点 | 修改 | 真实丢弃 ASU 的挂点保留并加 `not_before`；2110 移出（plain Remove 不入队）；9535/9623 为直接 `PopReplicas` 路径 |
 | 含 ASU 的 Upsert 强制 Case C | 保留 | Case B 原地复用不分配 ASU 且复用旧 epoch；v2 在 Case B 判定前短路 |
-| `AsuDescriptor` 48B（含 `object_epoch`） | 保留 | `object_epoch` 参与 key 派生与记录头校验；40B 说法作废 |
+| `AsuDescriptor` 40B（含 `object_epoch`，无 chunk 字段） | 修改 | v2.3 删除 `chunk_payload`/`chunk_count`，改为 4×`uint64_t` + 2×`uint32_t` = 40B；`object_epoch` 参与 key 派生与记录头校验；48B 说法作废 |
 | staging slot 超时后进程生命周期内永不复用 | 修改 | 保留 quarantine，但区分「瞬时占满（等待）」与「全部隔离（不可服务）」 |
-| `EvictDiskReplica` 扩展白名单承载 ASU/MEMORY 删除 | 废弃 | 纯元数据路径，缺 lease/完成度/refcnt 保护与物理删除；改走 `RemoveObject` 级联 + `RemoveReplicaTier` |
+| `EvictDiskReplica` 扩展白名单承载 ASU/MEMORY 删除 | 废弃 | 纯元数据路径，缺 lease/完成度/refcnt 保护与物理删除；删 ASU 改走 `BatchRemoveAsuObjects`（先捕获→现有 Remove→入队） |
 
 
 ## v2.1 变更摘要
@@ -185,7 +187,27 @@ v2.1 是 v2.0 的增量修订，输入是用户本轮的四条答复，不改变
 1. **目标场景不需要 ASU-only 或 ASU+NOF**：v2.0 的配置白名单原样确认（`asu∈{0,1}`；>0 时要求 `replica_num>=1`、`nof==0`、`dfs==0`，否则 `INVALID_PARAMS`），不再作为待裁决项。
 2. **新增严格/降级配置项**：`AsuConfig::require_asu`（env `MOONCAKE_ASU_REQUIRED`，默认 false）。false 为分层降级——主层成功、ASU 失败时 `PutEnd(MEMORY)` + `PutRevoke(ASU)`，Put 成功并记 `asu_degraded_total`；true 为整体失败——`PutRevoke(ALL)`，Put 返回失败，错误码取 `first_asu_error`。开关只约束 `TIERED_MEMORY_THEN_ASU` 写，`asu_replica_num == 0` 的普通 Put 不受影响。
 3. **写/读前的内存注册与 entry 构建**：`RegisterRegions` 必须在任何 `BatchStoreAsync`/`BatchLoadAsync` 之前完成；`KVBuffer.mrKey` 由 SDK 在 `SubmitAsync` 中按 `buffer.handle` 解析，调用方填写会被重置；`RegisteredMemory.tokenId` 仅用于诊断。详细注册与 entry 构造规则见 §3.4.1（注册什么、四条注册判据与结果存放）与 §3.5.1（`KVBuffer` 逐字段归属、`mrKey` 由 SDK 解析、`buffer.handle` 必须取 canonical handle），另见 §2.3.1 第 10-11 条与 §4.1 的 TC-134～TC-139；本修订覆盖配置项、终态与 reg-entry。
-4. **`kMaxSliceSize` 约 16 MiB 是正确的**：不豁免，对象上限约 16 MiB，多 chunk 路径在默认部署不可达，作为已知约束保留。
+4. **`kMaxSliceSize` 的前置约束是正确的**：不豁免。ASU 有效对象上限是 **16,776,192 B**（= 16,776,704 − 512）；CACHELIB 名义上限 `kMaxSliceSize = 16,777,200 B`，二者相差 **1,008 B**。`(16,776,192, 16,777,200]` 窗口由 `PrepareWriteStart` 的 ASU 校验显式拒绝为 `ASU_OBJECT_TOO_LARGE`，不得写成「约 16 MiB」。
+
+## v2.3 变更摘要
+
+v2.3 是 v2.1 的增量修订，输入是用户本轮四条纠正，不改变「有序写 / 择优读 / 级联删」架构。
+
+1. **取消分块**：一个 Mooncake object = 一个 ASU key = 一条 entry，`offset` 恒为 0，`wire_len = 512 + AlignUp(object_size, 512)`。删除 `kChunkPayloadBytes`/`kChunkStrideBytes`/`kMaxChunks`、`AsuChunkPlanner`、descriptor 与记录头的 chunk 字段、以及「chunk 0 最后写当提交点」整套机制。单 key 最大 object = **16,776,192 B**；CACHELIB `kMaxSliceSize = 16,777,200 B`，存在 **1,008 B** 窗口，由 `PrepareWriteStart` 显式拒绝为 `ASU_OBJECT_TOO_LARGE`。
+2. **删除复用现有 Remove**：`Client::Remove`/`BatchRemove`/`MasterService::RemoveObject` 一行不改；新增 `BatchRemoveAsuObjects(keys, force)`，内部先捕获 `AsuDescriptor`、再调用既有 Remove、最后入 `AsuDeleteQueue`。删除凭空造的 `RemoveReplica` RPC、`Client::RemoveMemoryReplica`、`MasterService::RemoveReplicaTier`。
+3. **命名对齐 Mooncake**（现名 → 新名 → 依据）：
+
+| 现名 | 新名 | 依据（Mooncake 既有同构符号） |
+| --- | --- | --- |
+| `WriteObject` | `BatchStoreObjects` | `StorageBackend::StoreObject`（storage_backend.h:437/449/461） |
+| `ReadObjects` / `ReadObject` | `BatchLoadObjects`（`ReadObject` 删除） | `StorageBackend::LoadObject`（storage_backend.h:479/490） |
+| `QueryObject` | `BatchIsExist` | `StorageBackendInterface::IsExist`（storage_backend.h:284）、`Client::IsExist`（client_service.h:532） |
+| `DeleteObject` / `DeleteObjects` | `BatchRemoveObjects` | `Client::BatchRemove`（client_service.h:441）、`MasterService::RemoveObject`（master_service.cpp:7175） |
+| `IAsuKvClient` | `AsuKvClientInterface` | `StorageBackendInterface` 的 `*Interface` 命名 |
+| `AsuReadOutcome` | `AsuReadResult` | `*Result` 值类型命名 |
+| `AsuStorageBackend` | 保留 | `NvmeKvStorageBackend` / `DistributedStorageBackend` |
+| `AsuStagingArena` / `AsuAllocator` / `AsuDeleteQueue` / `FreeAsuReplicas` / `BuildEntry` | 保留 | `FreeDfsReplicas`、`BuildRemainingReplicaDescriptors`/`BuildBucket` 等先例 |
+4. **只支持 batch**：写只用 `BatchStoreAsync`、读只用 `BatchLoadAsync`、查用 `QueryAsync`、删用 `DeleteAsync`；多个对象按对象边界合并进同一 task（条数 ≤ `batch_max_entries` 且 ≤ `staging_slots`，字节 ≤ 64 MiB），逐 entry `entryStatus` 回填到每个对象；task 级 CANCELED/超时必须整批判失败。
 
 ## 1. 概述
 
@@ -199,7 +221,7 @@ Mooncake Store 是面向 LLM 推理的分布式 KV cache 存储系统。北向�
 
 - `CacheKey` 固定 8 字节（`kv_semantics/include/kv_types.h:39-40`）；
 - value 由 512B 对齐的 offset 寻址（`kv_types.h:43`、`KVBuffer` 定义见 `kv_types.h:122-128`，其中 `buffer.region.size` 同时充当 entry 长度，`offset` 是 32 位）；
-- 公有 API 有 `Init` / `Shutdown`、`QueryAsync`、`StoreAsync` / `BatchStoreAsync`、`LoadAsync` / `BatchLoadAsync`、`DeleteAsync`、`Check`、`Wait`、`RegisterRegions` / `UnregisterRegions`（`kv_client.h:33-61`），以及工厂函数 `CreateKvClient()`（`kv_client.h:64`）。
+- 公有 API 有 `Init` / `Shutdown`、`QueryAsync`、`BatchStoreAsync`、`BatchLoadAsync`、`DeleteAsync`、`Check`、`Wait`、`RegisterRegions` / `UnregisterRegions`（`kv_client.h:33-61`），以及工厂函数 `CreateKvClient()`（`kv_client.h:64`）。SDK 另提供单条 `StoreAsync` / `LoadAsync`，但**本设计不暴露、不调用**：`GetSqeIoNum` 对单条路径强制 1 条 SQE，与「只支持 batch」冲突（`io_scheduler.cc:80-90`）。
 
 也就是说，ASU 没有文件、没有目录，也没有长度或 Stat 查询：`TaskResult::queryResult` 只提供 exists 位图与前缀命中数（`kv_types.h:98-101`、`:137-141`）。这与 Mooncake 现有的南向契约存在根本性的语义错配：
 
@@ -223,13 +245,13 @@ Mooncake Store 是面向 LLM 推理的分布式 KV cache 存储系统。北向�
 
 **v2.0 的定稿骨架**
 
-- **Master 纯命名分配（沿用 v1.0）**：`AllocateReplicas` 只铸造 48B 的 `AsuDescriptor`，其中含 `asu_key_id`、`key_fingerprint`、`object_size`、`chunk_payload`、`chunk_count`、`record_version`、`flags` 与 `object_epoch`；不占 segment、不分配字节、无 offset 账本、不参与 `accessor.Grow(SaturatingMultiply(value_length, config.replica_num))` 的字节记账（`master_service.cpp:5028-5030`）。ASU 副本以 PROCESSING 状态进入对象元数据，并排在副本列表末尾，避免 `FindFirstCompleteReplica` 误选。
+- **Master 纯命名分配（沿用 v1.0）**：`AllocateReplicas` 只铸造 40B 的 `AsuDescriptor`，其中含 `key_id`、`key_fingerprint`、`object_epoch`、`object_size`、`record_version`、`flags`；不占 segment、不分配字节、无 offset 账本、不参与 `accessor.Grow(SaturatingMultiply(value_length, config.replica_num))` 的字节记账（`master_service.cpp:5028-5030`）。ASU 副本以 PROCESSING 状态进入对象元数据，并排在副本列表末尾，避免 `FindFirstCompleteReplica` 误选。
 - **key 派生（沿用 v1.0）**：`CacheKey` 只有 8 字节，因此用 XXH64 双 seed 派生——seed0 出 `asu_key_id`，seed1 出 `key_fingerprint` 做碰撞与陈旧记录 fail-stop；每次 `PutStart` 带新的 `object_epoch` 参与派生，因此新的写入总是新的物理 key，迟到的 `DeleteAsync` 不会误删新世代数据。`object_epoch` 由 `AsuAllocator` 的全局单调 64-bit 计数器生成，进程启动用随机种子，恢复时推进到已恢复 descriptor 的最大 epoch 加一。
-- **记录格式（沿用 v1.0）**：每 chunk = 512B 自描述头 `AsuRecordHeader` + payload；`chunk_payload = 16,776,192`、`chunk_stride = 512 + chunk_payload = 16,776,704`，正好等于单 entry 上限；chunk 1..N-1 先写、chunk0 最后写作为提交点；header CRC 与 payload CRC-32C 双校验，后者承重。
+- **记录格式（沿用 v1.0）**：一个对象 = 一个 ASU key = 一条 entry，`offset` 恒为 0，`wire_len = 512 + align_up(object_size, 512)`，单 entry 上限 16,776,704 B；entry = 512B 自描述头 `AsuRecordHeader` + payload。header CRC 与 payload CRC-32C 双校验，后者承重。**SDK 不保证单 entry 写入原子**：可见性由 Master 的 PROCESSING 状态与读端 header/CRC fail-stop 共同保证。
 - **写模式（v2.0 新增）**：`ReplicaWriteMode::TIERED_MEMORY_THEN_ASU`，由 `DetermineReplicaWriteMode` 在 `Replica` 层按 `AsuReplicaNum() > 0` 最优先返回（`mooncake-store/include/replica.h:265-269`、`:291-302`）。不复用 `FLEXIBLE_DUAL_REPLICA`，因为后者是对称的「任一侧成功即可」（`client_service.cpp:403-423`），会让 ASU 反向救助 memory，与要求 1 的有向语义矛盾。
 - **失败语义：由 `require_asu` 决定（v2.1 开关化）**：默认 `false` 为分层降级——主层全部成功、ASU 失败 → `PutEnd(MEMORY)` + `PutRevoke(ASU)`，`Put` 返回成功并记 `asu_degraded_total`（术语 `asu_degraded`）；`true` 为严格失败——`PutRevoke(ALL)`，`Put` 返回失败，错误码取 `first_asu_error`。两种模式下主层失败都是 ASU 阶段零调用 + `PutRevoke(ALL)`、`Put` 失败。`ReplicaType::ALL` 的语义在 `PutEnd` / `PutRevoke` 中扩展为**包含 ASU**，否则 happy 路径的 ASU 永远停在 PROCESSING。
-- **读（v2.0 新增）**：Master 不改返回内容——`GetReadableReplicaDescriptors` 只经 `IsReplicaReadable` 过滤（`master_service.cpp:4487-4505`），天然返回全部可读副本。Client 用显式档位 `ReplicaReadRank` 选择：local MEMORY(0) < local NOF(1) < remote MEMORY(2) < remote NOF(3) < LOCAL_DISK(4) < ASU(5) < DFS(6) < DISK(7)，选中 ASU 后直接走 `BatchLoadAsync`，默认每对象一个 task。
-- **删（v2.0 新增）**：「删 memory」= 新增 `RemoveReplica(MEMORY)` RPC 与 `Client::RemoveMemoryReplica`，只移除 MEMORY 副本；「删 ASU」= 现有 `Remove` / `RemoveObject` 的整对象删除，并在其中实现 memory → ASU 的有序级联。
+- **读（v2.0 新增）**：Master 不改返回内容——`GetReadableReplicaDescriptors` 只经 `IsReplicaReadable` 过滤（`master_service.cpp:4487-4505`），天然返回全部可读副本。Client 用显式档位 `ReplicaReadRank` 选择：local MEMORY(0) < local NOF(1) < remote MEMORY(2) < remote NOF(3) < LOCAL_DISK(4) < ASU(5) < DFS(6) < DISK(7)，选中 ASU 后直接走 `BatchLoadAsync`；多个对象按对象边界合并进同一 task。
+- **删（v2.0 新增）**：「删 memory」= 既有 `Client::Remove` / `BatchRemove`，一行不改（只删 memory 与元数据、不触达 ASU）；「删 ASU」= 新增 `BatchRemoveAsuObjects`，先捕获 `AsuDescriptor`、再调用既有 Remove、最后入队删除。
 - **物理删除的执行者不变**：`AsuDeleteQueue` + `AsuGcWorker` + Master delete-only `KvClient` 是唯一通道；`EvictDiskReplica` 不扩白名单、一行不改（理由见 §1.2.4 与 §3.11）。
 - **配置白名单（v2.0 收紧）**：`asu_replica_num ∈ {0,1}`；大于 0 时要求 `replica_num >= 1`、`nof_replica_num == 0`、`dfs_replica_num == 0`，否则 `INVALID_PARAMS`。ASU-only 由 `PrepareWriteStart` 的全零判定拒绝（`master_service.cpp:5051-5053`）。收紧的目的不是限制功能，而是保证「有 ASU 必有 memory 主副本」，让要求 3 的「先删 memory」始终有定义。
 
@@ -238,7 +260,7 @@ flowchart LR
     A1["PutStart 或 BatchPutStart"] --> A2["Master 分配 memory 并铸造 AsuDescriptor"]
     A2 --> A3["Client 写 disk 副本与 memory 副本"]
     A3 --> A4{"主层全部成功"}
-    A4 -- "是" --> A5["Client 写 ASU：chunk 1 到 N-1 后写 chunk 0"]
+    A4 -- "是" --> A5["Client 写 ASU：一个对象一条 entry，offset=0，多对象可合批"]
     A4 -- "否" --> A6["跳过 ASU 并 PutRevoke ALL"]
     A5 --> A7{"ASU 全部成功"}
     A7 -- "是" --> A8["PutEnd ALL"]
@@ -279,8 +301,8 @@ flowchart LR
 
 两条外部路线的共同问题不是实现细节，而是承载语义的抽象错误：local_disk 把 ASU 当成「批量 offload 的后端」，DFS 把 ASU 当成「文件系统」。二者都无法把「按 key 的写 / 读 / 查 / 删」映射为系统的一等操作。本设计因此新增 `ReplicaType::ASU = 101`，主方案为 `ASUKvReplica`：
 
-- **Master 纯命名分配**：`AllocateReplicas` 只铸造 48B `AsuDescriptor`，不占 segment、不分配字节、无 offset 账本；副本以 PROCESSING 状态进入对象元数据。
-- **Client 直连 `KvClient`**：在 memory 全部成功之后，把整对象按 512B chunk 同步写入 ASU；读路径按 descriptor 派生 offset 与长度，用 `BatchLoadAsync` 读回。
+- **Master 纯命名分配**：`AllocateReplicas` 只铸造 40B `AsuDescriptor`，不占 segment、不分配字节、无 offset 账本；副本以 PROCESSING 状态进入对象元数据。
+- **Client 直连 `KvClient`**：在 memory 全部成功之后，把一个对象作为一条 512B 对齐 entry（512B header + payload，offset=0）同步写入 ASU；读路径按 descriptor 的 `key_id` 与 `object_size` 用 `BatchLoadAsync` 读回。
 - **Master 侧 delete-only `KvClient`**：删除只需要 key，不需要 `RegisterRegions`，因此 Master 可以持有一个只做 `QueryAsync` / `DeleteAsync` 的客户端。
 - **延迟 GC**：元数据先删，物理 key 进入去重队列，宽限期后由独立线程删除，避免删掉仍被读租约引用的旧 key。
 
@@ -288,51 +310,48 @@ flowchart LR
 
 #### 1.1.3 ASU 的硬约束及其对设计的塑造
 
-设计规范里的 ASU 事实不是实现备注，而是直接决定 chunk 布局、提交顺序与错误映射的输入：
+ASU 事实直接决定 entry 布局、批量切分与错误映射：
 
 | 约束 | 代码事实 | 对设计的塑造 |
 | --- | --- | --- |
-| 单个 entry 单次 Store/Load 上限为 16,776,704 B（0xFFFFE00） | SQE 的 `length` / `buffer_length` 是 24-bit 且必须 512B 对齐（`kv_protocol.cc:195`、`:200`、`:214`）。字段绝对上限 0xFFFFFF 本身不满足对齐，向下取整得到 0xFFFFE00 | 导出 `kEntryMaxBytes = 16,776,704`、`kChunkPayloadBytes = 16,776,192`、`kChunkStrideBytes = 16,776,704`；一个 chunk 一个 entry |
-| 没有 per-entry size 字段 | `length` 直接取 `KVBuffer.buffer.region.size`（`sqe_request.cc:190`、`:206`、`:223`、`:251`） | 每个 chunk 前 512B 放自描述 header，写入真实的 `data_len`、边界与 CRC；读端不靠 SDK 告知长度 |
-| 超限或未对齐在预发送阶段失败会 abort 整个 transport task | `AbortSubBatchesBeforeSend` 把全部 `entryStatus` 置为 CANCELED（`trans_task_executor.cc:227-246`） | 客户端必须在提交前逐 entry 预检 `wire_len`、`offset`、`addr`、`region.size`、`handle`；不能指望「只失败超限那一条」。v2.0 的写阶段与读阶段都执行同一套预检 |
-| offset 是 32-bit、512B 对齐 | `KVBuffer::offset` 为 `uint32_t`（`kv_types.h:125`）；协议校验 512B 对齐（`kv_protocol.cc:205`） | 单 key 可寻址约 4 GiB；chunk 布局必须保证总长小于 2^32，超限在 `PutStart` 前置拒绝 |
-| 单 key 总量受设备 create size 约束 | 超限错误码 `CQE_OUT_OF_CREATE_SIZE = 0x10000 \| 0x712`（`kv_types.h:81`） | 是否自动扩展是 go/nogo H2；v2 仍用 `AsuConfig::max_object_bytes` 把不可预期失败变成确定参数错误 |
-| `buffer.region.size` 先被 `static_cast<uint32_t>` 再校验 | `sqe_request.cc:190`、`:206`、`:223`、`:251` | 任何 ≥4 GiB 的 region 会被静默截断；本层必须自行禁止 |
-| `buffer_addr` 只校验非零，SDK 不校验 512B 对齐 | `kv_protocol.cc:186-190` | 必须自建 512B 对齐的 pinned staging arena，并在提交前断言 `addr` 对齐 |
-| `maxInflightBytes` 只解析不生效 | `trans_config_utils.cc:145-146` | 不能依赖 SDK 做字节流控；本设计按条数（`kBatchMaxEntries`）与字节（`kBatchMaxBytes`）自行限流 |
-| 设备真实上限只在 Init 日志，公有 API 不暴露 | `kv_client.h:37-64` 无 `ServerKvCapabilities` 相关接口 | 设计按编译期常量切分，真机值由 go/nogo H1、H9 验证 |
-| 公有 API 没有长度、Stat、GetMeta | `QueryResult` 只有 exists 位图与前缀命中数（`kv_types.h:98-101`） | 长度的唯一权威是 Master 元数据；header 里的 `object_size` 只做交叉校验 |
-| `KvClientConfig::defaultWaitTimeoutMs` 默认 100ms；`Wait(taskId, timeoutMs, result)` 的 `timeoutMs` 是必填参数、没有默认值 | `kv_types.h:215`、`kv_client.h:54` | 必须显式传入按字节估算的 timeout；TIMEOUT 归为结果不确定，隔离 staging slot。v2.0 的 ASU 写在 `Put` 返回前同步执行，这条超时直接计入 Put 延迟 |
-| 删除语义与查询语义不同源 | DELETE 的 `ENTRY_DELETE_FAILED` 与 QUERY 的 `ENTRY_KEY_NOT_EXIST` 是不同错误空间（`kv_types.h:67-73`） | 删除按 rawResult 幂等判定，不假设「删不存在 key 一定报 KEY_NOT_EXIST」 |
+| 单 entry 单次 Store/Load 上限 16,776,704 B | SQE 的 `length`/`buffer_length` 是 24-bit 且 512B 对齐（`kv_protocol.cc:188-215`）；0xFFFFFF 向下取整为 0xFFFE00 | `kEntryMaxBytes = 16,776,704`、`kMaxObjectBytes = 16,776,192`；一个对象一条 entry |
+| 没有 per-entry size 字段 | `length` 取 `KVBuffer.buffer.region.size`（`sqe_request.cc:190`、`:206`、`:223`、`:251`） | 每条 entry 前 512B 放自描述 header，写入真实 `data_len` 与 CRC |
+| 预发送失败 abort 整个 transport task | `AbortSubBatchesBeforeSend` 把全部 `entryStatus` 置 CANCELED（`trans_task_executor.cc:227-246`） | 提交前逐 entry 预检；一个 task 承载多个对象，单条非法会取消整批 |
+| `offset` 32-bit、512B 对齐 | `KVBuffer::offset` 为 `uint32_t`（`kv_types.h:125`）；协议校验对齐（`kv_protocol.cc:202-206`） | 取消分块后 `offset` 恒为 0 |
+| 单 key 总量受设备 create size 约束 | `CQE_OUT_OF_CREATE_SIZE = 0x10000 \| 0x712`（`kv_types.h:81`） | 是否自动扩展是 H2；`AsuConfig::max_object_bytes` 默认 16,776,192 |
+| `buffer.region.size` 先 `static_cast<uint32_t>` | `sqe_request.cc:190`、`:206`、`:223`、`:251` | 本层禁止 ≥4 GiB 的 region |
+| `buffer_addr` 只校验非零 | `kv_protocol.cc:186-190` | 自建 512B 对齐 pinned staging arena 并预检 addr |
+| `maxInflightBytes` 只解析不生效 | `trans_config_utils.cc:145-146` | 按条数（`kBatchMaxStoreEntries`/`kBatchMaxLoadEntries`）与字节自行限流 |
+| 公有 API 无长度、Stat、GetMeta | `QueryResult` 只有 exists 位图（`kv_types.h:98-101`） | 长度唯一权威是 Master 元数据 |
+| `defaultWaitTimeoutMs` 默认 100ms；`Wait` 的 `timeoutMs` 必填 | `kv_types.h:215`、`kv_client.h:54` | 显式传按字节估算的 timeout；TIMEOUT 隔离 staging slot |
+| 批量接口与单条接口不同源 | `GetSqeIoNum` 对 LOAD/STORE 返回 1（`io_scheduler.cc:80-92`）；BATCH 按 110 切子批 | 只允许 `BatchStoreAsync`/`BatchLoadAsync`，禁止 `StoreAsync`/`LoadAsync` |
+| 删除与查询错误空间不同 | `ENTRY_DELETE_FAILED` 与 `ENTRY_KEY_NOT_EXIST`（`kv_types.h:67-73`） | 删除按 rawResult 幂等判定 |
 
-这些约束共同推出本设计的四个核心决定：**每 chunk 512B 自描述头**（对抗「SDK 无长度 API」）、**N > 1 时 chunk 1..N-1 先写、chunk 0 最后写**（用 chunk 0 作为提交点，半成品不可读）、**逐 entry 预检 + 单 task 内全成全败**（对抗整批 abort）、以及 **ASU 写在 memory 全部成功之后同步执行**（要求 1）。payload CRC-32C 是承重项必须保留：Mooncake 端到端 object checksum 默认关闭（`mooncake-store/src/config/client_object_checksum_config.cpp:13-16`），介质层唯一的完整性兜底就是每 chunk 的 `data_crc32c`。
+这些约束推出四个核心决定：**每条 entry 512B 自描述头**、**一个对象一条 entry、offset 恒 0**、**逐 entry 预检 + task 级全成全败**、**ASU 写在 memory 全部成功之后**。payload CRC-32C 是承重项；Mooncake 端到端 object checksum 默认关闭（`mooncake-store/src/config/client_object_checksum_config.cpp:13-16`）。**SDK 不保证单 entry 写入原子**：可见性由 Master 侧 PROCESSING 状态与读端 header/CRC fail-stop 共同保证。
 
-> **[v2.0 变更]** v1.0 允许前缀/截断读，并在截断时跳过 payload CRC（`asu_partial_read_crc_skipped_total`）。v2.0 规定公开读入口一律要求 slices 总长不小于 `object_size`，否则返回 `INVALID_PARAMS`：因此读路径永远整对象读、payload CRC-32C 恒可校验，截断分支与其 metric 一并废弃。这与 memory 副本在 `TransferRead` 的尺寸契约一致（`client_service.cpp:5160-5185`）。
+> **[v2.3 变更]** 取消分块后，「半写对象对读者不可见」只剩两层：Master 侧 ASU 副本在 `PutEnd` 前恒为 PROCESSING；读端 magic/version/header_crc/key_id/key_fingerprint/epoch/object_size/data_offset==0/data_len/data_crc32c 全字段 fail-stop。不得声称单 entry 写是原子的。
 
-> **[v2.0 变更]** 写序改变直接影响延迟模型：v1.0 的副本延迟约为 `max(memory, ASU)`，v2.0 因为 ASU 在 memory 之后同步内联，变成两阶段近似之和。16 MiB 对象的 `Put` P50/P99 回归必须由真机假设 H21 量化，并作为「严格失败 vs 分层降级」的裁决输入。
-
-还有一个前提性冲突必须显式标注：默认分配器为 CACHELIB 时，`PrepareWriteStart` 会用 `kMaxSliceSize` 拒绝大对象（`mooncake-store/include/types.h:468-469`、`mooncake-store/src/master_service.cpp:5111-5117`），使默认部署的对象上限约为 16 MiB，多 chunk 路径几乎不可达。该检查对所有副本类型生效，**对 ASU 同样生效**；已裁决不豁免（v2.1，见 §6.5），约 16 MiB 是正确上限，因此不宣称多 chunk 是默认部署下的可用路径。
+**1,008 B 窗口**：`kMaxSliceSize = Slab::kSize - 16 = 16,777,200 B`（`types.h:468-469`），而单 entry 最大 object 是 `16,776,704 - 512 = 16,776,192 B`，两者相差 **1,008 B**。窗口 `(16,776,192, 16,777,200]` 内 CACHELIB 放行但单 entry 装不下，必须在 `PrepareWriteStart` 的 ASU 校验里显式拒绝为 `ASU_OBJECT_TOO_LARGE`；`S > 16,777,200` 时 CACHELIB 检查（`master_service.cpp:5111-5117`）先返回 `INVALID_PARAMS`。已裁决不豁免（v2.1，见 §6.5）。
 
 #### 1.1.4 本设计的范围
 
-本设计的范围严格限定为「按 key 的写、读、查、删 + 必要的 init」：
+本设计严格限定为「按 key 的写、读、查、删 + 必要的 init」：
 
 | 在范围内 | 对应操作 |
 | --- | --- |
 | `AsuClientRuntime` / `AsuMasterRuntime` 的初始化、注册、就绪判定与关闭；`asu_available` 能力位 | init |
-| `Put` / `Upsert` / `BatchPut` / `BatchUpsert` 中 ASU 副本的**有序第二阶段**同步写入（memory/nof 全部成功之后） | 写 |
-| `Get` / `BatchGet` 中 Master 返回全部可读副本、Client 按档位择优，选中 ASU 后整对象批量读取 | 读 |
+| `Put` / `Upsert` / `BatchPut` / `BatchUpsert` 中 ASU 副本的**有序第二阶段**同步写入 | 写 |
+| `Get` / `BatchGet` 中 Master 返回全部可读副本、Client 按档位择优，选中 ASU 后批量读取 | 读 |
 | `IsExist` / `BatchIsExist` / `Query` 的逻辑存在性；`QueryAsync` 仅用于物理归因 | 查 |
-| 「删 memory」：`Client::RemoveMemoryReplica` / `MasterService::RemoveReplicaTier`，只移除 MEMORY 副本；「删 ASU」：`Client::Remove` 触发的整对象删除，按 memory → ASU 有序级联 | 删 |
+| 「删 memory」：既有 `Client::Remove` / `BatchRemove`（删 memory 与元数据、不触达 ASU）；「删 ASU」：新增 `Client::BatchRemoveAsuObjects`，内部先调用既有 `BatchRemove`、再删 ASU | 删 |
 
-> **[v2.0 变更]** 范围表与 v1.0 有三处实质差异：① 写从「并行同步副本」改为「memory 之后的有序第二阶段」，并明确主层失败时 ASU 零调用；② 读从「包含 session 读取与前缀读」改为「Master 返回全集、Client 显式档位择优、整对象读」，session/range 读对 ASU 明确 `NOT_SUPPORTED`；③ 删拆成两个方向相反的动词，而不是单一 `Remove`。
+> **[v2.3 变更]** 删除语义按用户纠正重写：现有按 key 删除 memory 的路径一行不改；新增的 `BatchRemoveAsuObjects` 才是「按 key 删 ASU」，且必须先删 memory、再删 ASU。
 
-配置白名单也属于范围的一部分：`asu_replica_num ∈ {0,1}`；大于 0 时要求 `replica_num >= 1`、`nof_replica_num == 0`、`dfs_replica_num == 0`，否则 `INVALID_PARAMS`；ASU-only 由 `PrepareWriteStart` 的全零判定拒绝（`master_service.cpp:5051-5053`）。`replica_num > 1` 的多 memory 副本允许存在，但 `asu_replica_num > 1` 不支持；此时「删 memory」一次移除该对象的**全部** MEMORY 副本（API 不带 `replica_id`，对象仍有 ASU 时保留），按副本粒度删除不在本期范围。
+配置白名单：`asu_replica_num ∈ {0,1}`；大于 0 时要求 `replica_num >= 1`、`nof_replica_num == 0`、`dfs_replica_num == 0`，否则 `INVALID_PARAMS`；ASU-only 由 `PrepareWriteStart` 的全零判定拒绝（`master_service.cpp:5051-5053`）。
 
+失败语义由 `AsuConfig::require_asu` 决定：默认 false 时 ASU 写失败只降级（Put 成功、`asu_degraded_total` 加 1）；true 时 ASU 写失败使整个 Put 失败。
 
-失败语义由 `AsuConfig::require_asu` 决定，属部署级配置，不是 per-key 参数：默认 false 时 ASU 写失败只降级（Put 成功、`asu_degraded_total` 加 1）；true 时 ASU 写失败使整个 Put 失败。该开关只约束 TIERED 写，不改变上面的白名单——白名单拒绝的组合在两种模式下同样 `INVALID_PARAMS`。
-
-以下内容不在本设计范围内，不应出现在实现或文档中：多租户配额管理、QoS、分层调度策略、跨集群复制/灾备、缓存替换策略调优、性能自动调参、多 key 分片作为默认路径（仅在 go/nogo H2 的 `if_false` 中作为退路说明）、ASU 命中后的 promotion/回填 memory、跨对象合并进同一 `BatchLoadAsync` 的默认路径、range/session 的 ASU 读写、以及扩展 `EvictDiskReplica` 白名单来承载 ASU 或 MEMORY 的删除。对象字节的 CRC-32C 校验、512B 自描述头、key fingerprint 防碰撞、epoch 防代际串读属于承重安全项，必须保留；不承担安全职责的冗余字段可以裁剪。
+以下内容不在范围内：多租户配额、QoS、分层调度、跨集群复制、缓存替换调优、性能自动调参、多 key 分片（一个对象绝不拆成多个 key 或 offset）、ASU 命中后的 promotion/回填 memory、range/session 的 ASU 读写、扩展 `EvictDiskReplica` 白名单。CRC-32C、512B 自描述头、key fingerprint、epoch 防代际串读属于承重安全项，必须保留。
 
 ### 1.2 用户使用场景分析
 
@@ -351,23 +370,19 @@ ASU 副本不是独立服务，而是 Mooncake Store 的一种副本形态。下
 
 #### 1.2.1 场景一：LLM 推理 KV cache 首次下沉
 
-- **前置条件**：Mooncake 集群与 ASU 视图已就绪；Client 已启用 ASU 且 `AsuClientRuntime::IsReady()` 为真；用户请求中 `asu_replica_num = 1`，同时 `replica_num >= 1`、`nof_replica_num = 0`、`dfs_replica_num = 0`。ASU-only 或 asu+nof / asu+dfs 的配置在 `PrepareWriteStart` 阶段即返回 `INVALID_PARAMS`，不会产生任何副本。
-- **用户做什么**：调用 `Put(key, slices)`（或 Python 侧 `put` / 张量写入），把 prefill 阶段产出的 KV cache 作为一个对象写入。
-- **系统行为**：`MasterClient::PutStart` → Master 的 `PrepareWriteStart` 校验配置与大小（`master_service.cpp:5047-5138`）→ `AllocateReplicas` 先分配 memory，最后在副本列表末尾铸造 `AsuDescriptor`（PROCESSING）→ Client 先写 disk 副本（若有）与 memory/nof 副本（单 key 路径见 `client_service.cpp:2115-2139`；批量路径为 `SubmitTransfers` + `WaitForTransfers`，`client_service.cpp:2884-3048`）→ 门禁 `NonDfsTransfersSucceeded`（`client_service.cpp:321-327`）为真后调用 `SubmitAsuWrites`（批量在 `SubmitDfsWrites` 之后、`FinalizeBatchPut` 之前；单 key 在 finalize 之前）→ `AsuStorageBackend::WriteObject` 按公式切 chunk，N > 1 时 chunk 1..N-1 先提交、chunk 0 最后提交作为 commit marker → `DetermineFinalizeDecision` 决定终态。
-- **期望结果（三种终态，v2.0 新增）**：
-  - **happy**：主层与 ASU 全部成功 → `PutEnd(ALL)`，`Put` 返回成功，ASU 为 COMPLETE 且可读。
-  - **degrade（`asu_degraded`，`require_asu=false`，默认）**：主层成功、ASU 失败 → `PutEnd(MEMORY)` + `PutRevoke(ASU)`，`Put` **仍然返回成功**，记 `asu_degraded_total` 与 WARN 日志；对象只有 memory，ASU 上已写入的部分由 best-effort `DeleteAsync` 与延迟队列回收。
-  - **failure**：主层失败 → `SubmitAsuWrites` 零调用（记 `asu_write_skipped_total{reason=primary_tier_failed}`），`PutRevoke(ALL)`，`Put` 返回失败。
-  - **strict failure（`require_asu=true`，v2.1 新增）**：主层成功、ASU 失败 → `PutRevoke(ALL)`，`Put` 返回失败（错误码取 ASU 的 `first_asu_error`）；已写成功的 memory 与 ASU 一并被撤销，对象不残留。
-- **对操作的要求**：以写为主；降级与失败路径都需要删。关注点是单 chunk 不超过 16,776,704 B、512B 对齐、同批 entry 全成全败、进程在 chunk 0 提交前崩溃时可被过期回收，以及**调用方在 `Put` 返回前不得修改 `slices` 指向的 buffer**——ASU 阶段的数据源是 `op.slices`，不回读 memory。由于两阶段串行，`Put` 延迟近似为 memory 写与 ASU 写之和。
+- **前置条件**：ASU 视图就绪、`AsuClientRuntime::IsReady()` 为真；`asu_replica_num = 1` 且 `replica_num >= 1`、`nof_replica_num = 0`、`dfs_replica_num = 0`。非法组合在 `PrepareWriteStart` 返回 `INVALID_PARAMS`。
+- **用户做什么**：调用 `Put(key, slices)` 把 prefill 产出的 KV cache 作为一个对象写入。
+- **系统行为**：`MasterClient::PutStart` → `PrepareWriteStart` 校验配置与大小（`master_service.cpp:5047-5138`）→ `AllocateReplicas` 先分配 memory，最后铸造 `AsuDescriptor`（PROCESSING）→ Client 写 disk（若有）与 memory/nof → 门禁 `NonDfsTransfersSucceeded`（`client_service.cpp:321-327`）→ `SubmitAsuWrites` → `AsuStorageBackend::BatchStoreObjects` 把本批对象按对象边界切 task，每个对象编码成**一条** entry（512B header + payload，offset=0），多个对象可放入同一个 `BatchStoreAsync`，按 `entryStatus` 逐对象回填 → `DetermineFinalizeDecision` 决定终态。
+- **期望结果**：happy → `PutEnd(ALL)`、Put 成功；degrade（`require_asu=false`）→ `PutEnd(MEMORY)` + `PutRevoke(ASU)`、Put 成功并记 `asu_degraded_total`；主层失败 → ASU 零调用 + `PutRevoke(ALL)`、Put 失败；strict（`require_asu=true`）→ `PutRevoke(ALL)`、Put 失败。
+- **对操作的要求**：单 entry 不超过 16,776,704 B（object 不超过 16,776,192 B）、512B 对齐、逐 entry 预检、task 级全成全败；**调用方在 `Put` 返回前不得修改 `slices` 指向的 buffer**。
 
-> **[v2.0 变更]** 本场景由 v1.0 的「并行双写、任一失败整 Put revoke」改为「有序两阶段 + 分层降级」，并删除了 `replica_num = 0` 的 ASU-only 形态。v2.1 把失败语义开关化：默认降级，`require_asu=true` 时整体失败。
+> **[v2.3 变更]** 取消分块：一个对象一条 entry、offset 恒 0，不再有 chunk 0 提交点，也不声称单 entry 写入原子。
 
 #### 1.2.2 场景二：缓存命中读回
 
 - **前置条件**：对象存在状态为 COMPLETE 的 ASU 副本（可以是唯一副本）；调用方遵守长度契约，`slices` 总长不小于 `object_size`。
 - **用户做什么**：调用 `Get(key)` 或 `BatchGet`，把 KV cache 读回继续 decode。
-- **系统行为**：`GetReplicaList` 由 Master 返回**全部可读副本**——`GetReadableReplicaDescriptors` 以恒真谓词遍历副本，只经 `IsReplicaReadable`（`completed && available && !IsAwaitingRemount`）过滤，不按类型裁剪也不排序（`master_service.cpp:4487-4505`、`ReadReplicaList` 4585、`BatchGetReplicaList` 4706）→ Client 的 `SelectBestReplica`（`replica_selection.h:133-194`）带 `ReadSelectionPolicy{asu_available}` 按显式档位选择：local MEMORY(0) < local NOF(1) < remote MEMORY(2) < remote NOF(3) < LOCAL_DISK(4) < **ASU(5)** < DFS(6) < DISK(7)，同档平手后出现者胜出 → 选中 ASU 后 `Client::Get` 分派到 `ReadAsuReplica`（`client_service.cpp:1578-1653`）；`BatchGet` 把 ASU 请求收集为 `AsuReadRequest`，在 DFS 批量读之后、RDMA 统一 Wait 之前调用 `ReadObjects`（`client_service.cpp:1718-1997`）→ 默认每对象一个 `BatchLoadAsync`，逐 entry 读 `entryStatus` 并 `DecodeAndValidate`（magic / version / header CRC / key_id / key_fingerprint / object_epoch / object_size / chunk_index / chunk_count / data_offset / payload CRC-32C）→ 回填用户缓冲 → 复用既有 `VerifyObjectChecksum` 与租约检查。
+- **系统行为**：`GetReplicaList` 由 Master 返回**全部可读副本**——`GetReadableReplicaDescriptors` 以恒真谓词遍历副本，只经 `IsReplicaReadable`（`completed && available && !IsAwaitingRemount`）过滤，不按类型裁剪也不排序（`master_service.cpp:4487-4505`、`ReadReplicaList` 4585、`BatchGetReplicaList` 4706）→ Client 的 `SelectBestReplica`（`replica_selection.h:133-194`）带 `ReadSelectionPolicy{asu_available}` 按显式档位选择：local MEMORY(0) < local NOF(1) < remote MEMORY(2) < remote NOF(3) < LOCAL_DISK(4) < **ASU(5)** < DFS(6) < DISK(7)，同档平手后出现者胜出 → 选中 ASU 后 `Client::Get` 分派到 `ReadAsuReplica`（`client_service.cpp:1578-1653`）；`BatchGet` 把 ASU 请求收集为 `AsuReadRequest`，在 DFS 批量读之后、RDMA 统一 Wait 之前调用 `BatchLoadObjects`（`client_service.cpp:1718-1997`）→ 多个对象按对象边界合批进同一 `BatchLoadAsync`，逐 entry 读 `entryStatus` 并 `DecodeAndValidate`（magic / version / header CRC / key_id / key_fingerprint / object_epoch / object_size / data_offset==0 / data_len / payload CRC-32C）→ 回填用户缓冲 → 复用既有 `VerifyObjectChecksum` 与租约检查。
 - **期望结果**：返回字节与写入完全一致；header 或 payload CRC 不符时返回 `ASU_RECORD_CORRUPT`，绝不把损坏字节交给用户；元数据存在但物理 entry 丢失时映射为 `REPLICA_IS_GONE` / `OBJECT_NOT_FOUND`；同一次 Get 内不做跨副本 fallback，也不返回部分数据。
 - **对操作的要求**：以读为主。关注点是整对象读取与 CRC 全量校验、`PROCESSING` 副本的双门控（Master 只返回 COMPLETE，选择器也只接受 COMPLETE）、以及物理丢失与介质损坏的错误归因。range / session 读对 ASU 明确 `NOT_SUPPORTED`。
 
@@ -378,45 +393,45 @@ ASU 副本不是独立服务，而是 Mooncake Store 的一种副本形态。下
 - **前置条件**：对象最初以 MEMORY + ASU 双副本写入；随后 MEMORY 副本因容量压力被淘汰，或调用方通过「删 memory」只移除了 MEMORY 副本；ASU 副本仍为 COMPLETE；对象元数据仍在 Master。
 - **用户做什么**：再次 `Get(key)`，期望命中下沉到 ASU 的副本。
 - **系统行为**：`GetReplicaList` 只返回仍存在的 ASU descriptor；Client 的档位选择回落到 ASU(5)；读路径与场景二相同，全部在 Client 侧完成。同时 `PutEnd` 的 offload 触发条件显式排除含 ASU 的对象（`master_service.cpp:5409-5412`），不会把「memory + ASU」的对象再写一份 LOCAL_DISK。
-- **期望结果**：内存副本不在时读取仍然成功，且不需要 Master 转发数据或感知 ASU 拓扑；读延迟主要由 ASU 读带宽与 chunk 数决定。
+- **期望结果**：内存副本不在时读取仍然成功，且不需要 Master 转发数据或感知 ASU 拓扑；读延迟主要由 ASU 读带宽与对象大小决定。
 - **对操作的要求**：只要求读。关注点是副本选择器的档位顺序（LOCAL_DISK 优于 ASU 优于 DFS 优于 DISK）、读租约、ASU 副本不被额外 offload 到 LOCAL_DISK，以及**不做 promotion**：命中 ASU 后不回填 memory，现有 hot cache 只对 memory 生效（`client_service.cpp:5766`），promotion-on-hit 只认 LOCAL_DISK（`master_service.cpp:4631-4645`）。
 
 > **[v2.0 变更]** v1.0 的场景三只描述「容量淘汰」；v2.0 把「删 memory 后仍可读」并入同一场景，因为这是要求 3 的直接后果，也是要求 2 必须存在的理由。
 
 #### 1.2.4 场景四：按 key 回收的两个删除动词
 
-- **前置条件**：对象不再需要；其全部副本处于 COMPLETE 状态（`CheckRemovable` 的前置，`master_service.cpp:7236-7255`）；ASU 集群启用 HA 或 oplog，或部署方接受重启即孤儿的风险。
-- **用户做什么**：根据意图调用两个不同的操作：
-  - **删 memory**：`Client::RemoveMemoryReplica(key, force)`，只释放 memory 副本，对象与 ASU 保留；
-  - **删 ASU**：`Client::Remove(key, force)`，即整对象删除，内部按「先 memory、后 ASU」级联。
+- **前置条件**：对象不再需要；全部副本 COMPLETE（`CheckRemovable` 前置，`master_service.cpp:7236-7255`）。
+- **用户做什么**：
+  - **删 memory**：调用既有 `Client::Remove(key, force)` 或 `BatchRemove`。它今天的行为就是「删掉 memory 副本与对象元数据，不触达 ASU 后端」，这正是「删 memory 只删 memory」；该路径一行不改。
+  - **删 ASU**：调用新增的 `Client::BatchRemoveAsuObjects(keys, force)`。它内部**首先调用**既有 `BatchRemove`（因此先删 memory 与元数据），然后用**删除前捕获**到的 `AsuDescriptor` 去删 ASU。
 
 ```mermaid
 flowchart TB
-    subgraph D1["删 memory：只移除浅层"]
-        B1["RemoveMemoryReplica"] --> B2["Master RemoveReplicaTier 只接受 MEMORY"]
-        B2 --> B3["CheckRemovable 与 fn_is_busy 保护"]
-        B3 --> B4["弹出 MEMORY 副本并释放 buffer"]
-        B4 --> B5["对象仍 IsValid 且 ASU 可读"]
+    subgraph D1["删 memory：既有路径，一行不改"]
+        B1["Client::Remove / BatchRemove"] --> B2["MasterService::RemoveObject / BatchRemove"]
+        B2 --> B3["CheckRemovable 保护"]
+        B3 --> B4["EraseMetadata：删除元数据与 memory buffer"]
+        B4 --> B5["不触达 ASU：ASU entry 成为不可枚举孤儿（预期行为）"]
     end
-    subgraph D2["删 ASU：整对象级联"]
-        C1["Remove 即 RemoveObject"] --> C2["先移除 MEMORY 元数据并 TearDown 释放 buffer"]
-        C2 --> C3["捕获 AsuDescriptor 并入 AsuDeleteQueue"]
-        C3 --> C4["宽限期后 AsuGcWorker 执行 DeleteAsync"]
+    subgraph D2["删 ASU：新增 BatchRemoveAsuObjects"]
+        C1["BatchRemoveAsuObjects(keys, force)"] --> C2["Phase 1 同一 key 写锁内捕获 AsuDescriptor"]
+        C2 --> C3["Phase 2 调用既有 RemoveObject（一行不改：先删 memory 与元数据）"]
+        C3 --> C4["Phase 3 仅对成功或 OBJECT_NOT_FOUND 的 key 把捕获的 descriptor 入 AsuDeleteQueue"]
+        C4 --> C5["宽限期后 AsuGcWorker 按 254 切批 BatchRemoveObjects → DeleteAsync"]
     end
 ```
 
-- **系统行为（删 memory）**：`Client::RemoveMemoryReplica` → `MasterClient::RemoveReplica(key, tenant, ReplicaType::MEMORY, force)` → `MasterService::RemoveReplicaTier`。后者在 `master_state_mutex_` 与 key 写锁下依次做：`Exists` 否则 `OBJECT_NOT_FOUND`；管理组排除；`CheckRemovable`（lease / 完成度 / replication task）；`metadata.HasReplica(&Replica::fn_is_busy)` 时返回 `OBJECT_REPLICA_BUSY`（保护 offload / promotion 正在 RDMA 读的 source buffer）；`EraseReplicasWithCacheTotalAccounting(metadata, &Replica::fn_is_memory_replica)` 弹出 MEMORY 副本并释放 buffer（`replica_num>1` 时一次弹出全部 MEMORY 副本，对象有 ASU 时保留）；`CancelPromotionTaskForRemovedReplicas`；`SyncKvObjectState` 把 media 从 `{cpu, disk}` 变 `{disk}`；只有当 `!metadata.IsValid()` 时才 `accessor.Erase()`。**有 ASU 时 `IsValid()` 为真，对象与 ASU 原样保留**（`mooncake-store/include/object_metadata.h:488`）。该路径不扩 `EvictDiskReplica`：后者是纯元数据通知路径，没有 `CheckRemovable`、没有 `master_state_mutex_`、没有 refcnt 保护与延迟释放（`master_service.cpp:6215-6336`），不适合承载按类型删除。
-- **系统行为（删 ASU）**：`MasterClient::Remove` → `MasterService::Remove` → `RemoveObject`（`master_service.cpp:7175-7204`）→ `CheckRemovable` → 非 HA 直接进入 `EraseMetadata`（`master_service.cpp:2054-2116`）：先捕获 ASU descriptor，再 `ReleaseLocalDiskUsage` / `FreeDfsReplicas` / 记账与索引清理，然后 `hold.TearDown()` 释放 memory buffer 与元数据，**最后**把 ASU 送入 `AsuDeleteQueue`（`EnqueueAsuDeletes`）。HA + oplog 下 `MarkRemovedAndPersist` 先标记；当前 HEAD 的 `FinalizeRemovedReplicasAfterDurable`（`master_service.cpp:1757-1807`）在 1780-1795 一次 pop 全部 REMOVED id，v2 须改为按 id 分两段 pop：先 memory 子集、再其余，ASU 在第二段之后经 `FreeAsuReplicas` 入队。物理删除由 `AsuGcWorker` 在宽限期后执行 `DeleteAsync`，只持队列自身 mutex，绝不在 `master_state_mutex_` 下做网络 I/O。
-- **期望结果**：删 memory 后对象仍 `IsValid`，`GetReplicaList` 返回 ASU，读经由场景二/三继续成功，对象对 `IsExist` 仍可见；删 ASU 后对象立即从元数据消失，`IsExist` / `Get` 返回不存在，物理空间在宽限期（`max(default_kv_lease_ttl_, asu_delete_grace_ms)`）后释放。`Remove` 后立刻 `Put` 同一逻辑 key 会得到新的 `object_epoch` 与新的 `asu_key_id`，迟到的 `DeleteAsync` 不会误删新对象。
-- **对操作的要求**：两个动词的失败语义必须可区分：对象不存在 → `OBJECT_NOT_FOUND`；删 memory 但无 memory 副本 → `REPLICA_NOT_FOUND`；lease 未过且非 force → `OBJECT_HAS_LEASE`；任一副本 PROCESSING → `REPLICA_IS_NOT_READY`（要求 1 与要求 3 的写删互斥）；有 replication task → `OBJECT_HAS_REPLICATION_TASK`；memory refcnt 不为零 → `OBJECT_REPLICA_BUSY`。删除必须与写共享 epoch/key 推导规则；关注点是幂等（删不存在的 key 视为成功）、失败重试、宽限期与读租约的关系、以及 Master 崩溃会丢失内存删除队列这一已知运维代价。崩溃窗口只允许停在「memory 已删、ASU 未入队」，此时对象只剩 ASU，仍可读、可重试删除。
+- **系统行为（删 ASU）**：`BatchRemoveAsuObjects` 在 Master 侧逐 key 执行三阶段。**Phase 1** 在 key 写锁内用只读访问器捕获 `is_asu_replica()` 的 descriptor（不授租约）；**Phase 2** 调用**既有** `RemoveObject`（一行不改，仍走 `CheckRemovable`、persist、`EraseMetadata`；`EraseMetadata` 不再捕获或入队 ASU）；**Phase 3** 仅对成功或 `OBJECT_NOT_FOUND`（stale handle）的 key 入队；`OBJECT_HAS_LEASE`/`REPLICA_IS_NOT_READY` 表示对象仍存活，跳过。捕获与删除之间若发生并发 Upsert，捕获到的旧 `key_id` 属于旧世代，迟到的删除只命中旧 key（epoch 派生隔离）。
+- **期望结果**：plain `Remove` 后对象立即从元数据消失，ASU entry 成为孤儿；`BatchRemoveAsuObjects` 后对象消失，ASU entry 在 `max(default_kv_lease_ttl_, asu_delete_grace_ms)` 后物理删除。
+- **对操作的要求**：删除必须与写共享 epoch/key 推导；关注幂等、失败重试、宽限期与读租约、以及「删除失败不向上层报错」。
 
-> **[v2.0 变更]** v1.0 只有单一 `Remove`。v2.0 把它拆成「删 memory」与「删 ASU」两个方向相反的操作，并明确物理删除的唯一执行者仍是 Master 侧的 delete-only `KvClient`；LOCAL_DISK 那种「Client 删文件、Master 删元数据」的分工（`storage_backend.cpp:996-1017`、`file_storage.cpp:681-719`）不能平移到网络可寻址的 ASU key 上。
+> **[v2.3 变更]** 删除 `RemoveReplica` RPC、`Client::RemoveMemoryReplica`、`MasterService::RemoveReplicaTier`；删 memory 复用既有 Remove，删 ASU 是新增函数且内部先调 Remove。
 
 #### 1.2.5 场景五：存在性探测决定是否复用
 
 - **前置条件**：调用方持有一个候选 key，需要在发起昂贵读取或重新计算前判断缓存是否可用。
 - **用户做什么**：调用 `IsExist(key)` / `BatchIsExist(keys)` / `Query(key)`。
-- **系统行为**：Client 只向 Master 查询元数据（`MasterClient::ExistKey`），Master 按 `HasReadableReplica` 授读租约并返回结果；整条热路径不触达 ASU，零额外 RTT。若需要区分「元数据在但物理丢失」与「传输失败」，诊断路径可以额外调用 `AsuStorageBackend::QueryObject` → `QueryAsync`，读 `TaskResult::queryResult->exists` 位图（`kv_types.h:98-101`），但该结果不作为 Mooncake 的存在性权威，也不进入 `IsExist` / `Query` 热路径。
+- **系统行为**：Client 只向 Master 查询元数据（`MasterClient::ExistKey`），Master 按 `HasReadableReplica` 授读租约并返回结果；整条热路径不触达 ASU，零额外 RTT。若需要区分「元数据在但物理丢失」与「传输失败」，诊断路径可以额外调用 `AsuStorageBackend::BatchIsExist` → `QueryAsync`，读 `TaskResult::queryResult->exists` 位图（`kv_types.h:98-101`），但该结果不作为 Mooncake 的存在性权威，也不进入 `IsExist` / `Query` 热路径。
 - **期望结果**：返回的是逻辑存在性，与 MEMORY / DFS / DISK 副本语义一致；长度直接取 `descriptor.object_size`，不再发起第二次查询。「memory 已删、只剩 ASU」的对象仍返回存在；「整对象删除、ASU 物理尚未删」的对象返回不存在。
 - **对操作的要求**：只要求查。关注点是物理存在性只能用于诊断与错误归因（例如区分 `OBJECT_NOT_FOUND` 与 `TRANSFER_FAIL`），公开 API 不承诺物理存在性；ASU entry 在设备侧丢失时，`IsExist` 仍可能返回 true，读取时才暴露 `REPLICA_IS_GONE`。
 
@@ -425,19 +440,19 @@ flowchart TB
 #### 1.2.6 场景六：批处理下的批量写与批量读
 
 - **前置条件**：一次推理批处理产生或消费多个 KV block；Client 启用 ASU。
-- **用户做什么**：调用 `BatchPut` / `BatchUpsert` 写入一批对象，或调用 `BatchGet` 批量读取一批对象。
-- **系统行为（写）**：批量路径在 `SubmitDfsWrites` 之后、`FinalizeBatchPut` 之前调用 `SubmitAsuWrites`（结构照抄 `SubmitDfsWrites`，`client_service.cpp:3201-3259`）：逐对象检查 `IsResolved`、`allocated_asu_replicas == 0` 与 `NonDfsTransfersSucceeded`；主层失败的对象记 `asu_write_skipped_total{reason=primary_tier_failed}` 并零调用；其余执行 `WriteObject` 并独立记录 `successful_asu_transfers` / `failed_asu_transfers`。`FinalizeBatchPut` 按对象决定终态：happy → `PutEnd(ALL)`；degrade → `PutEnd(MEMORY)` + `PutRevoke(ASU)`；failure → `PutRevoke(ALL)`。ASU 方向的 finalize RPC 失败只记 metric 与 WARN，不写 `finalize_rpc_errors`，由 reaper 在 `put_start_release_timeout` 后回收。
-- **系统行为（读）**：`Client::BatchGet` 在既有 DFS 批量读旁收集 `AsuReadRequest`，在 DFS 同步批量读之后、RDMA 统一 Wait 之前调用一次 `ReadObjects`；默认**每对象一个 `BatchLoadAsync`**（该对象的全部 chunk 在同一 task 内），多对象按 `staging_slots` 在飞上限分批 submit 并逐个 `Wait`（不是一次性把全部对象都 submit）；不提供跨对象合并，因为 SDK 在 `BuildTransportTasks` 阶段做全 key 路由校验，任一 key 不可路由会把整 task 的 `entryStatus` 置错。逐 entry 读 `entryStatus` 归因，`PARTIAL_FAILED` 不得早退丢掉 per-entry 结果。
-- **期望结果**：同一批内某个对象的 ASU 写失败不会把其它对象标记为失败；`require_asu=false` 时失败对象按分层降级处理（Put 成功、`asu_degraded_total` 加 1），`require_asu=true` 时该对象整体失败（`PutRevoke(ALL)`）、其余对象仍正常置 COMPLETE，不做整批回滚。批量读按对象返回独立结果，单个对象损坏不影响其它对象；同一对象绝不拆成两个 task，避免半成功状态。
-- **对操作的要求**：同时要求写和读。关注点是批内错误隔离、逐 entry `entryStatus` 的判定、按 `kBatchMaxEntries` 与 `kBatchMaxBytes` 的限流、SDK 的 `maxInflightBytes` 不生效这一事实，以及 staging arena 的「跨对象在飞 slot 上限 + `AcquireBatch` 原子预留」——只有全部 slot 被 quarantine 时才让 `AsuReadAvailable()` 变假，瞬时的 batch 超量不会让读失败。
+- **用户做什么**：调用 `BatchPut` / `BatchUpsert` 写入一批对象，或 `BatchGet` 读取一批对象。
+- **系统行为（写）**：批量路径在 `SubmitDfsWrites` 之后、`FinalizeBatchPut` 之前调用一次 `SubmitAsuWrites`：收集本批对象，调用一次 `BatchStoreObjects`；按对象边界切成若干 task（条数 ≤ `kBatchMaxEntries=110` 且 ≤ `staging_slots`，字节 ≤ `batch_max_bytes=64 MiB`），**绝不切开单个对象**；每个 task 一次 `BatchStoreAsync` + `Wait`，逐 entry `entryStatus` 回填到每个对象。主层失败的对象记 `asu_write_skipped_total{reason=primary_tier_failed}` 并零调用。`FinalizeBatchPut` 按对象决定终态，失败 op 不影响其它 op。
+- **系统行为（读）**：`Client::BatchGet` 收集 `AsuReadRequest`，在 DFS 批量读之后、RDMA 统一 Wait 之前调用一次 `BatchLoadObjects`；多个对象可合并进同一 task（同样按对象边界与 110/64 MiB 预算切分），逐 entry 归因，`PARTIAL_FAILED` 不得早退丢掉 per-entry 结果。
+- **期望结果**：同一批内某个对象的 ASU 写失败不会把其它对象标记为失败；`require_asu=false` 时失败对象按分层降级，`require_asu=true` 时该对象整体失败、其余对象仍置 COMPLETE。批量读按对象返回独立结果。
+- **对操作的要求**：批内错误隔离、逐 entry `entryStatus` 判定、按条数与字节限流、staging arena 的跨对象在飞 slot 上限与 `Reserve`/`AcquireBatch` 原子预留。
 
-> **[v2.0 变更]** v1.0 的批量写把 ASU 与 DFS 并列为同一批次的同步副本；v2.0 明确 `SubmitAsuWrites` 在 `SubmitDfsWrites` 之后执行且受 `NonDfsTransfersSucceeded` 门禁，批量读默认不跨对象合并 task。
+> **[v2.3 变更]** 批量语义从「每对象一个 task、不跨对象合并」改为「多个对象可合并进同一 task，按对象边界切分，逐 entry 归因」。
 
 ## 2. 设计描述
 
 ### 2.1 设计
 
-本节描述 `ReplicaType::ASU = 101` 的 ASUKvReplica 模块。它不是一个挂在现有 offload 插件下面的后端适配器，而是一个一等副本类型：Master 只铸造 48B 的 `AsuDescriptor` 并维护元数据与副本状态，不分配任何字节；Client 在 memory / nof 全部成功之后、`PutEnd` 之前，经 `kv::KvClient` 把对象按 512B 对齐的 chunk 同步写入 ASU；物理删除由 Master 自持的 delete-only `KvClient` 在宽限期后按 `key_id` 执行。
+本节描述 `ReplicaType::ASU = 101` 的 ASUKvReplica 模块。它不是一个挂在现有 offload 插件下面的后端适配器，而是一个一等副本类型：Master 只铸造 40B 的 `AsuDescriptor` 并维护元数据与副本状态，不分配任何字节；Client 在 memory / nof 全部成功之后、`PutEnd` 之前，经 `kv::KvClient` 把一个对象作为一条 512B 对齐 entry（`offset=0`）同步写入 ASU；物理删除由 Master 自持的 delete-only `KvClient` 在宽限期后按 `key_id` 执行。
 
 > **[v2.0 变更]** v1.0 把 ASU 描述为「与 memory 并行的同步副本、失败即整 Put revoke」。v2.0 依据用户的三条要求改写了模型：
 > (1) 写是**两阶段有序**——memory / nof 全部成功是 ASU 阶段的门禁，ASU 不再与 memory 并行，也不反向补位；
@@ -451,31 +466,31 @@ flowchart TB
 
 ASU 副本模块不是一个单点组件，而是同时出现在三个层次上的对称运行时：描述层（`Replica::Descriptor` 的 `AsuDescriptor` alternative）、Client 数据面（`AsuClientRuntime`）、Master 侧删除面（`AsuMasterRuntime`）。它横跨控制面与数据面，但两端互不侵入：Master 侧绝不经手对象字节（唯一的字节无关操作是 delete-only 的 key 级 `DeleteAsync`），Client 侧绝不重建 Master 的元数据。
 
-> **[v2.0 变更]** 与 v1.0 相比，L1 多出「有序写阶段」与「只删 MEMORY 的入口」，L2 多出显式读档位，L4 多出 `RemoveReplicaTier`；L3 / L5 的组成不变。写路径的**阶段边界**现在是一条显式的客户端门禁，而不是两侧同时扇出。
+> **[v2.3 变更]** 与 v1.0 相比，L1 多出「有序写阶段」与「BatchRemoveAsuObjects 删 ASU 入口」，L2 多出显式读档位；删 memory 仍是既有 `Remove`，不新增层。写路径的**阶段边界**现在是一条显式的客户端门禁，而不是两侧同时扇出。
 
 | 层 | 主要组成 | 上边界（被谁调用） | 下边界（调用谁） | 本期改动 |
 | --- | --- | --- | --- | --- |
 | L0 用户与 API 层 | 推理引擎、`MooncakeDistributedStore` / `store_py`、`RealClient` | Mooncake 公开 API：`Put` / `Get` / `Query` / `IsExist` / `Remove` 及其 batch 形式 | `Client` 实例 | 既有；`RealClient` 在 `Init` 中创建 `AsuClientRuntime`，并在读选择点传入 `asu_available` |
-| L1 Client 控制面 | `Client`：`Put`（client_service.cpp:2053）、`Upsert`（client_service.cpp:2271）、`Get`（client_service.cpp:1578）、`BatchGet`（client_service.cpp:1718）、`Remove`（client_service.cpp:3795）、`IsExist`（client_service.cpp:4191），新增 `RemoveMemoryReplica` | `RealClient`；`ReplicateConfig` | `MasterClient` RPC、`Replica::Descriptor`、`AsuClientRuntime` | 改动：有序两阶段写、分层 finalize、读档位、批量读收集、只删 memory 入口 |
+| L1 Client 控制面 | `Client`：`Put`（client_service.cpp:2053）、`Upsert`（client_service.cpp:2271）、`Get`（client_service.cpp:1578）、`BatchGet`（client_service.cpp:1718）、`Remove`（client_service.cpp:3795）、`IsExist`（client_service.cpp:4191），新增 `BatchRemoveAsuObjects` | `RealClient`；`ReplicateConfig` | `MasterClient` RPC、`Replica::Descriptor`、`AsuClientRuntime` | 改动：有序两阶段写、分层 finalize、读档位、批量读收集、删 ASU 入口（删 memory 复用既有 Remove） |
 | L2 副本描述与分派层 | `Replica::Descriptor`、`replica_selection.h`（`ReplicaReadRank` / `SelectBestReplica`）、`client_buffer.cpp` | L1 的选副本与尺寸计算 | 具体数据面（TransferEngine / 文件 / ASU） | 改动：新增 ASU alternative、显式档位、尺寸分支 |
 | L3 ASU 客户端数据面（新增） | `AsuClientRuntime` → `AsuStorageBackend` → `AsuStagingArena` + `AsuKvClientAdapter` → `kv::KvClient` → transport provider → ASU | `Client::SubmitAsuWrites` / `ReadAsuReplica` / `BatchGet` 在**主层成功之后**的同步调用 | `kv::KvClient` 公有异步 API 与 `Wait`（kv_client.h:33-59） | 全部新增 |
-| L4 Master 控制面 | `MasterService`：`PutStart` / `PutEnd` / `PutRevoke` / `RemoveObject` / 新增 `RemoveReplicaTier`、元数据与 oplog | `MasterClient` RPC | `ObjectMetadata`、oplog、`AsuMasterRuntime` | 改动：铸造 ASU、ALL 谓词、回收钩子、删除级联、只删 memory 路径 |
+| L4 Master 控制面 | `MasterService`：`PutStart` / `PutEnd` / `PutRevoke` / `RemoveObject` / 新增 `BatchRemoveAsuObjects`、元数据与 oplog | `MasterClient` RPC | `ObjectMetadata`、oplog、`AsuMasterRuntime` | 改动：铸造 ASU、ALL 谓词、回收钩子、删 ASU（捕获→既有 Remove→入队） |
 | L5 Master 侧 ASU 运行时（新增） | `AsuMasterRuntime` = `AsuAllocator` + `AsuDeleteQueue` + `AsuGcWorker` + delete-only `AsuStorageBackend` | `MasterService::AllocateReplicas`（master_service.h:1449）与 `FreeAsuReplicas` | `kv::KvClient` 的 `QueryAsync` / `DeleteAsync`，只传 key | 全部新增 |
 | L6 ASU 设备（外部） | `kv::KvClient` SDK、ASU 设备与设备侧 GC | L3 / L5 的 SDK 调用 | 物理设备 | 外部，模块边界之外 |
 
 边界说明：
 
-- 上边界只到 `Client` 的既有公开方法、新增的 `Client::RemoveMemoryReplica` 与 `MasterService::RemoveReplicaTier` 对应的新 RPC；不新增 `TaskType`，也不复用 `TaskType` 机制做删除。
-- 下边界只到 `kv::KvClient` 的公有 API：`QueryAsync`、`LoadAsync`、`StoreAsync`、`BatchLoadAsync`、`BatchStoreAsync`、`DeleteAsync`、`Wait`、`RegisterRegions`（kv_client.h:36-59）。
+- 上边界只到 `Client` 的既有公开方法（删 memory 复用 `Remove`/`BatchRemove`）与新增 `Client::BatchRemoveAsuObjects`；不新增 `TaskType`，也不复用 `TaskType` 机制做删除。
+- 下边界只到 `kv::KvClient` 的公有批量 API：`QueryAsync`、`BatchLoadAsync`、`BatchStoreAsync`、`DeleteAsync`、`Wait`、`RegisterRegions`（kv_client.h:36-59）。单条 `LoadAsync`/`StoreAsync` 不暴露、不调用。
 - **写路径的层次顺序由 Client 编排**：主层（MEMORY / NOF）先，`NonDfsTransfersSucceeded`（client_service.cpp:321-327）作为屏障，ASU 后；`asu_replica_num > 0` 时白名单要求 `dfs_replica_num == 0`，因此不存在 DFS 与 ASU 并存。Master 不编排顺序，只用副本状态（`PROCESSING` → `COMPLETE`）表达可见性，因此「顺序」是客户端不变量，「可见性」是服务端不变量。
-- **删除路径有两条独立入口**：删 memory 走 `RemoveReplicaTier`，删 ASU 复用既有 `Remove` / `RemoveObject` 并做有序级联；两者都不做物理删除，物理删除只在 L5。
+- **删除路径有两条独立入口**：删 memory 复用既有 `Client::Remove` / `BatchRemove`（只删 memory 与元数据、不触达 ASU）；删 ASU 走新增 `BatchRemoveAsuObjects`（捕获 descriptor → 既有 Remove → 入队）。两者都不做物理删除，物理删除只在 L5。
 - L4 / L5 绝不经手对象字节；L5 只发 keys-only 的 `QueryAsync` / `DeleteAsync`。
 - L3 承担全部字节搬运、`AsuRecordHeader` 编码与 CRC 校验。
 - L2 的 `AsuDescriptor` 是两端之间唯一的契约，客户端绝不自行重算 `asu_key_id`。
 
 ##### 2.1.1.2 逻辑模型图
 
-> **[v2.0 变更]** 图 1 在 v1.0 的分层图上新增了写序屏障节点（`NonDfsTransfersSucceeded`）与 `RemoveReplicaTier`；图 2 是新增的，用来把三条要求各自的「方向」画清楚：写是链式的、读的决策在 Client、删除有两个反向入口。
+> **[v2.3 变更]** 图 1 在 v1.0 的分层图上新增了写序屏障节点（`NonDfsTransfersSucceeded`）与 `BatchRemoveAsuObjects`；图 2 是新增的，用来把三条要求各自的「方向」画清楚：写是链式的、读的决策在 Client、删除有两个反向入口。
 
 图 1 是分层与依赖视图：
 
@@ -488,7 +503,7 @@ graph TD
     end
 
     subgraph L1["L1 Client 控制面"]
-        C["Client<br/>Put Upsert Get BatchGet Remove<br/>RemoveMemoryReplica"]
+        C["Client<br/>Put Upsert Get BatchGet Remove<br/>BatchRemoveAsuObjects"]
         SUM["ReplicaTransferSummary<br/>allocated / successful / failed<br/>memory nof dfs asu"]
         FD["DetermineFinalizeDecision<br/>ALL / MEMORY+ASU / ALL"]
     end
@@ -510,7 +525,7 @@ graph TD
 
     subgraph L3A["L3b ASU 数据面 新增"]
         ACR["AsuClientRuntime"]
-        ASB["AsuStorageBackend<br/>WriteObject / ReadObjects"]
+        ASB["AsuStorageBackend<br/>BatchStoreObjects / BatchLoadObjects"]
         ASA["AsuStagingArena<br/>FreeSlots / IsAvailable"]
         AKA["AsuKvClientAdapter"]
     end
@@ -518,7 +533,7 @@ graph TD
     subgraph L4["L4 Master 控制面"]
         MC["MasterClient RPC"]
         MS["MasterService<br/>元数据与副本状态权威"]
-        RRT["RemoveReplicaTier<br/>只移除 MEMORY"]
+        RRT["BatchRemoveAsuObjects<br/>捕获→既有 Remove→入队"]
     end
 
     subgraph L5["L5 Master 侧 ASU 运行时 新增"]
@@ -570,7 +585,7 @@ flowchart TD
         W1["Master PutStart<br/>memory PROCESSING + AsuDescriptor PROCESSING"]
         W2["Client 写 MEMORY NOF DFS"]
         W3{"NonDfsTransfersSucceeded"}
-        W4["Client 写 ASU<br/>chunk 1 到 N-1 先写 chunk0 最后"]
+        W4["Client 写 ASU<br/>一个对象一条 entry offset=0 多对象可合批"]
         W5["Master finalize"]
         W6["PutEnd ALL<br/>Put 成功"]
         W7["PutEnd MEMORY + PutRevoke ASU<br/>Put 成功 记 asu_degraded"]
@@ -587,23 +602,23 @@ flowchart TD
         R1["Master GetReplicaList<br/>返回全部可读副本"]
         R2["Client SelectBestReplica<br/>ReplicaReadRank"]
         R3["MEMORY NOF LOCAL_DISK DFS DISK<br/>既有数据面"]
-        R4["AsuStorageBackend ReadObjects<br/>BatchLoadAsync 逐 entry 校验"]
+        R4["AsuStorageBackend BatchLoadObjects<br/>BatchLoadAsync 逐 entry 校验"]
         R1 --> R2
         R2 -->|其它档位| R3
         R2 -->|第 5 档 ASU| R4
     end
 
     subgraph D["删 两个反向动词"]
-        D1["RemoveMemoryReplica<br/>只移除 MEMORY"]
-        D2["Remove<br/>删 ASU 等于整对象删除"]
-        D3["先移除 MEMORY 元数据与 buffer"]
-        D4["再移除 ASU 元数据并入 AsuDeleteQueue"]
+        D1["Client::Remove / BatchRemove<br/>只删 memory 与元数据 不触达 ASU"]
+        D2["BatchRemoveAsuObjects<br/>先捕获 descriptor"]
+        D3["调用既有 RemoveObject 删 memory 与元数据"]
+        D4["再用捕获的 key_id 入 AsuDeleteQueue"]
         D5["AsuGcWorker 宽限期后 DeleteAsync"]
         D2 --> D3 --> D4 --> D5
     end
 ```
 
-图中实线表示调用方向，边标签标出该段承载的操作。写、读、查三条路径都从 `Client` 出发，但 v2.0 的**写**多了一个门禁：主层数据面中的 MEMORY / NOF 分支（`TT`）必须先汇入 `NonDfsTransfersSucceeded`，通过后才有指向 `AsuClientRuntime` 的边；`DFSW` 不在该屏障内，且 `asu_replica_num > 0` 时 `dfs_replica_num` 必须为 0，两者不会并存。主层失败时这条边不存在，ASU 阶段零调用。**读**的决策点在 Client 的 `ReplicaReadRank`/`SelectBestReplica`，ASU 只是第 5 档的一个选项，选中后经 `AsuStorageBackend::ReadObjects` 落到 `BatchLoadAsync`。**删除**有两条互不相交的入口：`RemoveReplicaTier` 只摘 MEMORY，`Remove`（删 ASU）在同一个 key 写锁事务内先摘 MEMORY 再摘 ASU，物理删除完全绕开 `Client` 数据面，由 L5 的 `AsuGcWorker` 在宽限期后经 delete-only 后端执行。
+图中实线表示调用方向，边标签标出该段承载的操作。写、读、查三条路径都从 `Client` 出发，但 v2.0 的**写**多了一个门禁：主层数据面中的 MEMORY / NOF 分支（`TT`）必须先汇入 `NonDfsTransfersSucceeded`，通过后才有指向 `AsuClientRuntime` 的边；`DFSW` 不在该屏障内，且 `asu_replica_num > 0` 时 `dfs_replica_num` 必须为 0，两者不会并存。主层失败时这条边不存在，ASU 阶段零调用。**读**的决策点在 Client 的 `ReplicaReadRank`/`SelectBestReplica`，ASU 只是第 5 档的一个选项，选中后经 `AsuStorageBackend::BatchLoadObjects` 落到 `BatchLoadAsync`。**删除**有两条互不相交的入口：`Client::Remove`/`BatchRemove` 只删 memory 与元数据、不触达 ASU；`BatchRemoveAsuObjects` 先捕获 descriptor，再调用既有 Remove，最后入队，物理删除完全绕开 `Client` 数据面，由 L5 的 `AsuGcWorker` 在宽限期后经 delete-only 后端执行。
 
 **元数据权威与副本状态权威分别在哪一层**：
 
@@ -614,27 +629,27 @@ flowchart TD
 
 ##### 2.1.1.3 各组成部分的职责与边界
 
-> **[v2.0 变更]** 新增 `ReplicaTransferSummary` / `DetermineFinalizeDecision` / `RemoveReplicaTier` 三行；`Client` 行改为「有序两阶段 + 分层 finalize + 读档位 + 只删 memory」；`MasterService` 行补 `RemoveReplicaTier`、`CollectAsuDescriptors`、`EnqueueAsuDeletes`。
+> **[v2.3 变更]** 新增 `ReplicaTransferSummary` / `DetermineFinalizeDecision` / `BatchRemoveAsuObjects` 三行；`Client` 行改为「有序两阶段 + 分层 finalize + 读档位 + 删 ASU」；`MasterService` 行补 `BatchRemoveAsuObjects`、`CollectAsuDescriptors`、`EnqueueAsuDeletes`。
 
 | 组件 | 职责 | 明确不做什么 |
 | --- | --- | --- |
 | `RealClient` | 进程级装配：创建 `AsuClientRuntime` 并交给 `Client`；在读选择点为每个 key 传入 `asu_available`；与 `enable_ssd_offload` 的 `FileStorage` 初始化并列但不依赖该分支（real_client.cpp:1594-1605） | 不参与单次请求的副本决策，不做写序编排 |
-| `Client` | 写：主层传输 → `NonDfsTransfersSucceeded` 门禁 → `SubmitAsuWrites`；finalize：`DetermineFinalizeDecision` 的 TIERED 三分支；读：`ReadReplicaSelector` + `ReadAsuReplica` / `BatchGet` 收集；删：`RemoveMemoryReplica` 转发 | 不维护 `key_id` / `object_epoch`，只使用 descriptor；不在主层失败时调用 ASU |
+| `Client` | 写：主层传输 → `NonDfsTransfersSucceeded` 门禁 → `SubmitAsuWrites`；finalize：`DetermineFinalizeDecision` 的 TIERED 三分支；读：`ReadReplicaSelector` + `ReadAsuReplica` / `BatchGet` 收集；删：`BatchRemoveAsuObjects` 转发（删 memory 复用既有 `Remove`） | 不维护 `key_id` / `object_epoch`，只使用 descriptor；不在主层失败时调用 ASU |
 | `ReplicaTransferSummary` | 既有结构，新增 `allocated_asu_replicas` / `successful_asu_transfers` / `failed_asu_transfers` 与三个 `Record*` 分支；`AllAllocatedTransfersSucceeded` **不含** ASU | 不把 ASU 当作主层成功条件 |
 | `DetermineFinalizeDecision` | 既有双槽 `{end_type, revoke_type}`；TIERED 模式映射为 `{ALL,null,true}` / `{MEMORY,ASU,true}` / `{null,ALL,false}` | 不向量化、不新增 `revoke_asu` 字段 |
 | `Replica::Descriptor` / `replica_selection.h` / `client_buffer.cpp` | 跨进程描述与本地尺寸计算；`AsuDescriptor` 是 `descriptor_variant` 的新 alternative；`ReplicaReadRank` 把 ASU 固定在第 5 档 | 不承载任何后端句柄或 fd；不做副本状态判断 |
 | `AsuClientRuntime` | Client 侧 ASU 运行时的聚合根，持有一个 `AsuStorageBackend`；`IsReady()` 纳入 staging arena 可用性 | 不感知 Mooncake 对象元数据 |
-| `AsuStorageBackend` | 对象级 I/O 唯一实现：写为分块 + staging + header/CRC + chunk0 最后写；读为 `ReadObjects`（`ReadObject` 退化为单元素 wrapper）；同一类在 Master 侧以 delete-only 模式复用 | 不做副本选择，不改 Master 元数据，不缓存对象 |
+| `AsuStorageBackend` | 对象级批量 I/O 唯一实现：一个对象一条 entry（offset=0），`BatchStoreObjects` 按 `PlanBatches` 跨对象打包，`BatchLoadObjects` 跨对象合批并逐 entry 校验/回填；同一类在 Master 侧以 delete-only 模式复用 | 不做副本选择，不改 Master 元数据，不缓存对象 |
 | `AsuStagingArena` | 512B 对齐、Init 时一次性 `RegisterRegions` 的常驻 pinned 缓冲池；slot 状态 `FREE` / `IN_USE` / `QUARANTINED`；暴露 `FreeSlots()` / `IsAvailable()` | 不使用 `PinnedBufferPool`，不与 offload 共享缓冲 |
 | `AsuKvClientAdapter` | 包装 `kv::KvClient`：显式 `Wait` 超时、逐 entry 判定、`entryStatus` 到 `ErrorCode` 的映射；`PARTIAL_FAILED` 必须进入逐 entry 归因 | 不重试有副作用的部分失败，不吞错误，不把 `PARTIAL_FAILED` 当整体失败 |
 | `kv::KvClient` | ASU 的唯一下边界：异步提交与 `Wait` | 不提供长度、Stat、GetMeta API；`maxInflightBytes` 不生效 |
-| `MasterService` | 元数据与副本状态唯一权威：`AsuDescriptor` 的铸造时机、`PROCESSING` → `COMPLETE`、ALL 谓词、回收与级联、`RemoveReplicaTier` | 不访问 ASU 数据面、不读对象字节；不在 `master_state_mutex_` 下做网络 I/O |
-| `RemoveReplicaTier`（MasterService 新方法） | 只移除 `COMPLETE` 的 MEMORY 副本：`master_state_mutex_` → key 写锁 → `CheckRemovable` → `fn_is_busy` 保护 → 单谓词 pop → 视 `IsValid()` 决定是否 `accessor.Erase()` | 不动 ASU、不做物理删除、不绕过 refcnt |
-| `CollectAsuDescriptors` / `EnqueueAsuDeletes` | 整对象 teardown 的两段：先捕获 `AsuDescriptor`，待 MEMORY buffer 释放后再入 `AsuDeleteQueue` | 不在捕获阶段入队（否则会与「先删 memory」的可观测顺序相反） |
+| `MasterService` | 元数据与副本状态唯一权威：`AsuDescriptor` 的铸造时机、`PROCESSING` → `COMPLETE`、ALL 谓词、回收、`BatchRemoveAsuObjects`（捕获→既有 Remove→入队） | 不访问 ASU 数据面、不读对象字节；不在 `master_state_mutex_` 下做网络 I/O |
+| `BatchRemoveAsuObjects`（MasterService 新方法） | 逐 key 三阶段：key 写锁内只读捕获 `AsuDescriptor` → 调用既有 `RemoveObject`（一行不改）→ 对成功或 `OBJECT_NOT_FOUND` 的 key 入 `AsuDeleteQueue` | plain Remove 不捕获、不入队 ASU；不做物理删除、不绕过 refcnt 与完成度 |
+| `CollectAsuDescriptors` / `EnqueueAsuDeletes` | `BatchRemoveAsuObjects` 的两个辅助：捕获 `AsuDescriptor`、把捕获集合入 `AsuDeleteQueue`；`EraseMetadata` 不再调用它们 | 不在 plain Remove 路径入队 |
 | `AsuMasterRuntime` | Master 侧 ASU 运行时聚合根，组合 `AsuAllocator`、删除队列、GC 线程与 delete-only 后端 | 不做分配记账，不持有数据缓冲 |
 | `AsuAllocator` | 纯命名分配：`Allocate` 返回 `AsuDescriptor`；维护**全局单调** `object_epoch`（随机种子、每次自增、恢复时推进）与 `max_object_bytes` | 不占 segment、不分配字节、无 offset 账本 |
 | `AsuDeleteQueue` / `AsuGcWorker` | 按 `key_id` 去重的延迟删除队列与独立 GC 线程；元素带 `not_before`，到期后批量 `DeleteAsync`，可重试、超限丢弃并计数 | 不在 `master_state_mutex_` 或 key 锁下做网络 I/O |
-| delete-only `AsuStorageBackend` | 只保留 `QueryObject` / `DeleteObject` 路径 | 不分配 staging、不 `RegisterRegions` |
+| delete-only `AsuStorageBackend` | 只保留 `BatchIsExist` / `BatchRemoveObjects` 路径 | 不分配 staging、不 `RegisterRegions` |
 
 ##### 2.1.1.4 元数据权威与副本状态权威所在层
 
@@ -646,7 +661,7 @@ flowchart TD
 - **逻辑存在性**：由 Master 元数据回答（`IsExist` 与 `Query`）。物理存在性只能由 `QueryAsync` 的 `exists` 位图观测（kv_types.h:98-101），仅用于诊断与错误归因，不是 Mooncake 可见性权威。删除 memory 后对象仍 `IsValid`（object_metadata.h:488-494），因此查询返回存在。
 - **副本状态**：`Replica::status_` 是唯一权威。`GetReadableReplicaDescriptors`（master_service.cpp:4487-4500）遍历 Part 0 时用恒真谓词，只经 `IsReplicaReadable`（4502-4505，`is_completed() && is_available() && !IsAwaitingRemount`）过滤，**不按副本类型筛、不排序**——这正是要求 2「Master 返回所有副本」已经成立的原因，Master 侧不需改动。删除侧同理：`CheckRemovable` 的 `AllReplicas(&Replica::fn_is_completed)`（master_service.cpp:7248）让任何 `PROCESSING` 副本挡住删除，这是要求 1 与要求 3 的写删互斥。
 - **物理记录状态**：`NONE → PARTIAL → COMMITTED → DELETE_PENDING → DELETED`，失败可落 `ORPHAN`。它只影响诊断与 GC 重试，不参与可见性判定；即使物理上 `COMMITTED`，只要 Master 里不是 `COMPLETE`，读路径也看不见。
-- **分片表**：不存在。`chunk_count`、每 chunk 的 `offset` 与 `data_len` 是 `object_size` 加 `descriptor.chunk_payload` 的纯函数；每 chunk 的 `data_len` 与 CRC 在自身 `AsuRecordHeader` 里。没有 per-object shard 索引或 meta entry。
+- **分片表**：不存在。一个对象一条 entry，`offset` 恒 0；`object_size` 与 payload CRC 在自身 `AsuRecordHeader` 里。没有 per-object shard 索引或 meta entry。
 - **Master 维护的状态**：`ObjectMetadata` 里的 `AsuDescriptor`（本来就要持久化）、`AsuAllocator` 的 `object_epoch` 计数器、内存删除队列。没有字节账本、容量水位或 offset 分配表。
 - **Master 重启**：`MetadataPayload`（metadata_store.h:104-116）持久化 `vector<Replica::Descriptor>`，`AsuDescriptor` 可 struct_pack 序列化，restore 只需两处 descriptor 重建并推进 epoch，不访问 ASU、不需要 allocator 状态。
 
@@ -667,21 +682,21 @@ flowchart TD
 | 操作 | 用户可见入口 | L1 / L2 | L3 | L4 | L5 | L6 |
 | --- | --- | --- | --- | --- | --- | --- |
 | 写（主层） | `Put` / `Upsert` / `BatchPut` / `BatchUpsert` | 请求 `asu_replica_num=1`；`PutStart` 拿回含 `AsuDescriptor` 的副本列表；`SubmitTransfers` + `WaitForTransfers` 写 MEMORY / NOF / DFS | 不参与 | 只铸 descriptor 与改副本状态 | 不参与 | 不参与 |
-| 写（ASU 第二阶段） | 同上，无新增入口 | `SubmitAsuWrites`：门禁 `NonDfsTransfersSucceeded`，然后逐对象 `WriteObject` | 分块、编码、`BatchStoreAsync`、`Wait`、chunk0 最后写 | 只接收 finalize | 不参与 | `BatchStoreAsync` |
-| 读 | `Get` / `BatchGet` | Master 返回全部可读副本；Client 按档位选中 ASU 后 `ReadAsuReplica` 或收集进 `ReadObjects` | 按 chunk `BatchLoadAsync`、校验 header 与 CRC、回填 | `GetReplicaList` 只查元数据并授租约 | 不参与 | `BatchLoadAsync` |
+| 写（ASU 第二阶段） | 同上，无新增入口 | `SubmitAsuWrites`：门禁 `NonDfsTransfersSucceeded`，然后逐对象 `BatchStoreObjects` | 编码、`BatchStoreAsync`、`Wait`、逐 entry 归因 | 只接收 finalize | 不参与 | `BatchStoreAsync` |
+| 读 | `Get` / `BatchGet` | Master 返回全部可读副本；Client 按档位选中 ASU 后 `ReadAsuReplica` 或收集进 `BatchLoadObjects` | 合批 `BatchLoadAsync`、校验 header 与 CRC、回填 | `GetReplicaList` 只查元数据并授租约 | 不参与 | `BatchLoadAsync` |
 | 查 | `IsExist` / `BatchIsExist` / `Query` | 直接走 Master RPC，零额外 RTT | 不参与（诊断路径除外） | 元数据回答 | 不参与 | 不参与（物理探活时才 `QueryAsync`） |
-| 删 memory | `RemoveMemoryReplica` | `Client` 只转发 | 不参与 | `RemoveReplicaTier`：只 pop MEMORY，对象与 ASU 保留 | 不参与 | 不参与 |
-| 删 ASU | `Remove` | `Client::Remove` 只转发 | 不参与 | `RemoveObject` → `EraseMetadata` 三段：捕获 ASU → 释放 memory → 入队；HA 下两段 pop | 宽限期后 `DeleteAsync` | `DeleteAsync` |
+| 删 memory | `Remove` / `BatchRemove` | `Client` 只转发既有 RPC | 不参与 | `RemoveObject`：删 memory 与元数据、不触达 ASU | 不参与 | 不参与 |
+| 删 ASU | `BatchRemoveAsuObjects` | `Client` 转发新增 RPC | 不参与 | 捕获 ASU descriptor → 既有 `RemoveObject` → 入队；HA 下按 `enqueue_asu_deletes` 标志 | 宽限期后 `DeleteAsync` | `DeleteAsync` |
 
 ##### 2.1.1.6 与 DFS 路线、local_disk 路线的位置差异
 
-> **[v2.0 变更]** 「写入时机」改为「memory 全部成功之后」；新增「删除语义」一行说明两个方向；「按 key 删除」补上 `RemoveReplicaTier` 只删 memory 的语义。
+> **[v2.3 变更]** 「写入时机」改为「memory 全部成功之后」；新增「删除语义」一行说明两个方向；「按 key 删除」补上 `BatchRemoveAsuObjects` 先调既有 Remove 的语义。
 
 | 维度 | DFS 路线 | local_disk 路线 | 本方案 ASUKvReplica |
 | --- | --- | --- | --- |
 | 副本类型 | 复用 `ReplicaType::DFS = 100` | 不是副本类型，只是一个 `StorageBackendInterface` 插件 | 新增 `ReplicaType::ASU = 101` |
 | 模块位置 | L2 描述层 + `DistributedStorageBackend` / `FileSystemAdapter`（fs_adapter.h:34、distributed_storage_backend.h:40-49） | L1 之后的 offload 线程 → `StorageBackendInterface::BatchOffload`（storage_backend.h:263、274） | L2 一等 descriptor + L3 客户端数据面 + L5 Master 删除运行时 |
-| 写入时机 | `PutEnd` 前由 `TransferWrite` 交给 DFS 后端，与 MEMORY 并行 | `PutEnd` 之后由心跳驱动的推式 `BatchOffload`，带 `complete_handler` | **两阶段**：MEMORY / NOF 全部成功（屏障 `NonDfsTransfersSucceeded`）后、`PutEnd` 前同步 `WriteObject`；主层失败则零调用 |
+| 写入时机 | `PutEnd` 前由 `TransferWrite` 交给 DFS 后端，与 MEMORY 并行 | `PutEnd` 之后由心跳驱动的推式 `BatchOffload`，带 `complete_handler` | **两阶段**：MEMORY / NOF 全部成功（屏障 `NonDfsTransfersSucceeded`）后、`PutEnd` 前同步 `BatchStoreObjects`；主层失败则零调用 |
 | 失败语义 | 计入 `AllAllocatedTransfersSucceeded`，失败即整 Put revoke | 异步，失败不影响 Put | **按 `require_asu`**：默认 false 为分层降级（主层成功 + ASU 失败 → `PutEnd(MEMORY)` + `PutRevoke(ASU)`，Put 成功）；true 为整体失败（`PutRevoke(ALL)`） |
 | 长度权威 | `DistributedFSDescriptor.object_size`（replica.h:329-337） | 后端没有长度权威（`GetObjectDataSize` 默认返回 `std::nullopt`） | `AsuDescriptor.object_size`，来自 Master 元数据 |
 | 按 key 删除 | `FreeDfsReplicas` 只把 extent 交还 `dfs_allocator_`（master_service.cpp:7583-7593），不是按 key 删后端对象 | 接口没有 per-key 删除，只有整后端清空的 `RemoveAll`（storage_backend.h:321） | Master 自持 delete-only `KvClient` + 延迟 GC，按 `key_id` 精确删除 |
@@ -705,7 +720,7 @@ flowchart TD
 
 图中 `ReplicaDescriptor` 是既有嵌套类型 `Replica::Descriptor` 的图内简写，`KvClient` 是外部 SDK 类型 `kv::KvClient`。为可读性，图中省略 `tl::expected<..., ErrorCode>` 外壳、只保留成功值的类型名（失败即 `tl::unexpected`），泛型用 mermaid 的 `~T~` 记法；**容器与指针不省略**。真实签名见 §3 各 shard 的代码。标注 `new` 为新增类，`modified` 为既有类的小改动，`existing` / `external` 为对照项。
 
-> **[v2.0 变更]** 新增 `ReplicaReadRank`、`ReadSelectionPolicy`、`AsuReadRequest`、`AsuReadOutcome`、`ReplicaSelection`（自由函数集合）、`ReplicaTransferSummary`、`ReplicaWriteMode`；`Client` 增加 `WriteAsuReplicaForSingle` / `AsuReadAvailable` / `RemoveMemoryReplica`；`MasterService` 增加 `RemoveReplicaTier` / `CollectAsuDescriptors` / `EnqueueAsuDeletes` 并改 `AllocateReplicas` / `FreeAsuReplicas` 签名；`AsuStorageBackend` 的 `ReadObject` 退化为 `ReadObjects` 的 wrapper；`AsuDeleteQueue` 改 `TakeDue` / `Requeue` / `Size` / `DroppedCount`。**`AsuDeleteQueue` / `AsuGcWorker` / delete-only `AsuStorageBackend` 在 v2.0 是保留项，不从图中删除。**
+> **[v2.0 变更]** 新增 `ReplicaReadRank`、`ReadSelectionPolicy`、`AsuReadRequest`、`AsuReadResult`、`ReplicaSelection`（自由函数集合）、`ReplicaTransferSummary`、`ReplicaWriteMode`；`Client` 增加 `WriteAsuReplicaForSingle` / `AsuReadAvailable` / `BatchRemoveAsuObjects`；`MasterService` 增加 `BatchRemoveAsuObjects` / `CollectAsuDescriptors` / `EnqueueAsuDeletes` 并改 `AllocateReplicas` / `FreeAsuReplicas` 签名；`AsuStorageBackend` 只暴露对象级批量方法 `BatchStoreObjects` / `BatchLoadObjects` / `BatchIsExist` / `BatchRemoveObjects`。**`AsuDeleteQueue` / `AsuGcWorker` / delete-only `AsuStorageBackend` 在 v2.0 是保留项，不从图中删除。**
 
 ```mermaid
 classDiagram
@@ -739,8 +754,6 @@ classDiagram
         +uint64_t key_fingerprint
         +uint64_t object_epoch
         +uint64_t object_size
-        +uint32_t chunk_payload
-        +uint32_t chunk_count
         +uint32_t record_version
         +uint32_t flags
     }
@@ -775,27 +788,16 @@ classDiagram
         +uint64_t key_fingerprint
         +uint64_t object_epoch
         +uint64_t object_size
-        +uint32_t chunk_index
-        +uint32_t chunk_count
         +uint32_t data_offset
         +uint32_t data_len
         +uint32_t data_crc32c
-        +uint32_t chunk_payload
         +uint64_t replica_id
     }
 
     class AsuRecordCodec {
         <<new>>
-        +Encode(header, descriptor, index, data_len, data_crc32c, replica_id) void
-        +DecodeAndValidate(raw, expected, index) ErrorCode
-    }
-
-    class AsuChunkPlanner {
-        <<new>>
-        +Count(object_size) uint32_t
-        +DataLen(object_size, index) uint32_t
-        +Offset(index) uint64_t
-        +WireLen(data_len) uint32_t
+        +Encode(header, descriptor, data_len, data_crc32c, replica_id) void
+        +DecodeAndValidate(raw, expected) ErrorCode
     }
 
     class AsuConfig {
@@ -847,7 +849,7 @@ classDiagram
         +string message
     }
 
-    class IAsuKvClient {
+    class AsuKvClientInterface {
         <<interface>>
         +Init(config) ErrorCode
         +Shutdown() void
@@ -880,22 +882,19 @@ classDiagram
         +span slices
     }
 
-    class AsuReadOutcome {
+    class AsuReadResult {
         <<new>>
         +ErrorCode error
         +uint64_t bytes
-        +uint32_t chunks
     }
 
     class AsuStorageBackend {
         <<new>>
         +Create(config, client, register_staging) AsuStorageBackend
-        +WriteObject(descriptor, slices, trace_id) ErrorCode
-        +ReadObjects(requests, trace_id) vector~AsuReadOutcome~
-        +ReadObject(descriptor, slices, trace_id) ErrorCode
-        +QueryObject(descriptor, trace_id) bool
-        +DeleteObject(descriptor, trace_id) ErrorCode
-        +DeleteObjects(descriptors, trace_id) ErrorCode
+        +BatchStoreObjects(requests, trace_id) vector~ErrorCode~
+        +BatchLoadObjects(requests, trace_id) vector~AsuReadResult~
+        +BatchIsExist(descriptors, trace_id) vector~bool~
+        +BatchRemoveObjects(descriptors, trace_id) ErrorCode
         +IsReady() bool
         +Shutdown() void
     }
@@ -1020,7 +1019,7 @@ classDiagram
         +WriteAsuReplicaForSingle(op) ErrorCode
         +ReadAsuReplica(key, descriptor, slices) ErrorCode
         +AsuReadAvailable() bool
-        +RemoveMemoryReplica(key, force) ErrorCode
+        +BatchRemoveAsuObjects(keys, force) ResultList
     }
 
     class MasterService {
@@ -1030,7 +1029,7 @@ classDiagram
         +PutEnd(client_id, key, tenant_id, replica_type) ErrorCode
         +PutRevoke(client_id, key, tenant_id, replica_type) ErrorCode
         +RemoveObject(key, tenant_id, force, allow_managed_weight) ErrorCode
-        +RemoveReplicaTier(key, tenant_id, replica_type, force) ErrorCode
+        +BatchRemoveAsuObjects(keys, tenant_ids, force) ResultList
         +CollectAsuDescriptors(metadata) vector~AsuDescriptor~
         +EnqueueAsuDeletes(key, descriptors, not_before) void
         +FreeAsuReplicas(key, replicas, not_before) void
@@ -1084,23 +1083,21 @@ classDiagram
     AsuMasterRuntime o-- AsuStorageBackend : delete-only
     AsuGcWorker --> AsuDeleteQueue
     AsuGcWorker --> AsuStorageBackend
-    AsuStorageBackend *-- IAsuKvClient
+    AsuStorageBackend *-- AsuKvClientInterface
     AsuStorageBackend o-- AsuStagingArena
     AsuStorageBackend ..> AsuRecordCodec
-    AsuStorageBackend ..> AsuChunkPlanner
     AsuStorageBackend ..> AsuConfig
     AsuStorageBackend ..> AsuReadRequest
-    AsuStorageBackend ..> AsuReadOutcome
+    AsuStorageBackend ..> AsuReadResult
     AsuStagingArena *-- AsuStagingSlot
-    AsuStagingArena --> IAsuKvClient : RegisterRegions
-    AsuKvClientAdapter ..|> IAsuKvClient
+    AsuStagingArena --> AsuKvClientInterface : RegisterRegions
+    AsuKvClientAdapter ..|> AsuKvClientInterface
     AsuKvClientAdapter --> KvClient
-    IAsuKvClient ..> AsuEntryResult
+    AsuKvClientInterface ..> AsuEntryResult
     AsuRecordCodec ..> AsuRecordHeader
     AsuRecordCodec ..> AsuDescriptor
     AsuKeyCodec ..> AsuKeyMaterial
     AsuAllocator ..> AsuKeyCodec
-    AsuAllocator ..> AsuChunkPlanner
     AsuAllocator ..> AsuConfig
     AsuDeleteQueue *-- AsuDeleteItem
     AsuGcWorker ..> AsuConfig
@@ -1118,30 +1115,29 @@ classDiagram
 
 ##### 2.1.2.2 逐类简介
 
-> **[v2.0 变更]** 新增 `ReplicaWriteMode`、`ReplicaTransferSummary`、`FinalizeDecision`、`ReplicaReadRank`、`ReadSelectionPolicy`、`ReplicaSelection`、`AsuReadRequest`、`AsuReadOutcome` 八行；`AsuStorageBackend` / `AsuStagingArena` / `AsuAllocator` / `AsuDeleteItem` / `AsuDeleteQueue` / `AsuConfig` / `Client` / `MasterService` 的方法列按 v2 更新。
+> **[v2.0 变更]** 新增 `ReplicaWriteMode`、`ReplicaTransferSummary`、`FinalizeDecision`、`ReplicaReadRank`、`ReadSelectionPolicy`、`ReplicaSelection`、`AsuReadRequest`、`AsuReadResult` 八行；`AsuStorageBackend` / `AsuStagingArena` / `AsuAllocator` / `AsuDeleteItem` / `AsuDeleteQueue` / `AsuConfig` / `Client` / `MasterService` 的方法列按 v2 更新。
 
 > **[v2.1 变更]** 新增 `BuildEntry`（`asu_entry.h` 的自由函数，Store/Load 的唯一 entry 构造点）与 `AsuStagingArena::Handle()` / `TokenId()` / `InUseSlots()`；`KvClient` 外部类补 `UnregisterRegions`。
 
 | 类 | 类型 | 职责 | 关键方法 | 交互对象 | 生命周期 |
 | --- | --- | --- | --- | --- | --- |
-| `AsuDescriptor` | 新增，`replica.h` 中纯数据 struct | 48B 线格式：`key_id`、`key_fingerprint`、`object_epoch`、`object_size`、`chunk_payload`、`chunk_count`、`record_version`、`flags`，`YLT_REFL` | 无成员函数 | 被 `AsuReplicaData` 与 `Replica::Descriptor` 组合；随 RPC 与 oplog 跨进程 | 值类型，随副本生灭 |
+| `AsuDescriptor` | 新增，`replica.h` 中纯数据 struct | 40B 线格式：`key_id`、`key_fingerprint`、`object_epoch`、`object_size`、`record_version`、`flags`，`YLT_REFL` | 无成员函数 | 被 `AsuReplicaData` 与 `Replica::Descriptor` 组合；随 RPC 与 oplog 跨进程 | 值类型，随副本生灭 |
 | `AsuReplicaData` | 新增，纯数据 struct | `Replica::data_` 的新 alternative，只含一个 `AsuDescriptor` | 无 | 被 `Replica` 聚合 | 与 `Replica` 同生命周期 |
 | `AsuKeyCodec` | 新增，静态类 | 由 `scoped_key`（含 tenant）、`user_key` 与 `object_epoch` 推导 `key_id`、`key_fingerprint`、`CacheKey`；Master 与客户端共用同一实现 | `Derive`、`ToCacheKey` | `AsuAllocator`；客户端只消费 descriptor 里的 `key_id` | 无状态 |
 | `AsuKeyMaterial` | 新增，值类型 | `Derive` 的三元组返回值 | 无 | `AsuKeyCodec` | 调用期栈上 |
 | `AsuRecordCodec` | 新增，静态类 | `AsuRecordHeader` 的逐字段编解码、header CRC 与 payload CRC 计算、字段交叉校验 | `Encode`、`DecodeAndValidate` | `AsuStorageBackend` | 无状态 |
-| `AsuRecordHeader` | 新增，值类型 | 每 chunk 开头 512B 自描述头的内存表示 | 无 | `AsuRecordCodec` | 调用期栈上 |
-| `AsuChunkPlanner` | 新增，静态类 | 分块公式：chunk 数、每 chunk 的未填充长度、offset、线上长度；**默认部署下 `chunk_count` 恒为 1，多 chunk 已设计但不可达** | `Count`、`DataLen`、`Offset`、`WireLen` | `AsuStorageBackend`、`AsuAllocator`、校验代码 | 无状态 |
-| `asu_layout.h` | 新增，命名空间而非类 | 编译期常量：`kAlign`、`kEntryMaxBytes`、`kChunkPayloadBytes`、`kChunkStrideBytes`、`kMaxChunks`、`kMaxObjectBytes`、`kBatchMaxEntries`、`kBatchMaxBytes`、`kDefaultWaitTimeoutMs`，以及 `static_assert` 边界断言、`AlignUp` 与 `IsValidEntry` 等 constexpr 纯函数 | 仅编译期 | `AsuChunkPlanner`、`AsuStorageBackend`、`AsuConfig` | 无状态 |
+| `AsuRecordHeader` | 新增，值类型 | 每条 entry 开头 512B 自描述头（一个对象一条 entry） | 无 | `AsuRecordCodec` | 调用期栈上 |
+| `asu_layout.h` | 新增，命名空间而非类 | 编译期常量：`kAlign`、`kHeaderBytes`、`kEntryMaxBytes`、`kMaxObjectBytes`、`kBatchMaxEntries`、`kBatchMaxBytes`、`kDefaultWaitTimeoutMs`，以及 `static_assert` 边界断言、`AlignUp`、`WireLen`、`IsValidEntry`、`IsValidObjectSize` 与 `PlanBatches` 等 constexpr 纯函数 | 仅编译期 | `AsuStorageBackend`、`AsuConfig` | 无状态 |
 | `AsuConfig` | 新增 | 环境变量解析与校验；所有 go/nogo 相关上限集中在此；v2 增加删除宽限期、GC 退避、staging slots、批量上下限与跨对象开关 | `FromEnvironment`、`Validate` | 两个 runtime、`AsuStorageBackend`、`AsuGcWorker` | 进程生命周期，只读 |
-| `AsuStagingArena` | 新增 | 512B 对齐、Init 时一次性 `RegisterRegions` 的常驻 pinned 池；slot 分配、释放与超时隔离；暴露 `FreeSlots()` / `IsAvailable()`，全部 slot 被 quarantine 时读路径不可服务，瞬时占满则等待 | `Create`、`Acquire`、`AcquireBatch`、`Release`、`Quarantine`、`FreeSlots`、`IsAvailable` | `IAsuKvClient`（注册）、`AsuStorageBackend` | 随 runtime，进程生命周期 |
+| `AsuStagingArena` | 新增 | 512B 对齐、Init 时一次性 `RegisterRegions` 的常驻 pinned 池；slot 分配、释放与超时隔离；暴露 `FreeSlots()` / `IsAvailable()`，全部 slot 被 quarantine 时读路径不可服务，瞬时占满则等待 | `Create`、`Acquire`、`AcquireBatch`、`Release`、`Quarantine`、`FreeSlots`、`IsAvailable` | `AsuKvClientInterface`（注册）、`AsuStorageBackend` | 随 runtime，进程生命周期 |
 | `AsuStagingSlot` | 新增，内嵌 `AsuStagingArena::Slot` | 记录 `addr`、`capacity`、`handle`、`state`、`trace_id` | 无 | `AsuStagingArena` | 随 Arena |
-| `IAsuKvClient` | 新增，抽象接口 | 隔离 SDK：显式 `Wait` 超时、逐 entry 判定、错误映射；测试用 `FakeAsuKvClient` 实现同一接口 | `Init`、`Shutdown`、`Register`、`BatchStore`、`BatchLoad`、`Query`、`Delete` | `AsuKvClientAdapter`、`AsuStagingArena`、`AsuStorageBackend` | 随 runtime |
-| `AsuKvClientAdapter` | 新增 | 组合 `unique_ptr<kv::KvClient>`，做参数转换、显式 `Wait` 超时与任务级 `result.status` 到 `ErrorCode` 的映射；`OK` 与 `PARTIAL_FAILED` 都进入逐 entry 归因，只有整任务级错误才把全部 entry 置同一错误 | 同 `IAsuKvClient` | `kv::KvClient` | 随 `AsuStorageBackend` |
+| `AsuKvClientInterface` | 新增，抽象接口 | 隔离 SDK：显式 `Wait` 超时、逐 entry 判定、错误映射；只暴露批量形态（`BatchStore`/`BatchLoad`，其中 load 可拆为 `SubmitLoad`+`WaitTask` 以支持跨对象流水线）；测试用 `FakeAsuKvClient` 实现同一接口 | `Init`、`Shutdown`、`Register`、`BatchStore`、`BatchLoad`、`SubmitLoad`、`WaitTask`、`Query`、`Delete` | `AsuKvClientAdapter`、`AsuStagingArena`、`AsuStorageBackend` | 随 runtime |
+| `AsuKvClientAdapter` | 新增 | 组合 `unique_ptr<kv::KvClient>`，做参数转换、显式 `Wait` 超时与任务级 `result.status` 到 `ErrorCode` 的映射；`OK` 与 `PARTIAL_FAILED` 都进入逐 entry 归因，只有整任务级错误才把全部 entry 置同一错误 | 同 `AsuKvClientInterface` | `kv::KvClient` | 随 `AsuStorageBackend` |
 | `AsuEntryResult` | 新增，值类型 | 单个 entry 的 `StatusCode` 与 `message` | 无 | `AsuKvClientAdapter`、`AsuStorageBackend` | 调用期 |
 | `AsuReadRequest` | 新增，值类型 | 批量读的单个对象请求：`key`、`AsuDescriptor`、目标 slices | 无 | `Client::BatchGet`、`AsuStorageBackend` | 调用期 |
-| `AsuReadOutcome` | 新增，值类型 | 批量读的单个对象结果：错误码、已读字节、chunk 数 | 无 | `AsuStorageBackend`、`Client::BatchGet` | 调用期 |
-| `AsuStorageBackend` | 新增 | 对象级 I/O 唯一实现：写为分块、staging、header/CRC、chunk0 最后写；读为 `ReadObjects`（默认每对象一个 `BatchLoadAsync`），`ReadObject` 退化为单元素 wrapper；Master 侧以 delete-only 模式复用同一类 | `Create`、`WriteObject`、`ReadObjects`、`ReadObject`、`QueryObject`、`DeleteObject`、`IsReady` | `AsuStagingArena`、`IAsuKvClient`、`AsuRecordCodec`、`AsuChunkPlanner` | 每个 runtime 一个实例 |
-| `AsuAllocator` | 新增 | 纯命名分配：铸造 `AsuDescriptor`；维护全局原子 64-bit `object_epoch`（随机种子起步、每次自增、恢复时推进到已恢复最大值 + 1）与 `max_object_bytes` | `Allocate`、`NextEpoch`、`RestoreObservedEpoch`、`IsInitialized`、`MaxObjectBytes` | `AsuKeyCodec`、`AsuChunkPlanner`、`MasterService` | Master 进程生命周期 |
+| `AsuReadResult` | 新增，值类型 | 批量读的单个对象结果：错误码、已读字节 | 无 | `AsuStorageBackend`、`Client::BatchGet` | 调用期 |
+| `AsuStorageBackend` | 新增 | 对象级批量 I/O 唯一实现：一个对象一条 entry（offset=0），`BatchStoreObjects` 按 `PlanBatches` 跨对象打包；`BatchLoadObjects` 同样跨对象合批并逐 entry 校验/回填；`BatchIsExist` 物理探活；`BatchRemoveObjects` 按 254 key 切批；Master 侧以 delete-only 模式复用同一类 | `Create`、`BatchStoreObjects`、`BatchLoadObjects`、`BatchIsExist`、`BatchRemoveObjects`、`IsReady`、`Shutdown` | `AsuStagingArena`、`AsuKvClientInterface`、`AsuRecordCodec` | 每个 runtime 一个实例 |
+| `AsuAllocator` | 新增 | 纯命名分配：铸造 `AsuDescriptor`；维护全局原子 64-bit `object_epoch`（随机种子起步、每次自增、恢复时推进到已恢复最大值 + 1）与 `max_object_bytes` | `Allocate`、`NextEpoch`、`RestoreObservedEpoch`、`IsInitialized`、`MaxObjectBytes` | `AsuKeyCodec`、`MasterService` | Master 进程生命周期 |
 | `AsuDeleteQueue` | 新增（v1 保留项） | 按 `key_id` 去重的延迟删除队列；元素带 `release_at`，由 `not_before` 与宽限期共同计算 | `Enqueue`、`TakeDue`、`Requeue`、`Size`、`DroppedCount` | `FreeAsuReplicas`、`AsuGcWorker` | Master 进程生命周期，内存态 |
 | `AsuDeleteItem` | 新增，值类型 | 入队项：`key_id`、`object_epoch`、`key_fingerprint`、`user_key`、`release_at`、`attempt`；`not_before` 只用于计算 `release_at` | 无 | `AsuDeleteQueue` | 入队到删除或丢弃 |
 | `AsuGcWorker` | 新增（v1 保留项） | 独立线程按最早 `release_at` 等待，到期逐个 `DeleteAsync`，失败指数退避重入队，超限丢弃并计数 | `Start`、`Stop` | `AsuDeleteQueue`、delete-only `AsuStorageBackend` | Master 进程；`Shutdown` 先停 GC |
@@ -1156,8 +1152,8 @@ classDiagram
 | `ReplicaReadRank` | 新增，enum class | 读档位：local MEMORY(0) < local NOF(1) < remote MEMORY(2) < remote NOF(3) < LOCAL_DISK(4) < ASU(5) < DFS(6) < DISK(7)，`kNotReadable=0xFF` | 无 | `ReplicaSelection` | 无状态 |
 | `ReadSelectionPolicy` | 新增，值类型 | 客户端能力策略，当前只有 `asu_available`；默认 false，未启用 ASU 的 Client 永不选 ASU | 无 | `ReplicaSelection`、`ReadReplicaSelector` | 调用期 |
 | `ReplicaSelection` | 既有头文件，改动（risky） | `replica_selection.h` 的自由函数集合：`SelectBestReplica` 加第 4 参 policy，保留 memory/nof/HCA 逻辑，兜底链改为显式 min-rank；同档平手后出现者胜出，保持既有 LOCAL_DISK 语义 | `SelectBestReplica`、`ClassifyReplicaForRead`、`HasCompleteAsuReplica`、`NoReplicaError` | `Client`、`RealClient`、`Replica::Descriptor` | 无状态 |
-| `Client` | 既有，改动 | 有序两阶段写、分层 finalize、读档位与批量读、只删 memory 入口 | `SubmitAsuWrites`、`WriteAsuReplicaForSingle`、`ReadAsuReplica`、`AsuReadAvailable`、`RemoveMemoryReplica` | `AsuStorageBackend`、`MasterService` | 既有 |
-| `MasterService` | 既有，改动（risky） | 分配 ASU 副本、ALL 谓词、11 处回收钩子、两处 restore、offload 排除、删除级联、只删 memory 的严格路径 | `AllocateReplicas`、`PutEnd`、`PutRevoke`、`RemoveObject`、`RemoveReplicaTier`、`CollectAsuDescriptors`、`EnqueueAsuDeletes`、`FreeAsuReplicas` | `AsuMasterRuntime`、`ObjectMetadata` | 既有 |
+| `Client` | 既有，改动 | 有序两阶段写、分层 finalize、读档位与批量读、删 ASU 入口 | `SubmitAsuWrites`、`WriteAsuReplicaForSingle`、`ReadAsuReplica`、`AsuReadAvailable`、`BatchRemoveAsuObjects` | `AsuStorageBackend`、`MasterService` | 既有 |
+| `MasterService` | 既有，改动（risky） | 分配 ASU 副本、ALL 谓词、回收钩子、两处 restore、offload 排除、`BatchRemoveAsuObjects`（捕获→现有 Remove→入队） | `AllocateReplicas`、`PutEnd`、`PutRevoke`、`RemoveObject`、`BatchRemoveAsuObjects`、`CollectAsuDescriptors`、`EnqueueAsuDeletes`、`FreeAsuReplicas` | `AsuMasterRuntime`、`ObjectMetadata` | 既有 |
 | `EvictDiskReplica` 系列 | 既有，**无改动** | 对照项：纯元数据通知路径，只接受 `DISK` / `LOCAL_DISK`（master_service.cpp:6236-6241），没有 lease、完成度、refcnt 保护；不承载 ASU 或 MEMORY 删除 | `EvictDiskReplica`、`EvictDiskReplicaIfCurrent`、`BatchEvictDiskReplica` | client 侧删除本地文件 | 既有 |
 | `BufferAllocatorBase` | 既有，无改动 | 对照项：ASU 不实现 allocator，无字节账本 | 无 | 无 | 无 |
 | `StorageBackendInterface` | 既有，不复用 | 对照项：offload 插件面，本方案不经它 | 无 | 无 | 无 |
@@ -1170,19 +1166,19 @@ classDiagram
 
 | kind | 类 / 位置 | 内容 |
 | --- | --- | --- |
-| 新增（pure-additive 新建文件） | `asu/` 下 12 个头文件与实现、`tests/support/fake_asu_kv_client.h` | `AsuKeyCodec`、`AsuRecordCodec`、`AsuChunkPlanner`、`AsuStagingArena`、`IAsuKvClient`、`AsuKvClientAdapter`、`AsuStorageBackend`、`AsuAllocator`、`AsuDeleteQueue`、`AsuGcWorker`、`AsuMasterRuntime`、`AsuClientRuntime`、`AsuConfig`、`AsuReadRequest`、`AsuReadOutcome` |
+| 新增（pure-additive 新建文件） | `asu/` 下 12 个头文件与实现、`tests/support/fake_asu_kv_client.h` | `AsuKeyCodec`、`AsuRecordCodec`、`AsuStagingArena`、`AsuKvClientInterface`、`AsuKvClientAdapter`、`AsuStorageBackend`、`AsuAllocator`、`AsuDeleteQueue`、`AsuGcWorker`、`AsuMasterRuntime`、`AsuClientRuntime`、`AsuConfig`、`AsuReadRequest`、`AsuReadResult` |
 | 新增（放进既有头文件） | `replica.h` | `AsuDescriptor`、`AsuReplicaData`、`is_asu_replica` / `get_asu_descriptor` / `fn_is_asu_replica`；`ReplicaReadRank` / `ReadSelectionPolicy` 放在 `replica_selection.h` |
 | 复用既有机制（改一处或加一个分支） | `ReplicaWriteMode`（replica.h:265-269 + 291-302）、`ReplicaTransferSummary`（client_service.cpp:275-319）、`DetermineFinalizeDecision`（378-431）、`SelectBestReplica`（replica_selection.h:133-194）、`CheckRemovable`（master_service.cpp:7236-7255）、`Replica::fn_is_busy`（replica.h:504-507）、`BatchReplicaClear`（client_service.cpp:1570）、`RegisterPooledHandlers`（rpc_service.cpp:2058-2144） | 要求 1 复用前四个做写序与终态；要求 2 复用第五个与选择器；要求 3 复用第五、六、七个做删除保护；新 RPC 复用第八个注册 |
 | pure-additive（既有文件追加） | allocator.h:27-34 | 只追加 `ReplicaType::ASU = 101`，不重排、不复用 0 到 4 或 100 |
 | pure-additive（既有文件追加） | types.h 错误码区、types.cpp `toString` | 5 个错误码：`ASU_SERVICE_UNAVAILABLE`、`ASU_OBJECT_TOO_LARGE`、`ASU_KEY_COLLISION`、`ASU_RECORD_CORRUPT`、`ASU_DESCRIPTOR_INVALID` |
 | modify | `Client`、`Replica` 访问器、`client_buffer.cpp:144-191`、`master_admin_service.cpp`、`transfer_task.cpp`、`real_client.cpp`、`store_py.cpp` / `store_py_internal.h` | 分支接入与显式拒绝，不改变既有类型语义 |
-| risky | `Replica::data_` / `Replica::Descriptor::descriptor_variant` / `ReplicateConfig`（replica.h:108、742、925）、`master_service.cpp` 的 ALL 谓词与 11 处 `FreeAsuReplicas` 与两处 restore、`UpsertStart` 强制 Case C、`replica_selection.h:182-193` 兜底链 | 触碰线格式、副本生命周期与跨进程兼容性 |
-| **明确不复用 / 不修改** | `EvictDiskReplica` / `EvictDiskReplicaIfCurrent` / `BatchEvictDiskReplica`（master_service.cpp:6215-6372）、`StorageBackendInterface`、`BufferAllocatorBase`、`PinnedBufferPool` | ASU 删除不走 eviction 通知路径；ASU 没有本地文件 owner，也没有字节账本；删除机制只有 `RemoveObject` 级联 + `RemoveReplicaTier` + `AsuDeleteQueue` 一套 |
+| risky | `Replica::data_` / `Replica::Descriptor::descriptor_variant` / `ReplicateConfig`（replica.h:108、742、925）、`master_service.cpp` 的 ALL 谓词与 `FreeAsuReplicas` 挂点与两处 restore、`UpsertStart` 强制 Case C、`replica_selection.h:182-193` 兜底链 | 触碰线格式、副本生命周期与跨进程兼容性 |
+| **明确不复用 / 不修改** | `EvictDiskReplica` / `EvictDiskReplicaIfCurrent` / `BatchEvictDiskReplica`（master_service.cpp:6215-6372）、`StorageBackendInterface`、`BufferAllocatorBase`、`PinnedBufferPool` | ASU 删除不走 eviction 通知路径；ASU 没有本地文件 owner，也没有字节账本；删除机制只有 `BatchRemoveAsuObjects`（捕获→现有 Remove→入队）+ `AsuDeleteQueue` 一套 |
 
 两个结构性说明：
 
 - `AsuAllocator` 与 `BufferAllocatorBase` 之间没有继承或组合关系。`Allocate` 返回的是 `AsuDescriptor` 而不是 buffer：它不占 segment、不分配字节、没有 offset 账本，因此 Master 侧不存在 allocator 状态需要恢复，这也是 ASU 不与 standby restore 互斥的原因（对照 DFS 在 master_service.cpp:3672-3676 的拒绝）。`object_epoch` 是唯一的持久化相关状态，但它只是「推进到观察到的最大值 + 1」，不构成分配账本。
-- `AsuStorageBackend` 同时服务两个方向，靠构造参数 `register_staging` 区分：Client 侧为 true，创建 `AsuStagingArena` 并一次性 `RegisterRegions`；Master 侧为 false，不创建 arena、不注册数据 buffer，只保留 `QueryObject` / `DeleteObject`。同一个类在两端的错误映射与日志格式完全一致，便于跨进程对账。v2.0 的 `ReadObjects` 只在 Client 侧使用，Master 侧的 delete-only 实例即使链接到同一实现也不会走到该路径。
+- `AsuStorageBackend` 同时服务两个方向，靠构造参数 `register_staging` 区分：Client 侧为 true，创建 `AsuStagingArena` 并一次性 `RegisterRegions`；Master 侧为 false，不创建 arena、不注册数据 buffer，只保留 `BatchIsExist` / `BatchRemoveObjects`。同一个类在两端的错误映射与日志格式完全一致，便于跨进程对账。`BatchLoadObjects` 只在 Client 侧使用，Master 侧的 delete-only 实例即使链接到同一实现也不会走到该路径。
 
 ### 2.2 业务交互流程
 
@@ -1208,20 +1204,17 @@ flowchart TD
     C4 --> C5{NonDfsTransfersSucceeded}
     C5 -- 否 --> R1[零调用 ASU 并记 asu_write_skipped_total reason 为 primary_tier_failed]
     R1 --> F3[PutRevoke ReplicaType ALL]
-    C5 -- 是 --> A1[AsuStorageBackend::WriteObject]
-    A1 --> A2[AsuChunkPlanner 分块 得到 N 与每 chunk 的 data_len 与 wire_len 与 offset]
-    A2 --> A3[逐 chunk 编码 512B AsuRecordHeader 并计算 payload CRC32C]
-    A3 --> A4[AsuStagingArena::Acquire 取 512B 对齐 slot 并做 D2H 拷贝]
-    A4 --> A5[逐 entry 预检 wire_len 与 offset 与 addr 与 region.size 与 key_id 与 handle]
+    C5 -- 是 --> A1[AsuStorageBackend::BatchStoreObjects]
+    A1 --> A2[PlanBatches 按对象边界合批：条数 <= 110 且字节 <= 64 MiB]
+    A2 --> A3[每个对象编码一条 512B AsuRecordHeader 并计算 payload CRC32C]
+    A3 --> A4[AsuStagingArena::AcquireBatch 取 512B 对齐 slot 并做 D2H 拷贝]
+    A4 --> A5[逐 entry 预检 wire_len 与 offset=0 与 addr 与 region.size 与 key_id 与 handle]
     A5 --> A6{预检全部通过}
     A6 -- 否 --> R2[返回确定性错误并拒绝提交]
-    A6 -- 是 --> A7[BatchStoreAsync 提交 chunk 1 到 N-1 并显式超时 Wait]
+    A6 -- 是 --> A7[BatchStoreAsync 提交整个 task 并显式超时 Wait]
     A7 --> A8{逐 entryStatus 全部 OK}
-    A8 -- 否 --> R3[best effort DeleteObject 已写 chunk]
-    A8 -- 是 --> A9[BatchStoreAsync 单独提交 chunk 0 作为提交点 并显式超时 Wait]
-    A9 --> A10{chunk 0 OK}
-    A10 -- 否 --> R3
-    A10 -- 是 --> C6[RecordSuccess ReplicaType ASU]
+    A8 -- 否 --> R3[逐 entry 映射失败对象并 best effort BatchRemoveObjects 清理]
+    A8 -- 是 --> C6[RecordSuccess ReplicaType ASU]
     R2 --> F2[RecordFailure ReplicaType ASU]
     R3 --> F2
     C6 --> F1{DetermineFinalizeDecision 的 TIERED 分支}
@@ -1243,15 +1236,15 @@ flowchart TD
 - **ASU 不参与分配门槛**。`AllocateReplicas` 在 `use_disk_replica_` 块（master_service.cpp:4916-4920）与 DFS 块（4923-4947）之后、`return replicas`（4950）之前铸造 descriptor 并 `emplace_back` 到列表末尾，因此位置在 `HasExpectedReplicaAllocation` 门槛（master_service.cpp:4876-4898）**之后**；`HasExpectedReplicaAllocation` 的签名与判据都不改，`accessor.Grow` 仍只按 `SaturatingMultiply(value_length, config.replica_num)` 记账（master_service.cpp:5029-5030）。ASU 不占 segment、不分配字节、无 offset 账本，纯命名不会失败。排在末尾还有一个作用：`FindFirstCompleteReplica` 与旧兜底链在无显式档位时不会优先撞上 ASU。
 - **客户端必须二次校验分配结果**。Master 允许在纯命名层面「请求了 ASU 但没造出来」只发生在 runtime 异常路径，但 Client 不能在 finalize 阶段才发现：`Client::Put`/`StartBatchPut` 在拿到 PutStart 响应后立即检查 `requested_asu > 0 && allocated_asu == 0`，为真则不发起任何传输，直接 `PutRevoke(ReplicaType::ALL)` 并返回 `NO_AVAILABLE_HANDLE`。否则 `DetermineFinalizeDecision` 会把「没有 ASU」误判成降级成功。
 - **门禁是 memory 而非整体**。`SubmitAsuWrites` 只在 `NonDfsTransfersSucceeded`（client_service.cpp:321-327）为真时执行；memory 失败时 ASU 阶段零调用，记 `asu_write_skipped_total{reason=primary_tier_failed}`，最终 `PutRevoke(ALL)`。这与「ASU 在 memory 之后」的要求是同一条约束的两种表述。
-- **提交点仍是 chunk 0 最后写**。chunk 1 到 N-1 先写、chunk 0 单独一个 task 最后写；读到合法 chunk 0 header 才认为对象已提交，半写对象对读者不可见。默认 CACHELIB 部署下 `S` 被 `kMaxSliceSize` 卡在约 16MiB，`N=1`，多 chunk 分支不可达。
-- **失败是否回滚主层由 `require_asu` 决定**。ASU 阶段失败（含部分 chunk 失败后 best-effort `DeleteObject`）只让 `failed_asu_transfers > 0`；`require_asu=false` 时 `DetermineFinalizeDecision` 走降级分支，不改变已经成功的 memory 终态；`require_asu=true` 时改为整体失败并 `PutRevoke(ALL)`，已成功的 memory 也一并撤销。
+- **一个对象一条 entry，offset 恒 0**。`BatchStoreObjects` 把一个对象编码成一条 512B header + payload 的 entry，多个对象按对象边界合批进同一 `BatchStoreAsync`；单 task 条数受 `min(batch_max_entries=110, staging_slots)` 与 `batch_max_bytes` 约束，**绝不切开单个对象**。SDK 不保证单 entry 写入原子，半写对象对读者的不可见性由 Master 侧 PROCESSING 状态与读端 header/CRC fail-stop 共同保证。
+- **失败是否回滚主层由 `require_asu` 决定**。ASU 阶段失败（含 task 级 CANCELED/超时导致同批全部对象失败）只让 `failed_asu_transfers > 0`；`require_asu=false` 时 `DetermineFinalizeDecision` 走降级分支，不改变已经成功的 memory 终态；`require_asu=true` 时改为整体失败并 `PutRevoke(ALL)`，已成功的 memory 也一并撤销。
 
 终态由 `DetermineFinalizeDecision`（client_service.cpp:378-431）的 TIERED 分支唯一决定（v2.1 起分 `require_asu` 两模式，共四种映射）：
 
 | 主层 memory 传输 | ASU 阶段 | end_type | revoke_type | Put 返回 | ASU 物理残留处理 |
 | --- | --- | --- | --- | --- | --- |
-| 全部成功 | 全部 chunk 成功 | `ALL` | 无 | 成功 | 无 |
-| 全部成功 | 失败或部分失败（`require_asu=false`） | `MEMORY` | `ASU` | 成功，记 `asu_degraded_total` | 已写 chunk 先 best-effort 删除，descriptor 移除后由 `FreeAsuReplicas` 入队兜底 |
+| 全部成功 | 全部对象 entry 成功 | `ALL` | 无 | 成功 | 无 |
+| 全部成功 | 失败或部分失败（`require_asu=false`） | `MEMORY` | `ASU` | 成功，记 `asu_degraded_total` | 已写对象 best-effort `BatchRemoveObjects` 清理，descriptor 移除后由 `FreeAsuReplicas` 入队兜底 |
 | 全部成功 | 失败或部分失败（`require_asu=true`） | 无 | `ALL` | 失败，返回 `first_asu_error` | 已写 memory 与 ASU 一并撤销；memory 记账由 `EraseReplicasWithCacheTotalAccounting`（1731-1754）回收，ASU 入队由 `FreeAsuReplicas` 兜底 |
 | 任一失败 | 未被调用 | 无 | `ALL` | 失败，返回 `first_error` 或 `TRANSFER_FAIL` | 无 |
 
@@ -1279,10 +1272,10 @@ flowchart TD
     C3 -- 6 或 7 --> T3[走 DFS 或 DISK 既有路径]
     C3 -- 5 --> C4{AsuReadAvailable 且 slices 总长不小于 object_size}
     C4 -- 否 --> E2[返回 ASU_SERVICE_UNAVAILABLE 或 INVALID_PARAMS]
-    C4 -- 是 --> A1[AsuStorageBackend::ReadObject 或 ReadObjects]
-    A1 --> A2[规划 chunk R 等于 object_size 每 chunk 求 need 与 read_len 与 offset]
-    A2 --> A3[AsuStagingArena::Acquire 取 slot 并逐 entry 预检]
-    A3 --> A4[默认每对象一个 BatchLoadAsync]
+    C4 -- 是 --> A1[AsuStorageBackend::BatchLoadObjects]
+    A1 --> A2[PlanBatches 按对象边界合批 每个对象一条 entry offset=0]
+    A2 --> A3[AsuStagingArena::AcquireBatch 取 slot 并逐 entry 预检]
+    A3 --> A4[BatchLoadAsync 提交整个 task 可跨对象合批]
     A4 --> A5[Wait 显式 EstimatedTimeout]
     A5 --> A6{task 级状态}
     A6 -- OK 或 PARTIAL_FAILED --> A7[逐 entry 读 entryStatus]
@@ -1295,7 +1288,7 @@ flowchart TD
     C5 --> Z1[返回成功]
 ```
 
-> **[v2.0 变更]** v1.0 的读侧只有「选中 ASU 就 `ReadObject`」一条路径，选择发生在既有的 `FindFirstCompleteReplica`/`SelectBestReplica` 兜底链里，档位隐式。v2.0 把要求 2 落成两件显式的事：Master 侧确认「返回全部可读副本」已成立、不改代码；Client 侧新增 `ReplicaReadRank` 与 `ReadSelectionPolicy`，把 ASU 固定为第 5 档，并在选中 ASU 后改走 `ReadObjects` 的批量读。同时把「读请求长度必须不小于 `object_size`」写成入口硬约束，使 payload CRC 永远可全量校验。
+> **[v2.0 变更]** v1.0 的读侧只有「选中 ASU 就 `ReadObject`」一条路径，选择发生在既有的 `FindFirstCompleteReplica`/`SelectBestReplica` 兜底链里，档位隐式。v2.0 把要求 2 落成两件显式的事：Master 侧确认「返回全部可读副本」已成立、不改代码；Client 侧新增 `ReplicaReadRank` 与 `ReadSelectionPolicy`，把 ASU 固定为第 5 档，并在选中 ASU 后改走 `BatchLoadObjects` 的批量读。同时把「读请求长度必须不小于 `object_size`」写成入口硬约束，使 payload CRC 永远可全量校验。
 
 档位定义（`ReplicaReadRank`，replica_selection.h 新增）：
 
@@ -1317,10 +1310,10 @@ flowchart TD
 - **ASU 排第 5 档是实测前的保守选择**。ASU 读要付 staging 拷贝、`BatchLoadAsync`、显式 Wait 与回填，胜不过 RDMA 直连的 MEMORY/NOF，也比不过 LOCAL_DISK 的零拷贝；只应优于 DFS 与 DISK。档位高低可用 H21/TC-114 的实测结果只改一个枚举值，不需要新增配置。
 - **平手规则是后出现者胜出**。`rank <= best_rank` 才覆盖，保持 tests/pybind_client_test.cpp:188-262 对「最后一个 LOCAL_DISK 胜出」的既有断言，避免改测试或行为回归。
 - **`asu_available=false` 的 Client 永不选 ASU**。`ReadSelectionPolicy` 默认 `asu_available=false`，未启用 ASU 的部署即使 Master 返回了 AsuDescriptor 也不会选中它，兼容性由默认值兜住。
-- **选中 ASU 才走批量读**。`AsuStorageBackend::ReadObjects(span<const AsuReadRequest>, trace_id)` 是新入口，`ReadObject` 退化为单元素 wrapper。默认每个对象一个 `BatchLoadAsync`（该对象的全部 chunk 在同一 task 内），多对象场景按 `staging_slots` 在飞上限分批 submit 并逐个 Wait，与已提交的 RDMA future 并行；不提供跨对象合并——SDK 在 `BuildTransportTasks` 阶段做全 key 路由校验，任一 key 不可路由会把整 task 的 `entryStatus` 置错。
+- **选中 ASU 才走批量读**。`AsuStorageBackend::BatchLoadObjects(span<const AsuReadRequest>, trace_id)` 是唯一读入口；默认把多个对象按对象边界合并进同一 `BatchLoadAsync`（条数 ≤ `min(batch_max_entries=110, staging_slots)`，字节 ≤ 64 MiB），逐 entry `entryStatus` 归因回每个对象。**绝不切开单个对象**，但允许把多个对象放进同一 task。task 级 CANCELED/超时使同 task 内全部对象失败。
 - **读请求尺寸契约收紧为整对象**。入口要求 `CalculateSliceSize(slices) >= object_size`，否则 `INVALID_PARAMS`。所有已接线入口（`get_buffer` / `batch_get_buffer` / `batch_get_into` / `batch_get_into_multi_buffers`）都按 `object_size` 分配 slices，不会给 undersized slices。这条契约让 payload CRC-32C 永远可以全量校验，也废弃了 v1.0 的「截断读跳过 payload CRC」分支。
 - **不做同一次读内的跨副本 fallback**。选中 ASU 后 `BatchLoadAsync` 失败即该对象读失败，已写入的部分字节绝不按成功返回。这与 DFS 的现有行为一致；注意 LOCAL_DISK 实际有 heal-and-retry，文档不得再写「与 LOCAL_DISK 一致」。
-- **arena 耗尽必须区分瞬时与永久**。`AsuStagingArena` 增加 `FreeSlots()`/`IsAvailable()`/`QuarantinedCount()` 与 `AcquireBatch`；只有在**全部 slot 都已 quarantine** 时 `Acquire` 才立即 `ASU_SERVICE_UNAVAILABLE`、`IsReady()` 才变假。瞬时占满时数据面等待，`AcquireBatch` 为一个 task 原子预留全部 entry，`ReadObjectsImpl` 再用「跨对象在飞 slot 上限」防止自死锁。v1.0 的「超时 slot 永不复用且无恢复」会让读路径被两次超时永久静默打死（FMEA-50）。
+- **arena 耗尽必须区分瞬时与永久**。`AsuStagingArena` 增加 `FreeSlots()`/`IsAvailable()`/`QuarantinedCount()` 与 `AcquireBatch`；只有在**全部 slot 都已 quarantine** 时 `Acquire` 才立即 `ASU_SERVICE_UNAVAILABLE`、`IsReady()` 才变假。瞬时占满时数据面等待，`AcquireBatch` 为一个 task 原子预留全部 entry，跨 task 的总在飞 slot 数由 `PlanBatches` 的条数上限约束。v1.0 的「超时 slot 永不复用且无恢复」会让读路径被两次超时永久静默打死（FMEA-50）。
 
 #### 2.2.3 场景三 按 key 查询后决定行为
 
@@ -1335,7 +1328,7 @@ flowchart TD
     M4 --> Z1[用户可见的查结束 不触达 ASU]
     M4 --> Q1{是否需要物理探活或错误归因}
     Q1 -- 否 --> Z1
-    Q1 -- 是 --> A1[AsuStorageBackend::QueryObject]
+    Q1 -- 是 --> A1[AsuStorageBackend::BatchIsExist]
     A1 --> K1[KvClient::QueryAsync 一组 CacheKey]
     K1 --> K2[KvClient::Wait 显式超时]
     K2 --> D1[ASU 设备返回 QUERY 结果]
@@ -1351,7 +1344,7 @@ flowchart TD
 - **「ASU 尚在写」这一中间态在查询上的表现**：ASU 副本出生即 PROCESSING，`IsReplicaReadable` 要求 `is_completed()`，所以它不参与 `HasReadableReplica`。同一对象此时若已有 COMPLETE 的 memory，查询返回 true；若唯一副本是 PROCESSING 的 ASU（v1.0 的并行写里可能出现在主层尚未成功的短窗口），查询返回 false 或 `REPLICA_IS_NOT_READY`。v2.0 把 ASU 挪到 memory 全部成功之后，这一窗口不再存在，「有 ASU 但主层未成功」的对象不可能出现，实际只剩「有 memory 可读」或「整体未提交」两种取值。
 - **「memory 已删、只剩 ASU」的对象仍然存在**。删 memory 后对象 `IsValid()` 仍为真（object_metadata.h:488-494 只要还有至少一个非 invalid 副本），查询返回 true，读经由场景二可继续。这是要求 3 与要求 2 闭合的关键点。
 - ASU 设备丢失 entry 时 Master 的 `IsExist` 仍返回 true 并下发读不到的 `AsuDescriptor`，读时才暴露 `REPLICA_IS_GONE`。这与 DFS/DISK 同类，必须写进对外契约。
-- `QueryAsync` 的 `exists` 是 key 级位图，不是 per-chunk。key 存在但某个 offset 的中间 chunk 缺失无法被 Query 发现，只能靠读端 header 与 CRC 校验。
+- `QueryAsync` 的 `exists` 是 key 级位图，恰好对应「该对象唯一 entry 是否存在」，不存在 per-offset 粒度的问题。
 - 物理查询只用于删除前后一致性诊断、错误归因、开发自验证与运维探活，不放在 `IsExist` 或 `Query` 热路径，不作为 Mooncake 存在性权威。
 - 不新增公开的物理查询 RPC。
 
@@ -1361,45 +1354,31 @@ flowchart TD
 
 > **[v2.0 变更]** v1.0 只有一条「整对象删除」流程。v2.0 按用户要求把它拆成两个语义不同的动词：**删 memory** 只移除 memory 副本，对象与 ASU 原样保留；**删 ASU** 是整对象删除，并在同一 key 写锁事务内按「先 memory、后 ASU」级联。两者的物理执行者相同：ASU 的物理删除永远只由 Master 侧 delete-only KvClient 经 `AsuDeleteQueue`/`AsuGcWorker` 执行。
 
-##### 2.2.4.1 删 memory：只删 memory
+##### 2.2.4.1 删 memory：只删 memory（既有路径，一行不改）
 
 ```mermaid
 flowchart TD
-    U[用户调用 RemoveMemoryReplica] --> C1[Client 转发 MasterClient::RemoveReplica 且类型为 MEMORY]
-    C1 --> M1[MasterService::RemoveReplicaTier 取共享锁与 key 写锁]
+    U[用户调用 Client::Remove 或 BatchRemove] --> C1[Client 转发 MasterClient::Remove]
+    C1 --> M1[MasterService::RemoveObject 取共享锁与 key 写锁]
     M1 --> M2{对象存在}
     M2 -- 否 --> E1[返回 OBJECT_NOT_FOUND]
-    M2 -- 是 --> M3{管理组 租约 完成度 复制任务 引用计数}
-    M3 -- 拒绝 --> E2[OBJECT_HAS_LEASE 或 REPLICA_IS_NOT_READY 或 OBJECT_HAS_REPLICATION_TASK 或 OBJECT_REPLICA_BUSY]
-    M3 -- 通过 --> M4[EraseReplicasWithCacheTotalAccounting 只 pop MEMORY 副本]
-    M4 --> M5[函数返回时析构 释放 memory buffer 并同步 cache 记账]
-    M5 --> M6[CancelPromotionTaskForRemovedReplicas 与 SyncKvObjectState]
-    M6 --> M7{metadata 仍 IsValid}
-    M7 -- 是 仍有 ASU --> M8[保留对象 ASU 仍 COMPLETE 可读]
-    M7 -- 否 无其它副本 --> M9[accessor.Erase 整对象消失]
-    M8 --> Z1[返回成功 KvMedia 变为 disk]
-    M9 --> Z1
+    M2 -- 是 --> M3{CheckRemovable 与管理组 与复制任务}
+    M3 -- 拒绝 --> E2[OBJECT_HAS_LEASE 或 REPLICA_IS_NOT_READY 或 OBJECT_HAS_REPLICATION_TASK]
+    M3 -- 通过 --> M4[EraseMetadata：删除元数据与 memory buffer]
+    M4 --> M5[不捕获 ASU、不入队 ASU]
+    M5 --> Z1[对象从元数据消失 ASU entry 成为不可枚举孤儿 预期行为]
 ```
 
-##### 2.2.4.2 删 ASU：整对象删除并按 memory 先、ASU 后级联
+##### 2.2.4.2 删 ASU：新增 BatchRemoveAsuObjects（捕获→既有 Remove→入队）
 
 ```mermaid
 flowchart TD
-    U[用户调用 Remove] --> C1[Client 转发 MasterClient::Remove]
-    C1 --> M1[MasterService::RemoveObject 取共享锁与 key 写锁]
-    M1 --> M2{CheckRemovable 通过}
-    M2 -- 否 --> E1[OBJECT_HAS_LEASE 或 REPLICA_IS_NOT_READY 或 OBJECT_HAS_REPLICATION_TASK]
-    M2 -- 是 --> M3{enable_ha 且 enable_oplog}
-    M3 -- 否 --> M4[EraseMetadata 三段式]
-    M3 -- 是 --> M5[MarkRemovedAndPersist]
-    M4 --> M6[第一段 VisitReplicas 捕获 AsuDescriptor 列表]
-    M6 --> M7[第二段 ReleaseLocalDiskUsage 与 FreeDfsReplicas 与记账与索引清理]
-    M7 --> M8[第三段 hold.TearDown 释放 memory buffer 与元数据]
-    M8 --> M9[EnqueueAsuDeletes 入 AsuDeleteQueue 只持队列锁]
-    M5 --> M10[durable 后两段 pop 先 memory 子集 再其余并 FreeAsuReplicas]
-    M9 --> Z1[返回成功 元数据已不可见]
-    M10 --> Z1
-    Z1 --> G1[AsuGcWorker 等待 release_at 到期]
+    U[用户调用 BatchRemoveAsuObjects keys force] --> P1[Phase 1 key 写锁内只读捕获 AsuDescriptor]
+    P1 --> P2[Phase 2 调用既有 RemoveObject 一行不改 先删 memory 与元数据]
+    P2 --> P3{Remove 结果}
+    P3 -- OK 或 OBJECT_NOT_FOUND --> P4[Phase 3 用捕获的 key_id 入 AsuDeleteQueue]
+    P3 -- OBJECT_HAS_LEASE 或 REPLICA_IS_NOT_READY --> P5[跳过 不删 ASU]
+    P4 --> G1[AsuGcWorker 等待 release_at 到期]
     G1 --> G2[DeleteAsync 按 key_id 删除 并显式超时 Wait]
     G2 --> G3{rawResult 为 0x00}
     G3 -- 是 --> Z2[成功计数]
@@ -1408,12 +1387,11 @@ flowchart TD
 
 关键决策点：
 
-- **删 memory 是新增的严格路径**。`RemoveReplicaTier` 只接受 `ReplicaType::MEMORY`，其余类型返回 `INVALID_PARAMS`。它必须走 `master_state_mutex_` 共享锁 + `MetadataAccessorRW` + `CheckRemovable` + `is_busy` 保护 + 单谓词 pop，而不能复用 `EvictDiskReplicaImpl`：后者是纯元数据通知路径，无 `CheckRemovable`、无 `master_state_mutex_`、无延迟释放，且 `target_pred` 依赖 LOCAL_DISK 的 `client_id`（master_service.cpp:6215-6336），不适配「按副本类型删除」。
-- **`CheckRemovable` 不够，必须再加 `is_busy`**。`CheckRemovable`（master_service.cpp:7236-7255）只看租约、`AllReplicas(fn_is_completed)` 与 `replication_task`，不覆盖 offloading/promotion 任务持有的 source refcnt；`PopReplicas` 会当场析构 buffer，RDMA 仍在读就是 UAF（FMEA-47）。因此 `metadata.HasReplica(&Replica::fn_is_busy)`（replica.h:504-507）为真时返回 `OBJECT_REPLICA_BUSY`（types.h:378）。`force` 只绕过 lease，不绕过 refcnt 与完成度。
-- **删 memory 后对象可能仍然存在**。`EraseMetadata` 之外的 `RemoveReplicaTier` 只有在 `!metadata.IsValid()` 时才 `accessor.Erase()`；有 ASU 时 `IsValid()` 为真（object_metadata.h:488-494），对象保留，`GetReplicaList` 返回 ASU，读经由场景二继续。`KvMedia` 由 `{cpu,disk}` 变 `{disk}`。
-- **删 ASU 的落点是 `EraseMetadata` 的三段式**（master_service.cpp:2054-2116）。v1.0 在 2110 行直接以 `GetAllReplicas()` 调 `FreeDfsReplicas`，早于 2115 行的 `hold.TearDown()`；若照抄给 `FreeAsuReplicas`，ASU 入队会早于 memory 释放，与要求 3 的方向相反。v2 改为：先 `CollectAsuDescriptors(metadata)`（内部 `VisitReplicas(&Replica::fn_is_asu_replica)`）捕获 descriptor，再执行 `ReleaseLocalDiskUsage`/`FreeDfsReplicas`/`AccountCacheTotalRemoval`/索引清理，最后 `hold.TearDown()` 释放 memory buffer，随后 `EnqueueAsuDeletes(key, captured, nullopt)`。非 HA 路径上 `hold.TearDown()` 会一次性 `slot.record_.reset()`（`object_route.h:826-833`），memory buffer 与 ASU descriptor 同时消亡，所以这里**不存在可观测的「元数据移除顺序」**；本设计保证的是**物理删除的入队顺序**：`EnqueueAsuDeletes` 一定发生在 `TearDown` 之后，因此「memory 先释放、ASU 后入队」。该顺序自动覆盖 `Remove`/`RemoveAll`/`BatchRemove`/`RemoveByRegex`/`BatchReplicaClear(segment="")`/`PutStart` 陈旧清理等所有 `accessor.Erase()` 路径。
-- **HA 路径必须拆成两段 pop**。`FinalizeRemovedReplicasAfterDurable`（master_service.cpp:1757-1807）在 1780-1784 一次 pop 全部 id，照抄无法表达顺序。v2 改为先 pop `ids` 中 `is_memory_replica` 的子集（作用域结束即释放 buffer），再 pop 其余 id，ASU 在第二段之后经 `FreeAsuReplicas` 入队。不变量表述为「元数据移除顺序 memory → ASU」，不再声称「析构时刻早于入队」，否则 HA 下必然不成立。
-- **物理删除唯一执行者不变**。`AsuDeleteQueue` + `AsuGcWorker` + Master delete-only `KvClient` 仍是唯一通道。ASU 是网络可寻址 key、无 owner，LOCAL_DISK 的「client 删文件、Master 删元数据」分工（storage_backend.cpp:996-1017、file_storage.cpp:681-719）不可平移；`DeleteAsync` 只需 key（kv_client.h:50）。`EvictDiskReplica` 一行不改。
+- **删 memory 复用既有路径，一行不改**。`Client::Remove` / `BatchRemove` → `MasterService::RemoveObject`（`master_service.cpp:7175-7204`）今天的行为就是「删 memory 副本与对象元数据、不触达 ASU 后端」，这正是用户要求的「删 memory 只删 memory」。它继续走 `master_state_mutex_` 共享锁 + `MetadataAccessorRW` + `CheckRemovable`（`master_service.cpp:7236-7255`），本设计不新增任何 RPC 或 Client 方法。
+- **`EraseMetadata` 不再捕获或入队 ASU**。plain Remove / `RemoveAll` / `RemoveByRegex` / `BatchReplicaClear` 等所有 `accessor.Erase()` 路径都不拥有 ASU 物理删除权，因此 ASU entry 成为孤儿（预期行为）。删除 ASU 只能由 `BatchRemoveAsuObjects` 发起。
+- **新函数的三阶段与顺序陷阱**。`BatchRemoveAsuObjects` **首先**在 key 写锁内用只读访问器捕获 `is_asu_replica()` 的 descriptor（`AsuDescriptor` 随对象元数据一起被 Remove 删除，所以必须**先捕获**）；**其次**调用既有 `RemoveObject`（一行不改，先删 memory 与元数据）；**最后**用捕获到的 `key_id` 入 `AsuDeleteQueue`。若 Remove 返回 `OBJECT_HAS_LEASE`/`REPLICA_IS_NOT_READY`，对象仍存活，不入队。
+- **捕获与删除之间的并发由 epoch 兜底**。若期间发生并发 Upsert，捕获到的旧 `key_id` 属于旧世代，迟到的 `DeleteAsync` 只命中旧 key，不会误删新世代（`object_fingerprint`/`object_epoch` 派生隔离）。
+- **物理删除唯一执行者不变**。`AsuDeleteQueue` + `AsuGcWorker` + Master delete-only `KvClient` 仍是唯一通道。ASU 是网络可寻址 key、无 owner，LOCAL_DISK 的「client 删文件、Master 删元数据」分工不可平移；`DeleteAsync` 只需 key（`kv_client.h:50`）。`EvictDiskReplica` 一行不改。
 - **宽限期与 `not_before`**。`release_at = max(now, not_before) + max(default_kv_lease_ttl_, asu_delete_grace_ms)`，`default_kv_lease_ttl_` 默认 10000ms（types.h:94-95）、`asu_delete_grace_ms` 默认 60000ms。`not_before` 用于被丢弃的 PROCESSING ASU：取 `put_start_time + put_start_release_timeout_sec_`（默认 600s，types.h:140-141），等待可能仍在飞的 DMA 落定。
 - **崩溃窗口是要求 3 的关键收益**。memory 已删、ASU 未入队时崩溃，对象只剩 ASU，仍可读、可重试删除；反过来（先删 ASU 再删 memory）则会出现「memory 可读但 ASU 已物理删除」的不一致，且无法通过重试修复。
 - **删除失败不向上层报错**。元数据已不可逆删除，向上报错只会诱导重试一个不存在的对象；重试到上限后丢弃并记 `master_asu_delete_dropped_total`，孤儿属于运维问题。
@@ -1453,7 +1431,7 @@ sequenceDiagram
         M->>K: 3 CreateKvClient 与 Init client_config_path
         K->>D: 4 建立 view 与 transports
         M->>A: 5 Create cfg 与未 Init 的 client 与 register_staging 为 false
-        M->>A: 6 QueryObject probe_key
+        M->>A: 6 BatchIsExist probe_key
         A->>K: 7 QueryAsync 单个 CacheKey
         A->>K: 8 Wait task 显式 timeout
         K->>D: 9 QUERY
@@ -1497,15 +1475,15 @@ sequenceDiagram
 2. `AsuMasterRuntime::Create` 构造 `AsuAllocator` 与 `AsuDeleteQueue`。`AsuAllocator` 用 `random_device`、`steady_clock`、`pid` 混合出随机 `epoch_base`，避免 Master 重启后与上一世代的 key 冲突；`AsuDeleteQueue` 只是内存队列。
 3. Master 先 `CreateKvClient` 并 `Init(client_config_path)`，KvClient 建立 view 与 transports。
 4. 再以 `register_staging=false` 创建 `AsuStorageBackend`。delete-only 模式不分配 staging arena、不调用 `RegisterRegions`，因为 Delete 与 Query 只需要 key（kv_client_impl.cc:292-297、493-507）。
-5. 就绪探测走 `QueryObject(probe_key)`，最终是单 key 的 `QueryAsync` 加显式 `Wait`。SDK 在 snapshot、router、transports 任一为空时返回 `NOT_INITIALIZED`。
+5. 就绪探测走 `BatchIsExist({probe_key})`，最终是单 key 的 `QueryAsync` 加显式 `Wait`。SDK 在 snapshot、router、transports 任一为空时返回 `NOT_INITIALIZED`。
 6. 探测失败必须让 `MasterService::Init` 明确失败，不允许 Master 以「配置启用但后端不可用」的半启用状态启动。
 7. 探测成功后才启动 `AsuGcWorker` 线程。关闭顺序必须先 `Stop` GC 再 `Shutdown` KvClient，避免 GC 线程访问已销毁的 client。
 8. HA/oplog 恢复时，两处 descriptor 重建遇到 `AsuDescriptor` 用 `Replica(desc.id, asu_desc, desc.status)` 重建并校验 `object_size`，随后推进 `AsuAllocator` 的 epoch 计数器。恢复过程不访问 ASU，因此不与 HA 互斥。
 9. Client 侧先 `CreateKvClient` 并 `Init`，再以 `register_staging=true` 创建 `AsuStorageBackend`。顺序不可交换：`RegisterRegionsOnce` 在 `!snapshot` 时返回 `NOT_INITIALIZED`（kv_client_impl.cc:334-335），而未注册的 entry 要到 `Wait` 才以 `BUFFER_NOT_REGISTERED` 暴露（sqe_request.cc:45-55）。
 10. `RegisterRegions` 的**四条成功判据**（缺一不可，任一失败即释放 arena 并让 `Client::Init` 明确失败）：① `status.code == OK`（必须在 `MapStatus` 之前判，`MapStatus(PARTIAL_FAILED)` 返回 `OK`，见 §3.5.1）；② 返回条数等于请求条数（SDK 所有失败路径都会 `clear` 输出，kv_client_impl.cc:337、408-411）；③ `handle != kInvalidMRHandle`（视图为空时返回 OK 但零注册，kv_client_impl.cc:337-339）；④ `tokenId != 0`（AICPU 取不到 UB `tokenValue` 或 RDMA `rkey` 时 `GetMemTokenId` 返回 `UNSUPPORTED`，aicpu_trans_provider.cc:1839-1844、1966-1970）。失败带退避重试，不允许先接受写再报错。
-11. arena 大小等于 `staging_slots` 乘 `kChunkStrideBytes`（默认 8 × 16,776,704 = 134,213,632 B），基址 512B 对齐，**一个 region、一个 `MRHandle`**，所有 slot 共享该 handle；`RegisteredMemory.tokenId` 只存为诊断字段，不进入 entry、不得当 handle 用。
+11. arena 大小等于 `staging_slots` 乘单 entry 上限 `kEntryMaxBytes`（默认 8 × 16,776,704 = 134,213,632 B），基址 512B 对齐，**一个 region、一个 `MRHandle`**，所有 slot 共享该 handle；`RegisteredMemory.tokenId` 只存为诊断字段，不进入 entry、不得当 handle 用。
     - 前置条件是客户端 `kv_client` 配置文件含 `asuSharedProvider=1`（或 `asu_shared_provider=1`，config_utils.cc:159-160）。默认 `SharedProviderMode::INDEPENDENT` 会为每个 ASU 节点各建一个 provider，并在注册时把全部已注册区域 `BindMemory` 过去（kv_client_impl.cc:687-702、719-731），而 AICPU 的 `BindMemory` 只接受 `MEM_DEVICE`（aicpu_trans_provider.cc:1691-1699）；因此非空 view 下缺该配置会让注册必然 `PARTIAL_FAILED`。该门禁只在 `register_staging == true` 时生效（Master 的 delete-only client 不注册，不受约束），失败即 Init 失败，不允许降级启动。
-12. 能力协商：SDK 公有 API 不暴露 `ServerKvCapabilities`，本设计不读取、不 clamp，固定按 `kEntryMaxBytes` 与 `kChunkPayloadBytes` 切分；设备真实上限只能从 Init 日志观察并实测确认。
+12. 能力协商：SDK 公有 API 不暴露 `ServerKvCapabilities`，本设计不读取、不 clamp，固定按 `kEntryMaxBytes` 校验单 entry；设备真实上限只能从 Init 日志观察并实测确认。
 
 > **[v2.0 变更]** 两处变化。(1) `AsuClientRuntime::IsReady()` 从「Init 就绪」扩展为「Init 就绪 且 staging arena 未全部 quarantine」，因此第 21c 步同时要求 `FreeSlots() == staging_slots`；运行期全部 slot 被 timeout 隔离后 `IsReady()` 会变假，读选择器随之改选其它副本（对应 FMEA-50、FMEA-36）。瞬时的 slot 占满只让数据面等待，不会改变 `IsReady()`。(2) `AsuAllocator` 的 epoch 语义明确为「全局原子 64 位、随机种子、恢复时推进到已恢复 descriptor 最大 epoch + 1」，用于满足「新 PutStart 必得新物理 key」这一承重前提。其余 init 逻辑与 v1.0 完全相同。
 
@@ -1537,29 +1515,24 @@ sequenceDiagram
     alt NonDfsTransfersSucceeded 为 false
         C->>C: 12a 零调用 ASU 并记 asu_write_skipped_total 的 primary_tier_failed
     else 为 true
-        C->>A: 12b WriteObject descriptor slices trace_id
-        A->>A: 13 规划 N 个 chunk 求 data_len 与 wire_len 与 offset
-        loop chunk i 从 1 到 N-1
+        C->>A: 12b BatchStoreObjects requests trace_id
+        A->>A: 13 PlanBatches 按对象边界合批 每对象一条 entry offset=0
+        loop 每个对象 entry
             A->>A: 14 Encode 512B AsuRecordHeader 并计算 payload CRC32C
             A->>A: 15 AcquireBatch 512B 对齐 slot 并 D2H 拷贝
-            A->>A: 15a BuildEntry 组装 KVBuffer key/region/handle/offset mrKey 留空
+            A->>A: 15a BuildEntry 组装 KVBuffer key/region/handle/offset=0 mrKey 留空
         end
-        A->>A: 16 逐 entry 预检 wire_len 与 offset 与 addr 与 region.size 与 key_id 与 handle
-        A->>K: 17 BatchStoreAsync 提交 chunk 1 到 N-1
+        A->>A: 16 逐 entry 预检 wire_len 与 offset=0 与 addr 与 region.size 与 key_id 与 handle
+        A->>K: 17 BatchStoreAsync 提交整个 task（可含多个对象）
         A->>K: 18 Wait 显式 timeout
         K->>D: 19 STORE
         D-->>K: 20 entryStatus
         K-->>A: 21 TaskResult
         alt 任一 entryStatus 非 OK
-            A->>A: 22a best effort DeleteObject 已成功 chunk
-            A-->>C: 22b 返回错误
+            A->>A: 22a 逐 entry 归因到对象并 best effort BatchRemoveObjects 清理
+            A-->>C: 22b 返回该 task 内对象的逐对象结果
         else 全部 OK
-            A->>K: 22c BatchStoreAsync 单独提交 chunk 0 作为提交点
-            A->>K: 23 Wait 显式 timeout
-            K->>D: 24 STORE chunk 0
-            D-->>K: 25 entryStatus
-            K-->>A: 26 TaskResult
-            A-->>C: 27 OK 或错误
+            A-->>C: 27 OK
         end
         C->>C: 28 RecordSuccess 或 RecordFailure ASU
     end
@@ -1589,20 +1562,20 @@ sequenceDiagram
 2. 写模式在 `DetermineReplicaWriteMode`（replica.h:291-302）最前面按 `AsuReplicaNum() > 0` 返回 `TIERED_MEMORY_THEN_ASU`。`ReplicateConfig` 追加 `struct_pack::compatible<size_t, 4> asu_replica_num` 与 `AsuReplicaNum()`，沿用 replica.h:133-139 的 compatible 范式，禁止裸 `size_t`（否则破坏 RPC 线格式兼容）。
 3. `PrepareWriteStart`（master_service.cpp:5047-5138）是唯一参数校验入口。`kMaxSliceSize` 检查（master_service.cpp:5111-5117）保持在最前且对所有副本类型生效；其后的 ASU 六条校验见 2.2.1。
 4. `AllocateReplicas` 先分配 memory（`replica_num >= 1` 已由白名单保证），在 `use_disk_replica_` 与 DFS 块之后、`return replicas` 之前 `emplace_back` 一个 PROCESSING 的 AsuDescriptor（因此位于 `HasExpectedReplicaAllocation` 门槛 master_service.cpp:4876-4898 之后）。`AllocateReplicas` 需要新增 `const TenantId&` 参数并透传 `AllocateAndInsertMetadata`/`InsertMetadata`；`accessor.Grow` 的记账公式（master_service.cpp:5029-5030）不变，ASU 不占字节。
-5. `AsuDescriptor` 的 48B 线格式（含 `object_epoch`）在 PutStart 响应中原样返回。客户端只使用其中的 `key_id` 与 `object_size`，绝不自行重算 key；`object_epoch` 参与 key 推导，每次 PutStart 得到新物理 key，因此 Remove 后立刻 Put 不会被迟到的 Delete 误删。
+5. `AsuDescriptor` 的 40B 线格式（含 `object_epoch`）在 PutStart 响应中原样返回。客户端只使用其中的 `key_id` 与 `object_size`，绝不自行重算 key；`object_epoch` 参与 key 推导，每次 PutStart 得到新物理 key，因此 Remove 后立刻 Put 不会被迟到的 Delete 误删。
 6. 客户端在拿到 PutStart 响应后立即校验 `requested_asu > 0` 时 `allocated_asu > 0`。为假说明服务端纯命名没造出 ASU，此时不发起传输、直接 `PutRevoke(ALL)` 并返回 `NO_AVAILABLE_HANDLE`。这一步不能省：让 `allocated_asu == 0` 流进 finalize 会被 `HasExpectedReplicaAllocation` 与 TIERED 分支误判。
 7. `StageWriteBuffersForRemoteReplicas`（client_service.cpp:3626-3647）的 `all_of(CanUseLocalMemcpy)` 必须排除 ASU descriptor，否则本地 memory + ASU 的组合会被整对象 staging，与 arena 拷贝叠加。
 8. 主层传输：单 key 在 client_service.cpp:2115-2139 逐 memory/nof 副本 `TransferWrite` 并 `RecordSuccess/RecordFailure`；批量走 `SubmitTransfers` 与 `WaitForTransfers`（client_service.cpp:3682-3684）。磁盘副本仍先写（client_service.cpp:2115-2126），但 v2 白名单禁止 asu 与 dfs 同存。
-9. 门禁是 `NonDfsTransfersSucceeded`（client_service.cpp:321-327）。为假时 `SubmitAsuWrites` 记 `asu_write_skipped_total{reason=primary_tier_failed}` 并零调用 `WriteObject`；这是要求 1 的逆序断言点（FMEA-41）。
-10. `AsuStorageBackend::WriteObject` 的输入是 `op.slices`，不回读 memory。契约是「Put 返回前调用方不得修改 buffer」。
-11. 分块发生在 `WriteObject` 内部，使用 `AsuChunkPlanner::Count`、`DataLen`、`WireLen`、`Offset`。`S=0` 或 `S` 超过 `MaxObjectBytes` 直接拒绝。
-12. 512B 对齐由三处共同保证：header 固定 512B；`wire_len` 等于 512 加 `align_up(data_len, 512)`；`offset_i` 等于 `i` 乘 `kChunkStrideBytes`（恒为 512B 的整数倍）。arena 基址与 slot 也强制 512B 对齐。SDK 只校验 length 与 offset 的对齐，不校验 addr。
-13. staging 与 entry 组装：device 指针的 slice 先 D2H 拷入已注册 pinned slot；每 chunk 独立 slot，slot 不可在 Wait 返回前复用。随后在提交前用 `BuildEntry(descriptor, dst, slot->handle, wire_len, index)` 组装 `kv::KVBuffer`：`key` 取 `AsuKeyCodec::ToCacheKey(descriptor.key_id)`，`buffer.region.addr` 取 slot 地址，`buffer.region.size` 取 `wire_len`（不是 slot 容量），`buffer.handle` 取注册返回的 canonical handle，`offset` 取 `ChunkOffset(index)`，`mrKey` 必须留 `std::nullopt`（由 `KvClient::SubmitAsync` 按 handle 回填，调用方传入的值会被无条件重置）。字段归属见 §3.5.1。
-14. 逐 entry 预检在第一次 `BatchStoreAsync` 之前完成，检查 `wire_len` 是 512 的整数倍且落在 512 到 16,776,704 之间、`offset` 是 512 的倍数且不超过 `0xFFFFFE00`、`buffer.region.addr` 是 512 的倍数、`buffer.region.size` 精确等于 `wire_len`、`key` 非全零且非空、`buffer.handle` **精确等于** arena 的 canonical handle（只判 `!= kInvalidMRHandle` 拦不住「非 0 但未注册」，那种错误要到 `Wait` 才以 `BUFFER_NOT_REGISTERED` 暴露）、`mrKey` 必须为空。原因是 SDK 在预发送阶段失败会 abort 整个 transport task 并把所有 `entryStatus` 置 CANCELED（trans_task_executor.cc:227-246），不存在只失败一条。
+9. 门禁是 `NonDfsTransfersSucceeded`（client_service.cpp:321-327）。为假时 `SubmitAsuWrites` 记 `asu_write_skipped_total{reason=primary_tier_failed}` 并零调用 `BatchStoreObjects`；这是要求 1 的逆序断言点（FMEA-41）。
+10. `AsuStorageBackend::BatchStoreObjects` 的输入是 `op.slices`，不回读 memory。契约是「Put 返回前调用方不得修改 buffer」。
+11. 每个对象一条 entry，`wire_len = 512 + align_up(object_size, 512)`，`offset` 恒为 0。`S=0` 或 `S > 16,776,192` 直接拒绝（后者含 1,008 B 窗口）。
+12. 512B 对齐由三处共同保证：header 固定 512B；`wire_len` 等于 512 加 `align_up(object_size, 512)`；`offset` 恒为 0（512B 的整数倍）。arena 基址与 slot 也强制 512B 对齐。SDK 只校验 length 与 offset 的对齐，不校验 addr。
+13. staging 与 entry 组装：device 指针的 slice 先 D2H 拷入已注册 pinned slot；每个对象一个 slot，slot 不可在 Wait 返回前复用。随后在提交前用 `BuildEntry(descriptor, dst, slot->handle, wire_len)` 组装 `kv::KVBuffer`：`key` 取 `AsuKeyCodec::ToCacheKey(descriptor.key_id)`，`buffer.region.addr` 取 slot 地址，`buffer.region.size` 取 `wire_len`（不是 slot 容量），`buffer.handle` 取注册返回的 canonical handle，`offset` 恒为 0，`mrKey` 必须留 `std::nullopt`（由 `KvClient::SubmitAsync` 按 handle 回填，调用方传入的值会被无条件重置）。字段归属见 §3.5.1。
+14. 逐 entry 预检在 `BatchStoreAsync` 之前完成，检查 `wire_len` 是 512 的整数倍且落在 512 到 16,776,704 之间、`offset == 0`、`buffer.region.addr` 是 512 的倍数、`buffer.region.size` 精确等于 `wire_len`、`key` 非全零且非空、`buffer.handle` **精确等于** arena 的 canonical handle（只判 `!= kInvalidMRHandle` 拦不住「非 0 但未注册」，那种错误要到 `Wait` 才以 `BUFFER_NOT_REGISTERED` 暴露）、`mrKey` 必须为空。原因是 SDK 在预发送阶段失败会 abort 整个 transport task 并把所有 `entryStatus` 置 CANCELED（trans_task_executor.cc:227-246），不存在只失败一条。
 15. `region.size` 在 SDK 内部先被 `static_cast<uint32_t>`（sqe_request.cc:190、206、223、251），所以本层禁止任何 entry 大于等于 4GiB；`kMaxObjectBytes` 与 `wire_len` 双重断言。
 16. `Wait` 必须显式传 timeout。`KvClientConfig` 的 `defaultWaitTimeoutMs` 默认 100ms（kv_types.h:215），16MiB entry 必然超时；Wait 超时后 task 被无条件 Remove（task_manager.cc:108-116），结果不可再取，该 task 的全部 slot 进 quarantine。
-17. 提交顺序：chunk 1 到 N-1 一个 task 并 Wait，全部成功后 chunk 0 单独一个 task 并 Wait。chunk 0 是 commit marker，同样要经过 staging 与预检。默认 CACHELIB 部署下 `S` 不超过约 16MiB、`N=1`，此时只剩 chunk 0 一次提交。
-18. 任一 chunk 失败则 best-effort `DeleteObject` 已成功 chunk，再 `RecordFailure(ASU)`。注意这里**不** revoke 主层：ASU 阶段的失败只交给 `DetermineFinalizeDecision`；`require_asu=false` 进入降级，`true` 由 finalize 统一 revoke ALL。
+17. 提交批次：按 `PlanBatches` 把本批对象按对象边界切成若干 task（条数 ≤ `min(batch_max_entries=110, staging_slots)`，字节 ≤ `batch_max_bytes=64 MiB`），每个 task 一次 `BatchStoreAsync` + 显式 `Wait`；一个对象只贡献一条 entry，绝不切开单个对象。
+18. 任一 entry 失败则按 `entryStatus` 映射到对应对象，best-effort `BatchRemoveObjects` 清理失败对象，再 `RecordFailure(ASU)`；task 级 CANCELED/超时使该 task 内全部对象失败。注意这里**不** revoke 主层：ASU 阶段的失败只交给 `DetermineFinalizeDecision`；`require_asu=false` 进入降级，`true` 由 finalize 统一 revoke ALL。
 19. `DetermineFinalizeDecision`（client_service.cpp:378-431）在非 FLEXIBLE 分支之前插入 TIERED 判定：`primary_ok = HasExpectedReplicaAllocation && NonDfsTransfersSucceeded`，`asu_ok = allocated_asu > 0 && successful_asu == allocated_asu && failed_asu == 0`。四种组合映射为 `{ALL, null, true}`（主层与 ASU 都成功）、`{MEMORY, ASU, true}`（`require_asu=false` 降级）、`{null, ALL, false}`（`require_asu=true` 严格失败，错误码取 `first_asu_error`）、`{null, ALL, false}`（主层失败，ASU 从未写）。`FinalizeDecision` 结构保持 `end_type` + `revoke_type` 双槽，不向量化——白名单关掉 asu+nof/asu+dfs 后，降级只需一个 end 和一个 revoke。
 20. **ASU 写阶段在 PutEnd 之前**。这是必然的：ASU 副本出生即 PROCESSING，只有 `PutEnd` 能把 COMPLETE 态写进元数据；若先 PutEnd 再写物理数据，就会出现「元数据 COMPLETE 而物理未提交」的可读假象。同步内联（而不是异步后台写）的理由同样落在这里：异步会让 ASU 长期 PROCESSING，使 `CheckRemovable` 的 `AllReplicas(fn_is_completed)`（master_service.cpp:7248）恒假，阻塞 Remove、软 pin 与动态复制。
 21. 单 key 终态顺序保持「先 end 后 revoke」（client_service.cpp:2186-2203、2392-2408），只改错误处理：`revoke_type == ASU` 失败时仅记 `asu_finalize_rpc_failed_total` 与 WARN，不写 `finalize_rpc_errors`、不 return。原因是 `FinalizeBatchPut` 只要 `finalize_rpc_errors` 被置位就 `SetTerminalError`（client_service.cpp:3441-3444），不分流则「降级但仍成功」在实现上不成立（FMEA-44）。`require_asu=true` 时严格失败只产出 `revoke_type == ALL`，绝不落入该豁免；`ignore_errors` 的判据必须是「副本类型 == ASU」而不是「写模式 == TIERED」（FMEA-60）。end 为空、仅发 revoke 时，revoke 失败只记录（该作用域没有 PutOperation/failure_context），随后返回 `finalize_decision.error`（ASU 根因），不要用 revoke 的错误覆盖它（client_service.cpp:2196-2203、2401-2408）。
@@ -1633,12 +1606,12 @@ sequenceDiagram
     alt rank 为 kAsu
         C->>C: 8 client_buffer 生成 object_size 大小的 slices
         C->>C: 9 Client::Get 分派 ReadAsuReplica 并校验 slices 总长不小于 object_size
-        C->>A: 10 ReadObject 或 ReadObjects
-        A->>A: 11 规划 chunk R 等于 object_size 求 need 与 read_len 与 offset
+        C->>A: 10 BatchLoadObjects requests trace_id
+        A->>A: 11 PlanBatches 按对象边界合批 每对象一条 entry offset=0
         A->>A: 12 AcquireBatch slot 并按 read_len 置零缓冲
-        A->>A: 12a BuildEntry 组装读 entry key 取 key_id region.size 取 read_len offset 取 ChunkOffset mrKey 留空
-        A->>A: 12b 逐 entry 预检 read_len 与 offset 与 addr 与 region.size 与 key_id 与 handle 等值
-        A->>K: 13 BatchLoadAsync 默认每对象一个 task
+        A->>A: 12a BuildEntry 组装读 entry key 取 key_id region.size 取 read_len offset=0 mrKey 留空
+        A->>A: 12b 逐 entry 预检 read_len 与 offset=0 与 addr 与 region.size 与 key_id 与 handle 等值
+        A->>K: 13 BatchLoadAsync 提交整个 task（可含多个对象）
         A->>K: 14 Wait 显式 EstimatedTimeout
         K->>D: 15 RETRIEVE
         D-->>K: 16 entryStatus 与 payload
@@ -1659,7 +1632,7 @@ sequenceDiagram
     C-->>U: 26 返回数据或错误
 ```
 
-> **[v2.0 变更]** 读路径的改动集中在 Client：Master 只被确认「原本就返回全部可读副本」；Client 用显式档位替代隐式兜底链，并在选中 ASU 后走 `ReadObjects` 批量读而不是逐对象 `ReadObject`。另一个承重修复是适配层的 `PARTIAL_FAILED` 早退——不改则逐 entry 归因在实现上不成立。
+> **[v2.0 变更]** 读路径的改动集中在 Client：Master 只被确认「原本就返回全部可读副本」；Client 用显式档位替代隐式兜底链，并在选中 ASU 后走 `BatchLoadObjects` 批量读而不是逐对象 `ReadObject`。另一个承重修复是适配层的 `PARTIAL_FAILED` 早退——不改则逐 entry 归因在实现上不成立。
 
 时序简介：
 
@@ -1671,19 +1644,19 @@ sequenceDiagram
 6. 若选中 ASU：`client_buffer.cpp` 的 `calculate_total_size`（client_buffer.cpp:144-159）在最后 `else` 前加 ASU 分支返回 `object_size`；`allocateSlices`（client_buffer.cpp:161-191）加 ASU 分支生成单个 `Slice{buffer_ptr, object_size}`。这一步必须做，否则 ASU 会落到既有 `else` 的默认计算。
 7. `Client::Get`（client_service.cpp:1578-1653）在 1599-1603 的 DFS 分支旁加 `else if (replica.is_asu_replica()) err = ReadAsuReplica(...)`。入口要求 `CalculateSliceSize(slices) >= object_size`，否则 `INVALID_PARAMS`——与 memory 在 `TransferRead`（client_service.cpp:5160-5185）的尺寸契约一致。`TransferRead` 入口再显式 `if (is_asu_replica) return INVALID_REPLICA` 兜底，`transfer_task.cpp` 的 `submitFileReadOperation` 之前也加防御性拒绝，避免落到 `get_disk_descriptor()` 抛 `std::runtime_error`。
 8. 后置校验原样保留：`VerifyObjectChecksum`（client_service.cpp:1622-1624）、hot cache（1637）、租约检查（1641）。hot cache 只在 `is_memory_replica` 时生效，`ProcessSlicesAsync` 因 5766 的 memory 门控会跳过 ASU。
-9. 读分块在 `ReadObjects` 内部完成：`R = min(CalculateSliceSize(slices), object_size)`，因为入口已保证 `slices >= object_size`，实际 `R == object_size`；`need_i = min(chunk_payload, R - i*chunk_payload)`；`read_len_i = 512 + AlignUp(need_i, 512)`；`offset_i = i * kChunkStrideBytes`。由 `align_up` 单调性保证 `read_len_i` 不超过写侧已存的 `wire_len_i`，因此不做 over-read、也不需要独立长度索引。
-10. 打包：默认每个对象一个 `BatchLoadAsync`，该对象的全部 chunk 在同一 task 内；`task` 内条数受 `min(batch_max_entries=110, staging_slots)` 与 `batch_max_bytes`（默认 64MiB）约束。多对象场景按在飞上限分批 submit 并逐个 Wait，与已提交的 RDMA future 并行；不提供跨对象合并。**跨对象在飞 slot 总数受 `staging_slots` 约束**：提交下一个 task 前若 `in_flight_slots + take > staging_slots`，先 Wait 并释放最早对象的 task；每个 task 用 `AcquireBatch` 原子预留全部 entry，避免持有部分 slot 再阻塞。因此一个含任意多对象的 `BatchGet` 在默认 8 slot 下仍能全部完成（TC-127）。
-11. 逐 entry 预检与写侧同规则：`read_len` 是 512 的倍数且落在 512 到 16,776,704 之间、`read_off` 是 512 的倍数且小于 2^32、addr 是 512 的倍数、`region.size` 精确等于 `read_len`、`key` 非全零、`buffer.handle` 精确等于 arena 的 canonical handle、`mrKey` 必须为空。读侧 entry 与写侧同构，唯一差异是 `buffer.region.size` 取 `read_len`（不是写侧的 `wire_len`），且 slot 在组装前按 `read_len` 置零；没有 header 编码步骤。预发送失败同样会整批 CANCELED。
+9. 读不做分块：入口已保证 `slices >= object_size`，每个对象一次完整 entry 读取，`read_len = 512 + AlignUp(object_size, 512)`，`offset = 0`。`data_len == object_size`，payload CRC-32C 永远全量校验。
+10. 打包：`BatchLoadObjects` 把多个对象按对象边界合并进同一 `BatchLoadAsync`（条数 ≤ `min(batch_max_entries=110, staging_slots)`，字节 ≤ `batch_max_bytes`，默认 64MiB）。**绝不切开单个对象**；task 级错误波及本 task 内全部对象，`PARTIAL_FAILED` 逐 entry 归因。跨对象在飞 slot 总数受 `staging_slots` 约束，每个 task 用 `AcquireBatch` 原子预留。
+11. 逐 entry 预检与写侧同规则：`read_len` 是 512 的倍数且落在 512 到 16,776,704 之间、`read_off == 0`、addr 是 512 的倍数、`region.size` 精确等于 `read_len`、`key` 非全零、`buffer.handle` 精确等于 arena 的 canonical handle、`mrKey` 必须为空。读侧 entry 与写侧同构，唯一差异是 `buffer.region.size` 取 `read_len`，且 slot 在组装前按 `read_len` 置零；没有 header 编码步骤。预发送失败同样会整批 CANCELED。
 12. **适配层必须修复的早退缺陷**：`Status::ok()` 只对 `OK` 为真（kv_types.h:88-93），v1.0 的 `if (!wait.ok())` 会把 `PARTIAL_FAILED` 误判成整体失败并丢掉全部 per-entry 结果。v2 改为 `if (code != OK && code != PARTIAL_FAILED) return unexpected(MapStatus(code));` 再交 `ToEntryResults` 逐条映射。`BatchStore`/`BatchLoad` 两侧都要改。
 13. `Wait` 必须显式传 `EstimateTimeoutMs`（基于字节数与基线估算）。超时后 task 被无条件 Remove（task_manager.cc:108-116），本 task 的全部 slot 进 quarantine 且不复用；当**全部** slot 都被 quarantine 时 runtime 变为不可服务（`IsAvailable()==false`），仅瞬时占满不改变可服务性。
 14. 结果判定：task 级 `OK` 与 `PARTIAL_FAILED` 都继续读 `entryStatus` 逐条映射；只有 `TIMEOUT`/`NOT_FOUND`/`NOT_INITIALIZED`/`CONNECTION_ERROR`/`IO_ERROR` 才把本 task 全部 entry 置同一错误。LOAD 的 `ENTRY_KEY_NOT_FOUND` 或 `ENTRY_DATA_NOT_EXIST` 映射 `REPLICA_IS_GONE`。
-15. header 校验是 fail-stop：magic、version、header_bytes、header_crc32c、flags 未知位、`key_id`（asu_key_id）、`key_fingerprint`、`object_epoch`、`object_size`、`chunk_index`、`chunk_count`、`data_offset`、`chunk_payload`、`data_len`，任一不符返回 `ASU_RECORD_CORRUPT` 或 `ASU_KEY_COLLISION`，绝不交出别人的字节。
-16. **payload CRC-32C 在 v2 中永不跳过**。因为入口强制整对象读，每个 chunk 都完整读到，`data_crc32c` 全量可校验。这是承重项：Mooncake 端到端 CRC-64 默认关闭，ranged read 又会跳过校验，若这里再跳过就只剩 header CRC。CRC 必须按地址序对内存计算，不能按写序增量拼接。
+15. header 校验是 fail-stop：magic、version、header_bytes、header_crc32c、flags 未知位、`key_id`（asu_key_id）、`key_fingerprint`、`object_epoch`、`object_size`、`data_offset==0`、`data_len`（== object_size）、`data_crc32c`，任一不符返回 `ASU_RECORD_CORRUPT` 或 `ASU_KEY_COLLISION`，绝不交出别人的字节。
+16. **payload CRC-32C 在 v2 中永不跳过**。因为入口强制整对象读，每个对象的 entry 完整读到，`data_crc32c` 全量可校验。这是承重项：Mooncake 端到端 CRC-64 默认关闭，若这里再跳过就只剩 header CRC。CRC 必须按地址序对内存计算。
 17. 回填用 `CopyMaybeDevice`（batch_read_fanout.h:57-66），host 缓冲 memcpy、device 缓冲 H2D。成功或已确定的错误 → `Release(slot)`；task 级超时 → `Quarantine(slot)`。
-18. 批量读接线在 `Client::BatchGet`（client_service.cpp:1718-1997）：在 1758-1759 的 DFS 请求容器旁新增 `asu_read_requests`/`asu_indices`；在 1802-1816 的 DFS 分支旁加 `else if (is_asu_replica())`：runtime 未就绪则 `results[i] = ASU_SERVICE_UNAVAILABLE`，否则收集并 `continue`。在 DFS 同步批量读（client_service.cpp:1889-1955）之后、RDMA 统一 Wait（client_service.cpp:1957-1997）之前执行一次 `ReadObjects`，逐 outcome 映射并复用 `VerifyObjectChecksum`（1978-1985）。
+18. 批量读接线在 `Client::BatchGet`（client_service.cpp:1718-1997）：在 1758-1759 的 DFS 请求容器旁新增 `asu_read_requests`/`asu_indices`；在 1802-1816 的 DFS 分支旁加 `else if (is_asu_replica())`：runtime 未就绪则 `results[i] = ASU_SERVICE_UNAVAILABLE`，否则收集并 `continue`。在 DFS 同步批量读（client_service.cpp:1889-1955）之后、RDMA 统一 Wait（client_service.cpp:1957-1997）之前执行一次 `BatchLoadObjects`，逐 outcome 映射并复用 `VerifyObjectChecksum`（1978-1985）。
 19. real_client 侧四个全对象选择点必须传 policy：`get_buffer_internal`（real_client.cpp:4036）、`batch_get_buffer_internal`（4425）、`batch_get_into_internal`（6776）、`batch_get_into_multi_buffers_internal`（8440）；`nullptr` 分支统一走 `NoReplicaError`，避免与 `ReadReplicaSelector` 的错误码不一致。multi-buffer 的 `if (replica.is_memory_replica() || replica.is_nof_replica())`（real_client.cpp:8464）要扩展为 `|| replica.is_asu_replica()`，否则会落到 real_client.cpp:8498 的 `Unsupported replica type`。
 20. range 与 session range 对 ASU 显式 `NOT_SUPPORTED`；`SelectSessionReplica`（real_client.cpp:550-571）不纳入 ASU。`MakeReadReplicaSelector(bool allow_asu = true)` 的 range 调用点（client_service.cpp:1661、4907）传 `false`。
-21. 失败语义：选择阶段无 COMPLETE 副本 → `INVALID_REPLICA`；只有 ASU 且 `AsuReadAvailable() == false` → `ASU_SERVICE_UNAVAILABLE`。单对象失败即失败，不做同一次 Get 内的跨副本 fallback，不返回部分数据。批量每对象结果独立；task 级错误波及本 task 内的全部对象，`PARTIAL_FAILED` 逐 entry 归因，同一对象绝不拆两个 task。
+21. 失败语义：选择阶段无 COMPLETE 副本 → `INVALID_REPLICA`；只有 ASU 且 `AsuReadAvailable() == false` → `ASU_SERVICE_UNAVAILABLE`。单对象失败即失败，不做同一次 Get 内的跨副本 fallback，不返回部分数据。批量每对象结果独立；task 级错误波及本 task 内的全部对象，`PARTIAL_FAILED` 逐 entry 归因，但一个对象只占一条 entry，不存在同对象跨 task。
 22. 明确不做：回填 memory/promotion（hot cache 只在 client_service.cpp:5766 对 memory 生效，promotion-on-hit 只认 LOCAL_DISK，master_service.cpp:4631-4645）、range/session 读、扩展 `RetainMemoryReadCandidates`（replica_selection.h:199-218 是未来 fallback 的唯一落点，登记为已知扩展点）。
 
 #### 2.3.4 查询阶段
@@ -1704,7 +1677,7 @@ sequenceDiagram
     M-->>C: 5 逻辑存在性 true 或 false 以及 GetReplicaList 时的 descriptor.object_size
     C-->>U: 6 返回逻辑存在性 零额外 RTT 不触达 ASU
     opt 运维探活或错误归因需要物理存在性
-        C->>A: 7 QueryObject descriptor trace_id
+        C->>A: 7 BatchIsExist descriptors trace_id
         A->>K: 8 QueryAsync 一组 CacheKey 只含 key_id
         A->>K: 9 Wait task 显式 timeout
         K->>D: 10 QUERY 最多 256 条
@@ -1719,7 +1692,7 @@ sequenceDiagram
 
 1. `IsExist`、`BatchIsExist`、`Query` 只走元数据，零额外 RTT。Client 侧见 client_service.cpp:4191-4194，Master 侧查 metadata accessor，按 `HasReadableReplica` 决定可见性并授租约（master_service.cpp:2824-2861）。
 2. 返回的长度是 `descriptor.object_size`。SDK 没有长度、Stat、GetMeta API（kv_client.h:33-61），不存在第二权威。
-3. 物理存在性只能由 `QueryAsync` 的 `exists` 位图观测，按入参 key 顺序回填（trans_task_utils.cc:169-180）。它只回答 key 是否存在，不回答某个 offset 的 chunk 是否存在。
+3. 物理存在性只能由 `QueryAsync` 的 `exists` 位图观测，按入参 key 顺序回填（trans_task_utils.cc:169-180）。取消分块后每个对象只有一个 entry，key 级位图恰好对应「该对象 entry 是否存在」。
 4. 因此物理查询只用于删除前后一致性诊断、错误归因、开发自验证与运维探活；不放在 `IsExist` 或 `Query` 热路径，不作为 Mooncake 存在性权威。
 5. 语义边界：ASU entry 丢失时 Master 的 `IsExist` 仍返回 true 并下发读不到的 descriptor，读时才暴露 `REPLICA_IS_GONE`。这与 DFS/DISK 同类，必须写进对外契约。
 6. 不新增公开的物理查询 RPC。
@@ -1730,20 +1703,18 @@ sequenceDiagram
 
 > **[v2.0 变更]** v1.0 只有一张 remove 图。v2.0 拆成两张，对应两个方向相反的动词。两张图共享同一个不变量：**ASU 的物理删除永远只由 Master 侧 delete-only KvClient 执行**，`FreeAsuReplicas` 只入队、不做 IO。
 
-##### 2.3.5.1 删 memory：只删 memory
+##### 2.3.5.1 删 memory：既有 Remove，一行不改
 
 ```mermaid
 sequenceDiagram
     participant U as 用户或应用
     participant C as Client
     participant M as Master
-    participant A as AsuStorageBackend
-    participant K as KvClient SDK
     participant D as ASU 设备
 
-    U->>C: 1 RemoveMemoryReplica key 与 force
-    C->>M: 2 RemoveReplica key tenant ReplicaType MEMORY force
-    M->>M: 3 取 master_state_mutex 共享锁 与 MetadataAccessorRW 的 key 写锁
+    U->>C: 1 Remove key 或 BatchRemove keys 与 force
+    C->>M: 2 MasterClient::Remove
+    M->>M: 3 RemoveObject 取 master_state_mutex 共享锁 与 MetadataAccessorRW 的 key 写锁
     M->>M: 4 Exists 否则 OBJECT_NOT_FOUND
     M->>M: 5 管理组成员返回 UNAVAILABLE_IN_CURRENT_STATUS
     M->>M: 6 CheckRemovable 检查租约 与全副本 COMPLETE 与复制任务
@@ -1751,31 +1722,23 @@ sequenceDiagram
         M-->>C: 7a OBJECT_HAS_LEASE 或 REPLICA_IS_NOT_READY 或 OBJECT_HAS_REPLICATION_TASK
         C-->>U: 7b 返回错误
     else 可删除
-        M->>M: 8 HasReplica 的 fn_is_busy 为真时返回 OBJECT_REPLICA_BUSY
-        M->>M: 9 EraseReplicasWithCacheTotalAccounting 只 pop MEMORY 副本
-        M->>M: 10 函数返回时析构 释放 memory buffer 并同步 cache 记账
-        M->>M: 11 CancelPromotionTaskForRemovedReplicas 与 SyncKvObjectState
-        M->>M: 12 metadata 仍 IsValid 时保留对象与 ASU
-        M-->>C: 13 OK
-        C-->>U: 14 返回成功
-        Note over M: 后续 Get 由读档位选中 ASU
+        M->>M: 8 EraseMetadata 删除元数据与 memory buffer
+        M->>M: 9 不捕获 ASU 不入队 ASU（ASU entry 成为孤儿）
+        M-->>C: 10 OK
+        C-->>U: 11 返回成功
+        Note over D: ASU 物理数据不动，仍可被诊断工具发现
     end
 ```
 
 时序简介：
 
-1. `Client::RemoveMemoryReplica` 转发 `MasterClient::RemoveReplica(key, tenant, ReplicaType::MEMORY, force)`。新增 RPC 需要同时改 `rpc_service.h/.cpp`、`master_client.h/.cpp`、`RpcNameTraits` 特化，并在 `RegisterPooledHandlers` 的实参列表追加 `&WrappedMasterService::RemoveReplica`（注册点 rpc_service.cpp:2076-2144）——漏这一行服务端不会注册。
-2. `RemoveReplicaTier` 只接受 `ReplicaType::MEMORY`，其余返回 `INVALID_PARAMS`。锁序对齐 `RemoveObject`：共享 `master_state_mutex_`（master_service.cpp:7179）+ `MetadataAccessorRW` 的 key 写锁。
-3. `CheckRemovable`（master_service.cpp:7236-7255）的三项检查原样复用：lease 未过期且非 force → `OBJECT_HAS_LEASE`；`AllReplicas(fn_is_completed)` 不成立 → `REPLICA_IS_NOT_READY`；有 `replication_task` → `OBJECT_HAS_REPLICATION_TASK`。
-4. 额外的 `is_busy` 保护是承重项：`CheckRemovable` 不覆盖 offloading/promotion 任务持有的 source refcnt，而 `PopReplicas` 会当场析构 buffer，RDMA 仍在读就是 UAF（FMEA-47）。`force` 只绕过 lease。
-5. `EraseReplicasWithCacheTotalAccounting(metadata, &Replica::fn_is_memory_replica)` 只 pop MEMORY；被 pop 的 `Replica` 在函数返回时析构，buffer 随之释放，cache 记账同步完成。`ReleaseLocalDiskUsage`/`FreeDfsReplicas` 对本谓词是 no-op，保留即可。
-6. `CancelPromotionTaskForRemovedReplicas` 清理 promotion 任务；`SyncKvObjectState` 让 media 从 `{cpu,disk}` 变为 `{disk}`。
-7. **只在 `!metadata.IsValid()` 时才 `accessor.Erase()`**。有 ASU 时 `IsValid()` 为真（object_metadata.h:488-494），对象保留，`GetReplicaList` 返回 ASU。
-8. HA/oplog 镜像 `RemoveObject` 的顺序：persist 入队成功后再 `mark_removed`（master_service.cpp:7228-7232），不要复用 `EvictDiskReplicaImpl` 的模板（persist 失败不回溯 mark）。
-9. 错误语义：对象不存在 → `OBJECT_NOT_FOUND`；无 memory 副本 → `REPLICA_NOT_FOUND`（types.h:373）且不触碰任何副本；有 PROCESSING 副本 → `REPLICA_IS_NOT_READY`（写删互斥）；memory refcnt > 0 → `OBJECT_REPLICA_BUSY`（types.h:378）。
-10. 若要求 2 未落地，「只剩 ASU」的对象不可读，此时 `RemoveMemoryReplica` 应返回 `NOT_SUPPORTED`；两条要求必须同版本上线。
+1. 删 memory 直接复用现有 `Client::Remove` / `BatchRemove` → `MasterClient::Remove` → `MasterService::RemoveObject`（`master_service.cpp:7175-7204`），一行不改；不新增 RPC、不新增 Client 方法。
+2. `RemoveObject` 取 `master_state_mutex_` 共享锁（`master_service.cpp:7179`），`MetadataAccessorRW` 取 key 写锁；不存在返回 `OBJECT_NOT_FOUND`，管理组成员返回 `UNAVAILABLE_IN_CURRENT_STATUS`。
+3. `CheckRemovable`（`master_service.cpp:7236-7255`）的三项检查原样复用：lease 未过期且非 force → `OBJECT_HAS_LEASE`；`AllReplicas(fn_is_completed)` 不成立 → `REPLICA_IS_NOT_READY`；有 `replication_task` → `OBJECT_HAS_REPLICATION_TASK`。
+4. `EraseMetadata` 只删除元数据与 memory buffer，**不捕获、不入队 ASU**。这是用户明确要求的「删 memory 只删 memory」；ASU entry 成为不可枚举孤儿（预期行为），只能由 `BatchRemoveAsuObjects` 回收。
+5. 错误语义：对象不存在 → `OBJECT_NOT_FOUND`；有 PROCESSING 副本 → `REPLICA_IS_NOT_READY`（写删互斥）。
 
-##### 2.3.5.2 删 ASU：整对象删除并按 memory 先、ASU 后级联
+##### 2.3.5.2 删 ASU：新增 BatchRemoveAsuObjects（捕获→既有 Remove→入队）
 
 ```mermaid
 sequenceDiagram
@@ -1786,72 +1749,60 @@ sequenceDiagram
     participant K as KvClient SDK
     participant D as ASU 设备
 
-    U->>C: 1 Remove key 与 force
-    C->>M: 2 MasterClient::Remove
-    M->>M: 3 RemoveObject 取 master_state_mutex 共享锁与 key 写锁
-    M->>M: 4 CheckRemovable 检查租约 与全副本 COMPLETE 与复制任务
-    alt 存在 PROCESSING 副本
-        M-->>C: 5a REPLICA_IS_NOT_READY
-        C-->>U: 5b 返回错误
-    else 可删除
-        alt enable_ha 且 enable_oplog
-            M->>M: 6a MarkRemovedAndPersist 标记全部 completed
-            M->>M: 6b durable 后两段 pop 先 memory 子集 再其余并 FreeAsuReplicas
-        else 非 HA
-            M->>M: 6c EraseMetadata 进入三段式
-            M->>M: 7 第一段 CollectAsuDescriptors 先捕获 AsuDescriptor
-            M->>M: 8 第二段 ReleaseLocalDiskUsage 与 FreeDfsReplicas 与记账与索引清理
-            M->>M: 9 第三段 hold.TearDown 释放 memory buffer 与元数据
-            M->>M: 10 EnqueueAsuDeletes 入 AsuDeleteQueue 只持队列锁
-        end
-        M-->>C: 11 OK 物理删除的入队顺序为 memory 先 ASU 后
-        C-->>U: 12 返回成功
+    U->>C: 1 BatchRemoveAsuObjects keys 与 force
+    C->>M: 2 MasterClient::BatchRemoveAsuObjects
+    M->>M: 3 Phase 1 key 写锁内只读捕获 AsuDescriptor（不授租约）
+    M->>M: 4 Phase 2 调用既有 RemoveObject 一行不改 先删 memory 与元数据
+    alt Remove 返回 OBJECT_HAS_LEASE 或 REPLICA_IS_NOT_READY
+        M-->>C: 5a 跳过该 key 不入队
+        C-->>U: 5b 逐 key 返回结果
+    else Remove OK 或 OBJECT_NOT_FOUND
+        M->>M: 6 Phase 3 用捕获的 key_id 入 AsuDeleteQueue
+        M-->>C: 7 OK 逐 key 结果
+        C-->>U: 8 返回成功
         Note over M: AsuGcWorker 独立线程 不在 master_state_mutex 下做网络 IO
-        M->>M: 13 等待 release_at 等于 max now 与 not_before 加上 max lease_ttl 与 grace
-        M->>A: 14 DeleteObject 一组 key_id
-        A->>K: 15 DeleteAsync keys
-        A->>K: 16 Wait 显式 timeout
-        K->>D: 17 DELETE
-        D-->>K: 18 rawResult 与 entryStatus
-        K-->>A: 19 TaskResult
+        M->>M: 9 等待 release_at 等于 max now 与 not_before 加上 max lease_ttl 与 grace
+        M->>A: 10 BatchRemoveObjects 一组 key_id
+        A->>K: 11 DeleteAsync keys 按 254 切批
+        A->>K: 12 Wait 显式 timeout
+        K->>D: 13 DELETE
+        D-->>K: 14 rawResult 与 entryStatus
+        K-->>A: 15 TaskResult
         alt rawResult 为 0x00
-            A->>A: 20a 成功计数 asu_delete_ok_total
+            A->>A: 16a 成功计数 asu_delete_ok_total
         else ENTRY_DELETE_FAILED 或其它可重试错误
-            A->>A: 20b 指数退避重试 超上限丢弃并记 master_asu_delete_dropped_total
+            A->>A: 16b 指数退避重试 超上限丢弃并记 master_asu_delete_dropped_total
         end
     end
 ```
 
 时序简介：
 
-1. 「删 ASU」不新增 API，就是现有 `Client::Remove` → `MasterClient::Remove` → `MasterService::Remove` → `RemoveObject`（master_service.cpp:7175-7204）。单设 `RemoveAsu` 会让「无 ASU 时是 no-op 还是先删 memory」没有自洽答案，且容易误删唯一主副本。
-2. `RemoveObject` 取 `master_state_mutex_` 共享锁（master_service.cpp:7179），`MetadataAccessorRW` 取 key 写锁；不存在返回 `OBJECT_NOT_FOUND`，管理组成员返回 `UNAVAILABLE_IN_CURRENT_STATUS`。
-3. `CheckRemovable`（master_service.cpp:7236-7255）在这里额外承担写删互斥：任何 PROCESSING 副本（包括正在写的 ASU）都会让删除返回 `REPLICA_IS_NOT_READY`。
-4. 非 HA 路径进入 `EraseMetadata`（master_service.cpp:2054-2116）。三段式是 v2 的核心改动：**段 1** 用 `VisitReplicas(&Replica::fn_is_asu_replica)` 捕获 `vector<AsuDescriptor>`；**段 2** 执行 `ReleaseLocalDiskUsage`、`FreeDfsReplicas`、`AccountCacheTotalRemoval`、软 pin 索引清理；**段 3** `hold.TearDown()` 释放 memory buffer 与元数据。随后 `EnqueueAsuDeletes(key, captured, nullopt)`。
-5. 顺序的意义：用户要求「删 ASU 时先删 memory」。非 HA 路径上，`hold.TearDown()`（`object_route.h:826-833`）一次性销毁整个 `ObjectMetadata`，memory buffer 与 ASU descriptor 同时消亡，因此可观测的不变量只能是**物理删除的入队顺序**：`EnqueueAsuDeletes` 在 `TearDown` 之后执行，保证 memory 先释放、ASU 后入队，且不会因为持有 descriptor 拷贝而延长 memory 生命周期。HA 路径的两段 pop 才提供真实的「元数据移除顺序 memory → ASU」。
-6. `EnqueueAsuDeletes` 只持 `AsuDeleteQueue` 自身的 mutex，绝不在 `master_state_mutex_` 或 key 锁下做网络 IO。
-7. HA 路径：`MarkRemovedAndPersist`（master_service.cpp:7206-7234）标记全部 completed；durable 后 `FinalizeRemovedReplicasAfterDurable`（master_service.cpp:1757-1807）改为两段 pop——先 pop `ids` 中 `is_memory_replica` 的子集，再 pop 其余并 `FreeAsuReplicas`。不变量表述为「元数据移除顺序 memory → ASU」。
-8. `release_at = max(now, not_before.value_or(now)) + max(default_kv_lease_ttl_, asu_delete_grace_ms)`。`not_before` 的类型是 `std::chrono::system_clock::time_point`（与 `metadata.put_start_time` 同源），在 `AsuMasterRuntime::EnqueueDelete` 内做**唯一一次** system_clock→steady_clock 换算并钳到 `>= now`；`AsuDeleteItem::release_at`、`TakeDue`/`Requeue` 与 GC 的 `now` 全部保持 steady_clock。普通 COMPLETE ASU 的 `not_before` 为空；被丢弃的 PROCESSING ASU 取 `put_start_time + put_start_release_timeout_sec_`，等待可能仍在飞的 DMA 落定。
-9. `AsuGcWorker` 是独立单线程，按 `release_at` 取到期项，`DeleteAsync({ToCacheKey(key_id)})` 后显式超时 `Wait`。失败指数退避重入队，超过 `asu_delete_max_attempts` 丢弃并记 `master_asu_delete_dropped_total`。
-10. DELETE 的成功语义是 `rawResult == 0x00`；`ENTRY_DELETE_FAILED`（0x0201）可重试；不要假设 DELETE 会返回 `ENTRY_KEY_NOT_EXIST`，那是 QUERY 的语义。删除不存在的 key 按 H4 视为幂等成功。
-11. 一个对象一个 ASU key（chunk 用 offset 表达），物理删除是每对象一次 `DeleteAsync`。**在 H15 真机确认「DeleteAsync 删除该 key 下全部 offset」之前，文档不得写成 O(1)**；若 H15 为假，`AsuDeleteItem` 需携带 `chunk_count` 并逐 offset 删除，删除成本与失败面都会放大。
-12. 崩溃窗口：memory 已删、ASU 未入队时崩溃，对象只剩 ASU，仍可读、可重试删除（FMEA-46）。这是「先 memory」的关键收益。
-13. 每个写世代有独立 `object_epoch` 并参与 key 推导，删除队列只删入队时的 `key_id`；Remove 后立即 Put 或 Upsert 重分配都不会被迟到的 `DeleteAsync` 误删。在飞写与删除的竞争由 `not_before` + epoch 派生缓解，属概率性保证（H16）。
-14. 删除失败不向上层报错：元数据已不可逆删除，向上报错只会诱导重试不存在的对象；孤儿属运维问题，记 metric + WARN。
-15. `EvictDiskReplica` 不扩白名单、不加 ASU/MEMORY 分支、一行不改。它是纯元数据通知路径，只调 `EraseReplicasWithCacheTotalAccounting`（master_service.cpp:6326-6328）与 `!IsValid` 时的 `accessor.Erase()`（6332-6334），全程无物理删除，同时缺 lease 检查、`master_state_mutex_`、延迟释放与 task/promotion 清理。删除机制只有一套。
+1. 「删 ASU」是新增的 `BatchRemoveAsuObjects(keys, force)`。它内部**首先**在 key 写锁内用只读访问器捕获每个 key 的 `AsuDescriptor`（因为随后的 `RemoveObject` 会把 descriptor 连同元数据一起删除），**然后**调用既有 `RemoveObject`（`master_service.cpp:7175-7204`，一行不改），**最后**用捕获的 `key_id` 入 `AsuDeleteQueue`。
+2. 既有 `RemoveObject` 取 `master_state_mutex_` 共享锁，`MetadataAccessorRW` 取 key 写锁；不存在返回 `OBJECT_NOT_FOUND`，管理组成员返回 `UNAVAILABLE_IN_CURRENT_STATUS`。
+3. `CheckRemovable`（`master_service.cpp:7236-7255`）承担写删互斥：任何 PROCESSING 副本（包括正在写的 ASU）都会让删除返回 `REPLICA_IS_NOT_READY`，此时跳过该 key、不入队。
+4. `EraseMetadata`（`master_service.cpp:2054-2116`）不再捕获或入队 ASU；plain Remove 后 ASU 成为孤儿。只有本函数在 Remove 返回成功或 `OBJECT_NOT_FOUND` 后，才把**捕获前**的 descriptor 入队，闭合「删 ASU 先删 memory」。
+5. `EnqueueAsuDeletes` 只持 `AsuDeleteQueue` 自身的 mutex，绝不在 `master_state_mutex_` 或 key 锁下做网络 IO。
+6. `release_at = max(now, not_before.value_or(now)) + max(default_kv_lease_ttl_, asu_delete_grace_ms)`。`not_before` 在 `AsuMasterRuntime::EnqueueDelete` 内做**唯一一次** system_clock→steady_clock 换算并钳到 `>= now`。
+7. `AsuGcWorker` 是独立单线程，按 `release_at` 取到期项，`BatchRemoveObjects` 按 254 key 切批 `DeleteAsync` 后显式超时 `Wait`。失败指数退避重入队，超过 `asu_delete_max_attempts` 丢弃并记 `master_asu_delete_dropped_total`。
+8. DELETE 的成功语义是 `rawResult == 0x00`；`ENTRY_DELETE_FAILED`（0x0201）可重试；不要假设 DELETE 会返回 `ENTRY_KEY_NOT_EXIST`，那是 QUERY 的语义。删除不存在的 key 按 H4 视为幂等成功。
+9. 一个对象一个 ASU key、一条 entry，物理删除是每对象一次 key 删除；`DeleteAsync` 以 key 为单位，不需要 offset 展开（v2.3 取消分块后 H15 退役）。
+10. 崩溃窗口：memory 已删、ASU 未入队时崩溃，对象只剩 ASU，仍可读、可重试删除。每个写世代有独立 `object_epoch` 并参与 key 推导，删除队列只删入队时的 `key_id`。
+11. 删除失败不向上层报错：元数据已不可逆删除，向上报错只会诱导重试不存在的对象；孤儿属运维问题，记 metric + WARN。
+12. `EvictDiskReplica` 不扩白名单、不加 ASU/MEMORY 分支、一行不改。
 
-#### 2.3.6 分块 512B 对齐 长度权威 与逐 entry 预检的落点
+#### 2.3.6 512B 对齐 长度权威 与逐 entry 预检的落点
 
 | 关注点 | 发生位置 | 依据 |
 | --- | --- | --- |
-| 分块 | 写路径 §2.3.2 第 11 步；读路径 §2.3.3 第 9 步 | `AsuChunkPlanner::Count/DataLen/WireLen/Offset`，常量来自 asu_layout.h |
-| 512B 对齐 | header 固定 512B；`wire_len = 512 + align_up(data_len, 512)`；`offset_i = i * kChunkStrideBytes`；staging slot 基址 512B 对齐 | asu_layout.h 的 `kAlign`、`kHeaderBytes`、`kChunkStrideBytes` 与 static_assert |
-| 长度权威 | 写：PutStart 时 `ObjectPart::length_` 复制进 `AsuDescriptor.object_size`，见 2.3.2 第 5 步；读：`descriptor.object_size` 决定 `R`，见 2.3.3 第 9 步 | object_part.h:77、rpc_types.h:84-105 |
+| 单 entry 布局 | 写路径 §2.3.2 第 11 步；读路径 §2.3.3 第 9 步 | 一个对象一条 entry，`wire_len = 512 + AlignUp(object_size, 512)`，`offset = 0`；常量见 asu_layout.h |
+| 512B 对齐 | header 固定 512B；`wire_len = 512 + align_up(object_size, 512)`；`offset` 恒 0；staging slot 基址 512B 对齐 | asu_layout.h 的 `kAlign`、`kHeaderBytes`、`kEntryMaxBytes` 与 static_assert |
+| 长度权威 | 写：PutStart 时 `ObjectPart::length_` 复制进 `AsuDescriptor.object_size`，见 2.3.2 第 5 步；读：`descriptor.object_size` 决定整对象读长度，见 2.3.3 第 9 步 | object_part.h:77、rpc_types.h:84-105 |
 | 逐 entry 预检 | 写入阶段 §2.3.2 第 14 步、读取阶段 §2.3.3 第 11 步；删除无 entry 长度问题 | SDK 预发送失败会 abort 整个 task 并置全部 entryStatus 为 CANCELED，见 trans_task_executor.cc:227-246 |
 | 有序写的落点 | ASU 阶段在 `PutEnd` 之前、`NonDfsTransfersSucceeded` 之后；单 key 在 client_service.cpp:2174-2183，批量在 3685、3735 | 见 2.3.2 第 20 步；门禁为 client_service.cpp:321-327 |
-| 提交点 | 写侧 chunk 0 最后写；读侧只认 `chunk_index==0` 且 header 合法的记录为已提交 | 见 2.3.2 第 17 步；半写对象对读者不可见 |
+| 可见性 | 读端只认 header 全字段合法且 payload CRC 匹配的 entry；单 entry 写入不被声称原子 | 见 2.3.2 第 17-18 步；半写对象对读者不可见 |
 
-> **[v2.0 变更]** 分块、对齐、长度权威三条的落点与 v1.0 相同。新增两行承重项：(1) 有序写的落点必须精确到「memory 全部成功之后、PutEnd 之前」，这是要求 1 在代码上的唯一定义；(2) 读侧因入口强制整对象读，`R` 恒等于 `object_size`，`min` 只保留为后端内部不变量，payload CRC 全量可校验。删除路径不涉及 entry 长度，只受单批 key 数与 `release_at` 约束。
+> **[v2.0 变更]** 对齐、长度权威两条的落点与 v1.0 相同。新增两行承重项：(1) 有序写的落点必须精确到「memory 全部成功之后、PutEnd 之前」，这是要求 1 在代码上的唯一定义；(2) 读侧因入口强制整对象读，payload CRC 全量可校验。取消分块后「提交点」一行被删除，单 entry 的可见性由 header/CRC fail-stop 保证。
 
 ### 2.4 SFMEA 分析
 
@@ -1862,39 +1813,39 @@ sequenceDiagram
 | 用例编号 | 故障模式 | 是否涉及 | 故障影响 | 容错措施 | 故障注入方法 | 备注 |
 | --- | --- | --- | --- | --- | --- | --- |
 | FMEA-01 | Client Init 时 ASU 视图 transports 为空 | 是 | RegisterRegions 返回 OK 但零注册，运行期全部 entry 报 BUFFER_NOT_REGISTERED（kv_client_impl.cc:337-339） | Init 校验返回的 handles 非空且不等于 kInvalidMRHandle；视图为空则退避重试，超时后 Init 失败 | 配置不存在的 view 文件启动 client，使 snapshot transports 为空 | 承重前置：必须在进入可服务状态前失败 |
-| FMEA-02 | 单 entry 超过 16,776,704B 或未 512B 对齐 | 是 | SDK 预发送阶段 abort 整个 transport task，同批所有 entryStatus 被置 CANCELED（trans_task_executor.cc:227-246） | 提交前逐 entry 预检 wire_len、offset、addr、region.size；超限在 WriteObject 前返回 ASU_OBJECT_TOO_LARGE | 单测构造 wire_len 等于 16,776,705 或 offset 等于 513 的 KVBuffer 提交 | 不能指望只失败超限的一条 |
+| FMEA-02 | 单 entry 超过 16,776,704B 或未 512B 对齐 | 是 | SDK 预发送阶段 abort 整个 transport task，同批所有 entryStatus 被置 CANCELED（trans_task_executor.cc:227-246） | 提交前逐 entry 预检 wire_len、offset==0、addr、region.size；超限在 BatchStoreObjects 前返回 ASU_OBJECT_TOO_LARGE | 单测构造 wire_len 等于 16,776,705 或 offset 等于 513 的 KVBuffer 提交 | 不能指望只失败超限的一条 |
 | FMEA-03 | buffer.region.size 大于等于 4GiB 被 static_cast 到 uint32 截断 | 是 | SDK 静默截断后按错误长度读写（sqe_request.cc:190、206、223、251） | 本层禁止任何 entry 大于等于 4GiB；kMaxObjectBytes 与 wire_len 双重断言 | FakeAsuKvClient 传入 region.size 等于 1 左移 32 的 KVBuffer | 截断发生在 SDK 内部，本层必须自己设防 |
 | FMEA-04 | buffer.handle 未注册 | 是 | 提交时不报错，Wait 时整条 entry 报 BUFFER_NOT_REGISTERED | 所有 KVBuffer 只引用 AsuStagingArena 的已注册区间；提交前断言 handle 命中注册表 | 把 KVBuffer.handle 设为随机未注册的 MRHandle | 错误暴露很晚，必须在提交前拦截 |
 | FMEA-05 | Wait 使用 `KvClientConfig::defaultWaitTimeoutMs` 的 100ms 超时 | 是 | 16MiB entry 必然超时；Wait 超时后无条件 Remove task，结果不可再取（task_manager.cc:108-116） | 显式传按字节估算的 timeout；TIMEOUT 归为不确定，隔离 slot 并走失败或 degrade | FakeAsuKvClient 延迟 200ms 返回，触发 100ms 超时（kv_types.h:215） | 默认值来自 KvClientConfig.defaultWaitTimeoutMs；`Wait` 的 timeoutMs 本身是必填参数 |
 | FMEA-06 | staging slot 在 Wait 超时后被复用 | 是 | 设备侧仍在飞的 DMA 写穿新数据 | TIMEOUT 后 Quarantine 该 slot，进程生命周期内不复用 | 超时后立即发起第二次写并让 Fake 记录同一 slot 被再次写入 | 内存安全承重项；v2.0 另加 FreeSlots 计数见 FMEA-50 |
 | FMEA-07 | 设备返回 CQE_OUT_OF_CREATE_SIZE（0x10000\|0x712） | 是 | 该 key 写失败；若未预检可能整批失败 | PrepareWriteStart 按 `AsuConfig::max_object_bytes`（env `MOONCAKE_ASU_MAX_OBJECT_BYTES`）前置拒绝，且只在 asu>0 时返回 ASU_OBJECT_TOO_LARGE；同时拒绝非法 asu 配置（asu>1、asu+nof、asu+dfs、asu 且 replica_num==0）；kMaxSliceSize 检查仍在最前；写失败只归因当前 key 并删除半成品 | FakeAsuKvClient 返回 StatusCode::CQE_OUT_OF_CREATE_SIZE；另以 asu=2、asu=1+nof=1、asu=1+dfs=1、asu=1+replica_num=0 四组调 PutStart 断言 INVALID_PARAMS | H2 的 go/nogo 项 `[v2.0 修订]` 配置白名单与 ASU_OBJECT_TOO_LARGE 的触发条件在 v2.0 收紧 |
 | FMEA-08 | 对已存在 key 再 Store 返回 CQE_KEY_ALREADY_EXISTED 0x723 | 是 | 重试或覆盖写失败 | 按 H3 实测结果选择覆盖或先 Delete 再 Store；当前设计每 epoch 新 key，正常不撞旧 key | FakeAsuKvClient 返回 StatusCode::CQE_KEY_ALREADY_EXISTED | H3 的 go/nogo 项 |
-| FMEA-09 | 视图刷新后同一 key 路由到新节点 | 是 | 旧节点数据查不到也删不掉，成为永久孤儿 | 每个 task 内的 chunk 共享同一 viewSnapshot（kv_client_impl.cc:445-463）；跨 task 时各 task 各自捕获 viewSnapshot，必须校验 view 版本或在视图变化时按 epoch 重写全部 chunk（见 H10/H22）；孤儿记 asu_orphan_suspect_total | 在 BatchStore 提交前后替换 view 文件，使同一 key 路由变化 | SDK 无迁移或双写能力；v2.0 的 memory 与 ASU 两阶段之间同样可能刷新 view，见 H22 |
+| FMEA-09 | 视图刷新后同一 key 路由到新节点 | 是 | 旧节点数据查不到也删不掉，成为永久孤儿 | 一个对象只有一条 entry，同一 task 内的 entry 共享同一 viewSnapshot（kv_client_impl.cc:445-463）；跨 task 时各 task 各自捕获 viewSnapshot，视图变化时按 epoch 重写（见 H10/H22）；孤儿记 asu_orphan_suspect_total | 在 BatchStore 提交前后替换 view 文件，使同一 key 路由变化 | SDK 无迁移或双写能力；v2.0 的 memory 与 ASU 两阶段之间同样可能刷新 view，见 H22 |
 | FMEA-10 | Master 重启且无 HA 或 oplog | 是 | 元数据全丢，ASU 条目不可枚举、不可回收 | 部署要求 ASU 集群强制 enable_ha 与 enable_oplog；无 HA/oplog 时的启动行为按 §6.3 第 4 条裁决执行（启动失败或显式告警降级） | kill -9 master 后以默认配置重启（master_config.h:559、master_config.h:128 均为 false） | 本设计已知最大运维代价 |
 | FMEA-11 | 有 oplog 但 restore 缺 AsuDescriptor 分支 | 是 | 一条 ASU key 进快照就让整次 restore 返回 INVALID_PARAMS（master_service.cpp:3388-3393、3964-3969） | 两处 restore（ConstructLegacyStandbyReplicas、RestoreFromStandbyStateCore）都加 ASU 分支并校验 object_size、推进 epoch；补快照与 oplog 往返测试 | 构造含 ASU key 的 snapshot 或 oplog 做 RestoreFromStandbySnapshot | 硬阻塞级 |
 | FMEA-12 | Remove 后立即 Put 同一逻辑 key，迟到的 DeleteAsync 命中新数据 | 是 | 新对象被误删，元数据仍 COMPLETE，读永久失败 | 每次 PutStart 新 object_epoch 得到新 key_id；删除队列只删入队时的 key_id；宽限期不小于 lease TTL | Remove 后立刻 Put 同 key，并手动提前触发 GC | 承重设计；与 FMEA-56 的并发版本区分 |
 | FMEA-13 | Upsert 走 Case B 原地覆盖但未重新分配 ASU | 是 | 同一物理 key 被改写，持租约读者读到新旧混合；请求了 ASU 却得到 allocated_asu=0，finalize 误判并整体回滚刚写成功的主层 | 强制 Case C 的判据扩展为「asu>0 或已有 ASU 或没有 COMPLETE memory」，在 Case B 判定（master_service.cpp:5999-6040）之前短路；同时把租约闸门（5986-5995）从「任何非 memory 副本」收窄为 DISK/LOCAL_DISK/DFS；新 epoch 得到新 key，旧副本入删除队列 | 先 Put 1MiB 再 Upsert 2MiB；另对 asu=0 写入的对象发起 asu=1 的 Upsert，断言返回的 descriptor 列表含 AsuDescriptor 且 epoch 变化 | 证伪者 F1 `[v2.0 修订]` 判据与租约闸门均与 v1.0 不同 |
 | FMEA-14 | 同尺寸 Upsert 且存在读租约 | 是 | file-backed 副本无法保留旧版本 | 租约闸门收窄为 DISK/LOCAL_DISK/DFS 后，ASU 不再被「非 memory」判定误挡；ASU 读走 descriptor 的 key_id 与 epoch，Case C 替换后旧 descriptor 仍指向旧物理 key，故对 ASU 安全 | 持读租约时对 asu=1 的对象发起同尺寸 Upsert，断言走 Case C 且不返回 OBJECT_HAS_LEASE | `[v2.0 修订]` v1.0 的实现是 ASU 属非 memory 被直接挡住，v2.0 改为可安全 Upsert |
-| FMEA-15 | client 写完前崩溃，留下 PROCESSING 副本 | 是 | 对象卡 processing，CheckRemovable 拒绝删除 | DiscardExpiredProcessingReplicas 过期丢弃时调用 FreeAsuReplicas，并传 not_before 等于 put_start_time 加 put_start_release_timeout_sec_；读选择器只认 COMPLETE | PutStart 后 kill -9 client，等待 processing 超时后检查 AsuDeleteQueue 是否收到条目 | `[v2.0 修订]` 11 个 Free 点全部与 FreeAsuReplicas 配对；2110 改为「捕获 descriptor 再 TearDown 再入队」 |
+| FMEA-15 | client 写完前崩溃，留下 PROCESSING 副本 | 是 | 对象卡 processing，CheckRemovable 拒绝删除 | DiscardExpiredProcessingReplicas 过期丢弃时调用 FreeAsuReplicas，并传 not_before 等于 put_start_time 加 put_start_release_timeout_sec_；读选择器只认 COMPLETE | PutStart 后 kill -9 client，等待 processing 超时后检查 AsuDeleteQueue 是否收到条目 | `[v2.3 修订]` 真实丢弃 ASU 的挂点与 FreeAsuReplicas 配对；2110 不再入队 |
 | FMEA-16 | HA finalizer 路径漏挂 FreeAsuReplicas | 是 | HA 切换后 ASU 条目永久泄漏 | 在 1753、1795、1844、1907、2110、5257、5897、6099、7080、9535、9623 全部与 FreeDfsReplicas 成对调用；其中 9531-9537 与 9611-9625 是直接 PopReplicas 路径、不经过 1753，必须字面配对；加单测守卫 | 构造 HA remove 流程，逐点检查 AsuDeleteQueue 是否收到条目 | `[v2.0 修订]` 更正 v1.0「由 1753 自动覆盖」的错误结论 |
-| FMEA-17 | 部分 chunk 写成功后失败 | 是 | 设备上残留不可达 chunk | 对已成功 chunk best-effort DeleteObject；chunk0 最后写使半成品不可读；随后按 `require_asu` 决定终态：false 走 degrade（PutEnd(MEMORY) 加 PutRevoke(ASU)），true 走严格失败（PutRevoke(ALL)、Put 返回失败并记 `asu_required_failures_total`）；主层失败时才无条件 PutRevoke(ALL) | FakeAsuKvClient 让第 2 个 chunk 返回 IO_ERROR，分别在 `require_asu=false/true` 下断言 Put 返回成功（memory COMPLETE、ASU 被 revoke）/ 返回失败（memory 与 ASU 均撤销） | `[v2.0 修订]` 终态由 `require_asu` 决定（默认分层降级、严格整体失败）；删除失败则记孤儿并告警 |
+| FMEA-17 | 单 entry 写失败（同 task 内其它对象可能成功） | 是 | 失败对象在设备上残留或不完整 | 按 entryStatus 逐 entry 映射到对象；对失败对象 best-effort `BatchRemoveObjects` 清理；随后按 `require_asu` 决定终态：false 走 degrade（PutEnd(MEMORY) 加 PutRevoke(ASU)），true 走严格失败（PutRevoke(ALL)）；task 级 CANCELED/超时使同 task 内全部对象失败 | FakeAsuKvClient 让某对象的 entry 返回 IO_ERROR，分别在 `require_asu=false/true` 下断言该对象降级/整体失败，同批其它对象不受影响 | `[v2.3 修订]` 单 entry 无 chunk 拆分，不存在「部分 chunk 成功」 |
 | FMEA-18 | 删除时 ASU 不可达 | 是 | 元数据已删、物理残留 | 指数退避重试 N 次；超限打 ERROR 并累加 master_asu_delete_dropped_total；提供 key_id 人工清理 runbook | iptables DROP 到 ASU 的链路，或 FakeAsuKvClient 连续返回 IO_ERROR | 不可枚举孤儿 |
-| FMEA-19 | payload CRC 不匹配 | 是 | 介质损坏或新旧代数据混合 | 整 chunk 读时校验 data_crc32c，返回 ASU_RECORD_CORRUPT，绝不返回错误字节 | 直接改写 ASU 上 payload 的一个字节，或用 Fake 注入篡改数据 | 对象级 checksum 默认关闭（client_object_checksum_config.cpp:14-16），chunk CRC 是常态兜底；v2.0 全对象读使该 CRC 永不跳过 |
-| FMEA-20 | header 字段与 descriptor 不一致 | 是 | 串读别的对象、旧世代或错位 chunk | 逐字段校验 key_id、key_fingerprint、object_epoch、object_size、chunk_index、chunk_count、data_offset、chunk_payload | 篡改 record header 的 chunk_index 或 epoch 后触发 ReadObject | fail-stop，不允许返回部分数据 |
-| FMEA-21 | 读请求长度小于已存长度 | 是 | 截断读无法校验被截断 chunk 的 payload CRC，且与 memory 副本的尺寸契约不一致 | 入口要求调用方 slices 总长大于等于 object_size，否则 INVALID_PARAMS；R 等于 min(slice_total, object_size) 只保留为后端内部不变量；payload CRC 永不全量跳过 | 直接调 backend 传入总长小于 object_size 的 slices，断言 INVALID_PARAMS | `[v2.0 修订]` v1.0 允许前缀读并跳过 CRC，v2.0 直接拒绝，关闭该残留风险 |
+| FMEA-19 | payload CRC 不匹配 | 是 | 介质损坏或新旧代数据混合 | 整对象 entry 读时校验 data_crc32c，返回 ASU_RECORD_CORRUPT，绝不返回错误字节 | 直接改写 ASU 上 payload 的一个字节，或用 Fake 注入篡改数据 | 对象级 checksum 默认关闭（client_object_checksum_config.cpp:14-16），payload CRC 是常态兜底；v2.0 整对象读使该 CRC 永不跳过 |
+| FMEA-20 | header 字段与 descriptor 不一致 | 是 | 串读别的对象或旧世代记录 | 逐字段校验 key_id、key_fingerprint、object_epoch、object_size、data_offset==0、data_len、data_crc32c | 篡改 record header 的 data_offset 或 epoch 后触发 BatchLoadObjects | fail-stop，不允许返回部分数据 |
+| FMEA-21 | 读请求长度小于已存长度 | 是 | 截断读无法校验被截断部分的 payload CRC，且与 memory 副本的尺寸契约不一致 | 入口要求调用方 slices 总长大于等于 object_size，否则 INVALID_PARAMS；payload CRC 永远全量校验 | 直接调 backend 传入总长小于 object_size 的 slices，断言 INVALID_PARAMS | `[v2.0 修订]` v1.0 允许前缀读并跳过 CRC，v2.0 直接拒绝，关闭该残留风险 |
 | FMEA-22 | 并发同 key 写 | 是 | 后写覆盖前写或对象卡 PROCESSING | Master 对象级锁加每写新 epoch；后到者看到 PROCESSING 走现有拒绝或抢占路径 | 两个 client 同时 Put 同一 key | 沿用既有语义，不新增并发控制；与 FMEA-56 的删除交织版本区分 |
 | FMEA-23 | 跨对象 64-bit key 碰撞 | 是 | 读到别的对象数据 | descriptor 与 record header 的 key_fingerprint 比对，不一致返回 ASU_KEY_COLLISION | Fake codec 强制两个对象产生相同 key_id 但不同 fingerprint | 写侧无 CAS，只能读侧 fail-stop |
 | FMEA-24 | 多客户端并发读同一 ASU 副本 | 是 | 读者之间互相干扰 | ASU 是全局寻址服务，读只依赖 descriptor；每客户端独立 staging arena | 两个 client 同时 Get 同一 key | 无 owner 概念 |
 | FMEA-25 | Descriptor 线格式与旧 client 混跑 | 是 | 旧 reader 无法解析 AsuDescriptor | 只追加 variant 末尾；发布顺序为先全量升级所有 reader 再在 Master 打开 enable_asu；补 old/new round-trip 测试 | 用旧版本 client 解析新 master 的 GetReplicaList 响应 | RPC 与 oplog 双线格式 |
 | FMEA-26 | ReplicateConfig 使用裸 size_t 字段 | 是 | 改变 struct_pack 类型码，滚动升级失败 | 必须用 struct_pack::compatible 追加末尾，读取用 value_or(0)；先例见 replica.h:133-139 | 对 ReplicateConfig 做 get_type_code 前后对比，模拟旧 reader 解析 | 兼容性硬约束；v2.0 的 asu_replica_num 按同一范式追加 |
-| FMEA-27 | CACHELIB 下大对象被 PutStart 拒绝 | 是 | 对象上限约 16,777,200B，多 chunk 路径几乎不可达 | `AsuConfig::max_object_bytes` 默认等于 `kMaxObjectBytes`；`PrepareWriteStart` 的 CACHELIB `kMaxSliceSize` 检查原样保留且对 ASU-only 写同样生效；本设计不宣称多 chunk 可用；已裁决不豁免（v2.1，见 §6.5），约 16MiB 为正确上限 | 默认 CACHELIB 配置下 Put 一个 20MiB 且 asu=1 的对象，断言 INVALID_PARAMS | `[v2.0 修订]` 检查位于 master_service.cpp:5111-5117，默认 16MiB 上限不变 |
+| FMEA-27 | CACHELIB 下大对象被 PutStart 拒绝 | 是 | 名义上限 16,777,200B；ASU 有效上限 16,776,192B，存在 1,008B 拒绝窗口 | `AsuConfig::max_object_bytes` 默认等于 `kMaxObjectBytes = 16,776,192`；`PrepareWriteStart` 对 `asu>0 && S > 16,776,192` 返回 `ASU_OBJECT_TOO_LARGE`，`S > 16,777,200` 由 CACHELIB 检查先返回 `INVALID_PARAMS`；已裁决不豁免（v2.1，见 §6.5） | 默认 CACHELIB 配置下 Put 16,776,191 / 16,776,192 / 16,776,193 / 16,777,200 / 20MiB 且 asu=1 的对象，断言边界结果 | `[v2.3 修订]` 精确到 16,776,192 与 1,008 B 窗口，不再写「约 16 MiB」 |
 | FMEA-28 | memory 加 ASU 对象被额外 offload 到 LOCAL_DISK | 是 | 双份写与 offload 队列压力 | PutEnd 的 offload 触发条件（master_service.cpp:5409-5412）追加 `!metadata.HasReplica(&Replica::fn_is_asu_replica)` | enable_offload 下 Put 一个同时含 memory 与 ASU 副本的对象，断言对象没有 LOCAL_DISK 副本 | `[v2.0 修订]` 从「设计意图」变为必改代码点 |
 | FMEA-29 | buffer_addr 非 512B 对齐 | 是 | 设备行为未知，可能失败或出现性能悬崖 | arena 强制 512B 对齐，提交前预检 addr 是 512 的倍数 | FakeAsuKvClient 校验传入 addr 是否 512B 对齐并断言 | SDK 只校验非零（kv_protocol.cc:185-187），不校验对齐 |
 | FMEA-30 | key_id 计算结果为全零 | 是 | SDK 本地拒绝全零 key | key_id 为 0 时置 1 | 构造 XXH64 输出为 0 的输入，或让 Fake codec 直接返回 0 | key 校验见 kv_protocol.cc:216-218 |
 | FMEA-31 | Client 与 Master 的租户解析不一致 | 是 | 自算 key 会删错或读失败 | descriptor 是 key 唯一权威，客户端绝不重算；确需 tenant 时从 resolved_tenant_id 取 | enable_multi_tenants 为 false 时用非 default tenant 发起 Put 与读 | 归一化行为见既有租户解析路径 |
 | FMEA-32 | ASU 设备侧 GC 与容量回收 | 否 | 设备容量可能不自动回收，本模块无法观测设备 GC 进度 | 本模块不控制设备 GC；用 best-effort Delete 加 asu_orphan_suspect_total 加人工 runbook | 在设备侧模拟 GC 延迟，观察 Delete 后物理空间未释放 | 不涉及：设备侧 GC 无公开 API，属 ASU 设备或 UCM SDK 边界；本模块只保证按 key 的 DeleteAsync 发出并确认，不承诺设备立即释放物理空间 |
 | FMEA-33 | Master 脑裂或双主 | 否 | 两个 Master 以不同 epoch 写同一 ns，可能产生重复条目 | 由 HA 与租约子系统负责；epoch 不同只保证不串读，不保证不产生孤儿 | 双 master 同时写同一 key 集合 | 不涉及：脑裂检测与选主属 HA 子系统；本模块只保证 epoch 参与 key 推导，不同 epoch 的记录不会互相串读，但会产生孤儿 |
-| FMEA-34 | 进程在 chunk0 提交前崩溃 | 是 | 半写对象 | chunk0 最后写；读端先校验 chunk0 header；Master 侧 PROCESSING 不可读；过期后回收 | 写完 chunk1 后 kill -9 进程，再尝试 ReadObject | 提交点设计 |
+| FMEA-34 | 进程在单 entry 写完前崩溃 | 是 | 半写对象 | 单 entry 写入不被声称原子；读端 header 全字段校验（含 data_offset==0、data_len、payload CRC）失败即 fail-stop；Master 侧 PROCESSING 不可读；过期后回收 | 写 entry 中途 kill -9 进程，再尝试 BatchLoadObjects | 可见性由 header/CRC + PROCESSING 双门控保证，不依赖 commit marker |
 | FMEA-35 | 删除宽限期小于读租约 TTL | 是 | 删掉仍被持租约读者引用的旧 key | release_at 等于 max(now, not_before) 加 max(default_kv_lease_ttl_, asu_delete_grace_ms)；被丢弃的 PROCESSING ASU 的 not_before 取 put_start_time 加 put_start_release_timeout_sec_ | 把 asu_delete_grace_ms 设为 0，并让一个读者持有租约后再删除 | `[v2.0 修订]` release_at 公式新增 not_before 维度 |
 | FMEA-36 | Client 未启用 ASU 却收到 AsuDescriptor | 是 | 写或读无法执行 | runtime 可用性判定为「Init 已就绪 且 staging arena 未全部 quarantine」，不满足返回 ASU_SERVICE_UNAVAILABLE 并打 ERROR；瞬时 slot 占满只等待，不算不可服务 | 关闭 client 的 ASU 开关但 Master 开启并下发 AsuDescriptor；或把全部 staging_slots 隔离后再读 | `[v2.0 修订]` 判定从「Init 未就绪」扩展为含 arena 永久可用性 |
 | FMEA-37 | 高并发导致 SDK 队列 RESOURCE_BUSY | 是 | 提交失败 | 按对象串行、按字节与条数限流；ASU 写路径的 RESOURCE_BUSY 在 `require_asu=false` 时归入 degrade（主层保留、ASU revoke），`require_asu=true` 时整体失败，不再无条件成功；新增 asu_write_failures_total{code} | FakeAsuKvClient 返回 StatusCode::RESOURCE_BUSY，分别在 false/true 下断言 Put 成功且 asu_degraded_total 增长 / Put 失败且 asu_required_failures_total 增长 | `[v2.0 修订]` 失败语义由 `require_asu` 决定（默认分层降级、严格整体失败）；maxInflightTasks 默认 1024（kv_types.h:214） |
@@ -1907,17 +1858,17 @@ sequenceDiagram
 | FMEA-44 | degrade 的 PutRevoke(ASU) RPC 失败 | 是 | ASU 停在 PROCESSING 至 put_start_release_timeout 默认 600s（types.h:140-141），对象不可删；若被当整体失败则与降级成功矛盾 | ASU 方向的 finalize 错误分流：不写 finalize_rpc_errors、不 return error，只记 asu_finalize_rpc_failed_total 与 WARN；由 reaper 兜底 | Fake MasterClient 让 BatchPutRevoke(ASU) 返回 RPC_FAIL，断言 Put 仍成功、ASU 最终被 reaper 回收 | 证伪者 F3 `[v2.0 新增]` |
 | FMEA-45 | ASU 写在飞时发起删除，Wait 超时后 DMA 仍飞到已入队的 key | 是 | 元数据已删而物理晚到写入，产生不可枚举孤儿 | 超时 slot Quarantine；PROCESSING ASU 的 not_before 取 put_start_time 加 put_start_release_timeout_sec_；Delete 不存在 key 按 H4 视为幂等成功 | Fake 延迟 2 倍 timeout 完成写入并触发 PutRevoke(ASU)，再推进 GC 到 due；随后 Query 该 key 检查是否复活 | 概率性保证，H16 `[v2.0 新增]` |
 | FMEA-46 | 级联删除在 memory 已删、ASU 未入队时崩溃 | 是 | 对象只剩 ASU，但可读、可重试删除 | 顺序固定为 memory 到 ASU，ASU 入队是最后一步；重试幂等 | 在 hold.TearDown() 之后、EnqueueAsuDeletes 之前 kill -9 Master，重启后重试 Remove | 要求 3 的关键收益 `[v2.0 新增]` |
-| FMEA-47 | 删 memory 时 offload 或 promotion 持有 source refcnt | 是 | buffer 被释放而 RDMA 仍在读，数据损坏或 UAF | RemoveReplicaTier 前置 `metadata.HasReplica(&Replica::fn_is_busy)` 返回 OBJECT_REPLICA_BUSY；先清 task 再 pop；force 只绕过 lease，不绕过 refcnt 与完成度 | 让 offload task 持有 source refcnt 时调用 RemoveMemoryReplica，断言返回 OBJECT_REPLICA_BUSY 且副本未被 pop | 证伪者致命项 `[v2.0 新增]` |
+| FMEA-47 | plain Remove 时 offload 或 promotion 持有 source refcnt | 是 | buffer 被释放而 RDMA 仍在读，数据损坏或 UAF | 复用既有 `RemoveObject` 的保护（`CheckRemovable` + 既有 task/promotion 清理），本设计**不修改**该路径；`BatchRemoveAsuObjects` 的 Phase 2 同样走这条既有路径 | 让 offload task 持有 source refcnt 时调用 `Client::Remove`，断言既有保护仍生效且 ASU 未被误删 | 既有路径，不因 v2.3 改变 `[v2.3 回归]` |
 | FMEA-48 | 读择优选中 PROCESSING 的 ASU 副本 | 是 | 读到半写对象或物理不存在的数据 | 双门控：Master 的 GetReadableReplicaDescriptors 只经 IsReplicaReadable（master_service.cpp:4502-4505）返回 COMPLETE；Client 的 ClassifyReplicaForRead 跳过非 COMPLETE 与非可用副本 | 构造 status 为 PROCESSING 的 AsuDescriptor 混入列表，断言选择器不选它且 NoReplicaError 返回 INVALID_REPLICA | 要求 2 与要求 1 的交叉 `[v2.0 新增]` |
-| FMEA-49 | 选中 ASU 但 BatchLoadAsync 失败或超时 | 是 | 该对象读失败；跨对象合并时可能波及无关对象 | 每对象一个 task；task 级 OK 与 PARTIAL_FAILED 都进入逐 entry 归因；只有 TIMEOUT、NOT_FOUND、NOT_INITIALIZED、CONNECTION_ERROR、IO_ERROR 才把本 task 全部 entry 置同一错误；超时 quarantine slot；不返回部分数据、不做同一次 Get 内跨副本 fallback | Fake 返回 TIMEOUT、ENTRY_KEY_NOT_FOUND 或整批 CANCELED，断言其余对象结果不受影响、不出现 unexpected(OK) | `[v2.0 新增]` |
-| FMEA-50 | staging arena 被超时永久隔离耗尽 | 是 | 该 client 之后所有 ASU 读静默失败，且无恢复路径 | 记录 quarantined 计数并暴露 FreeSlots；**全部 slot** 被 quarantine 时 Acquire 返回 ASU_SERVICE_UNAVAILABLE、IsAvailable 变假；瞬时占满时等待，`AcquireBatch` 原子预留，ReadObjectsImpl 用跨对象在飞上限防止自死锁 | 设 `staging_slots=2`，连续制造两次 Wait 超时后再发起读，断言立即失败且 `IsReady()` 为 false；另一组只占满 slot（不 quarantine）时断言读仍成功 | 替代 v1.0 的「永不复用且无恢复」`[v2.0 新增]` |
+| FMEA-49 | 选中 ASU 但 BatchLoadAsync 失败或超时 | 是 | 该对象读失败；同一 task 内其它对象可能被 task 级错误波及 | 按对象边界打包进同一 task（绝不切开单个对象）；task 级 OK 与 PARTIAL_FAILED 都进入逐 entry 归因；task 级 CANCELED/TIMEOUT 使同 task 内全部对象失败并逐对象上报；超时 quarantine slot；不返回部分数据、不做同一次 Get 内跨副本 fallback | Fake 返回 TIMEOUT、ENTRY_KEY_NOT_FOUND 或整批 CANCELED，断言 task 内对象全部失败、其它 task 对象不受影响、不出现 unexpected(OK) | `[v2.3 修订]` 同 task 多对象整批失败是明确语义 |
+| FMEA-50 | staging arena 被超时永久隔离耗尽 | 是 | 该 client 之后所有 ASU 读静默失败，且无恢复路径 | 记录 quarantined 计数并暴露 FreeSlots；**全部 slot** 被 quarantine 时 Acquire 返回 ASU_SERVICE_UNAVAILABLE、IsAvailable 变假；瞬时占满时等待，`AcquireBatch` 原子预留，跨 task 的在飞 slot 由 `PlanBatches` 上限约束 | 设 `staging_slots=2`，连续制造两次 Wait 超时后再发起读，断言立即失败且 `IsReady()` 为 false；另一组只占满 slot（不 quarantine）时断言读仍成功 | 替代 v1.0 的「永不复用且无恢复」`[v2.0 新增]` |
 | FMEA-51 | 含 ASU 的对象被额外 offload 到 LOCAL_DISK | 是 | 双份写与存储放大 | PutEnd 的 offload 触发条件排除 `HasReplica(&Replica::fn_is_asu_replica)` | enable_offload 加 asu=1 执行 Put，断言对象无 LOCAL_DISK 副本、offload 队列为空 | master_service.cpp:5409-5412 `[v2.0 新增]` |
 | FMEA-52 | KvMedia 分类漏 ASU | 是 | 订阅方看不到 disk 媒体；删除事件不 retract | KvMediaForMetadata（master_service.cpp:11151-11178）与 KvMediaForRemoval（11180-11203）加 is_asu_replica，归入 disk | 构造只含 ASU 的 metadata 调两函数，断言返回 disk 介质；删 memory 后断言媒体从 cpu 加 disk 变为 disk | `[v2.0 新增]` |
 | FMEA-53 | 批量写因 ASU 进入 replicas 触发全量 host staging 双重拷贝 | 是 | 写延迟与内存放大 | StageWriteBuffersForRemoteReplicas（client_service.cpp:3626-3647）的 all_of(CanUseLocalMemcpy) 排除 ASU descriptor | device 指针多 buffer Put 加 asu=1，断言 stager 未被调用 | `[v2.0 新增]` |
 | FMEA-54 | ASU-only、asu+nof、asu+dfs、asu>1 配置 | 是 | 要求 3 的级联方向无定义；降级终态无法用双槽表达 | PrepareWriteStart 一律返回 INVALID_PARAMS；ASU-only 由 PrepareWriteStart 的全零判定（master_service.cpp:5051-5053）拒绝 | 分别构造四种非法配置调用 PutStart，断言不产生任何副本与元数据 | 范围纪律 `[v2.0 新增]` |
 | FMEA-55 | Master 重启且无 HA，已入队 ASU 删除丢失 | 是 | ASU 上留下不可枚举孤儿 | 文档化运维代价加 asu_orphan_suspect_total；要求 ASU 集群强制 HA 或 oplog（open issue） | kill -9 Master 后以默认配置重启，检查 AsuDeleteQueue 是否为空且物理 key 仍在 | 与 FMEA-10 同源 `[v2.0 新增]` |
 | FMEA-56 | 同 key 并发 Put 的不同 epoch 与并发 delete 交织 | 是 | 迟到的 DeleteAsync 命中新世代，或读租约仍在而物理已被删 | 每次 PutStart 新 object_epoch 派生新 key_id；PROCESSING 副本让 CheckRemovable 的 AllReplicas(fn_is_completed)（master_service.cpp:7248）拒绝删除；删除侧 not_before 加 release_at；Delete 幂等 | 两个 client 并发 Put 同 key，第三个线程同时 Remove，循环 1000 次后断言最新 epoch 对象可读、旧 key 最终被删、无对象卡 PROCESSING | 与 FMEA-12 的区别是并发窗口而非顺序重放 `[v2.0 新增]` |
-| FMEA-57 | 删 memory 误连带删 ASU | 是 | 对象失去唯一可读副本，虽元数据仍在但读永久失败 | RemoveReplicaTier 以 `fn_is_memory_replica` 谓词调用 `EraseReplicasWithCacheTotalAccounting`；1753 的 `FreeAsuReplicas` 因只对 `is_asu_replica` 入队，对该谓词恒为 no-op（不是「未调用」）。单测注入 ASU 副本后调 RemoveMemoryReplica，断言入队数为 0；并加 grep/静态守卫禁止把 1753 的入参改成 GetAllReplicas | 对象有 memory 加 ASU 时调 RemoveMemoryReplica，断言 AsuDeleteQueue.Size() 为 0、GetReplicaList 仍含 COMPLETE ASU、Get 仍成功 | 要求 3 的方向性守卫 `[v2.0 新增]` |
+| FMEA-57 | 删 ASU 时未先删 memory，或删 memory 误删 ASU | 是 | 方向颠倒导致 memory 可读但 ASU 已删，或反之 | `BatchRemoveAsuObjects` 固定「捕获 descriptor → 既有 Remove → 入队」；plain Remove/EraseMetadata 不触达 ASU；HA finalize 由 `enqueue_asu_deletes` 标志区分 | 对象有 memory+ASU 时分别调 `Client::Remove`（断言不入队、ASU 可读）与 `BatchRemoveAsuObjects`（断言捕获后入队、memory 先消失） | 要求 3 的方向性守卫 `[v2.3 修订]` |
 | FMEA-58 | `require_asu` 只接到部分 finalize 入口 | 是 | 同一进程内 Put 严格、BatchPut/BatchUpsert 却降级（或反之），ASU 实际失败却被判成功，调用方以为已持久化 | `DetermineFinalizeDecision` 增加必填 `bool require_asu`（无默认值，编译即改三处既有调用点 `client_service.cpp:2184`、`2391`、`3340`，以及 `FinalizeBatchUpsert` 的新调用点，见 §3.10 差异片段 1（约 4952 行，`DetermineFinalizeDecision` 签名）与差异片段 4（约 5146 行，`FinalizeBatchUpsert` 降级））；Client 由 `AsuRequired()` 暴露，finalize 热路径不重复读 env | 设 `require_asu=true`，分别用 Put / Upsert / BatchPut / BatchUpsert 触发同一 ASU 失败，断言四个入口都失败且 `asu_required_failures_total` 各加 1 | v2.1 新增 |
 | FMEA-59 | 严格模式 ASU 失败后 memory 与 ASU 未完全回收 | 是 | 对象残留 COMPLETE memory 或永久 PROCESSING ASU，调用方已收到失败，后续 Remove 被 `CheckRemovable` 拒绝 | 严格分支只产出 `{null, ALL, false}`，复用 `PutRevoke(ALL)`/`BatchUpsertRevoke`；依赖裁决 #5 把 PutRevoke 的 `processing_rep`（5620-5627）与 `target_pred`（5635-5643）的 ALL 谓词补 `is_asu_replica`；memory 段记账由 `EraseReplicasWithCacheTotalAccounting`（1731-1754）回收，ASU 物理删除由 `FreeAsuReplicas` + `AsuDeleteQueue` 兜底 | `require_asu=true` 且 ASU 返回 IO_ERROR 后查 `GetReplicaList` 为 OBJECT_NOT_FOUND、`AsuDeleteQueue` 最终清空、无 PROCESSING 残留 | v2.1 新增 |
 | FMEA-60 | 严格模式的 finalize RPC 错误被 ASU 方向豁免吞掉 | 是 | `PutRevoke(ALL)` 的 RPC 失败未被记入 `finalize_rpc_errors`，对象可能残留 COMPLETE memory 与 PROCESSING ASU 且 `failure_context` 缺失，排障只能靠推断 | ASU 方向 `ignore_errors` 的判据必须是「副本类型 == ASU」而不是「写模式 == TIERED」；严格模式只产出 revoke ALL，不进 ASU 组；`add_finalize_action` 按 `revoke_type` 决定分组 | 严格模式下让 Fake MasterClient 的 `BatchPutRevoke(ALL)` 返回 RPC_FAIL，断言该 op 仍被判失败、`finalize_rpc_errors` 被置位且 `SetTerminalError` 生效 | v2.1 新增 |
@@ -1936,7 +1887,7 @@ v2.0 下风险最高的是四类故障。第一类是写侧终态一致性，FME
 
 覆盖缺口有三处，其中一处是 v2.0 新引入的。其一，物理存在性仍无权威来源：SDK 没有 Stat 或取长度 API，QueryResult 只有 exists 位图，IsExist 与 Query 只回答元数据可见性；ASU 上的 entry 丢失时 Master 仍返回可读描述，只能在读失败时暴露。其二，删除仍是 best-effort：ASU 不可达时最终丢弃条目并计数，孤儿没有自动回收通道，且默认无 HA 时重启即丢失队列。其三，`require_asu=false`（默认）时 ASU 写失败的 degrade 在公开 API 上仍不可感知，只体现为 metric 与 WARN；这是用户显式选择的降级语义，不再是未决缺口。需要感知的部署应设 `require_asu=true`，此时 ASU 失败直接使 Put 失败并通过既有错误码返回 `first_asu_error`（v2.1）。
 
-被范围纪律有意排除的缺口有三项：FMEA-32 的设备侧 GC 与容量回收没有公开 API，属于 ASU 设备或 UCM SDK 边界；FMEA-33 的脑裂检测与选主属于 HA 子系统，本模块只用 epoch 保证不串读；FMEA-54 的 ASU-only、asu+nof、asu+dfs、asu>1 组合被 PrepareWriteStart 直接拒绝，因为要求 3 的级联方向与降级双槽表达在这些组合下无定义。v1.0 记录的「前缀读截断无法校验 payload CRC」缺口已由 v2.0 关闭（FMEA-21 改为入口拒绝小于 object_size 的请求），不再列为残留风险。FMEA-14、FMEA-22、FMEA-27 属于既有路径或既有约束，本设计不重复实现；其中 FMEA-27 的 CACHELIB 切片上限会让多 chunk 路径在默认部署下几乎不可达；已裁决不豁免（v2.1，见 §6.5），约 16MiB 为正确上限。
+被范围纪律有意排除的缺口有三项：FMEA-32 的设备侧 GC 与容量回收没有公开 API，属于 ASU 设备或 UCM SDK 边界；FMEA-33 的脑裂检测与选主属于 HA 子系统，本模块只用 epoch 保证不串读；FMEA-54 的 ASU-only、asu+nof、asu+dfs、asu>1 组合被 PrepareWriteStart 直接拒绝，因为要求 3 的级联方向与降级双槽表达在这些组合下无定义。v1.0 记录的「前缀读截断无法校验 payload CRC」缺口已由 v2.0 关闭（FMEA-21 改为入口拒绝小于 object_size 的请求），不再列为残留风险。FMEA-14、FMEA-22、FMEA-27 属于既有路径或既有约束，本设计不重复实现；其中 FMEA-27 的 CACHELIB 名义上限是 16,777,200 B，ASU 有效对象上限是 16,776,192 B，二者相差 1,008 B，该窗口由 `PrepareWriteStart` 显式拒绝（已裁决不豁免，v2.1，见 §6.5）。
 
 ### 2.5 可定位设计
 
@@ -1962,9 +1913,8 @@ sequenceDiagram
     C->>N: TransferWrite 全部主层副本
     N-->>C: 逐副本成功或失败
     alt 主层全部成功
-        C->>A: SubmitAsuWrites 调 WriteObject
-        A->>K: BatchStoreAsync chunk 1 到 N-1
-        A->>K: BatchStoreAsync chunk0 提交点
+        C->>A: SubmitAsuWrites 调 BatchStoreObjects
+        A->>K: BatchStoreAsync 整个 task（可含多个对象，每对象一条 entry）
         K->>D: SQE 与 CQE
         A-->>C: ASU 成功或失败
     else 主层失败
@@ -1987,13 +1937,13 @@ flowchart TD
     S --> R5[档 5 ASU 需 asu_available 为真]
     S --> R6[档 6 DFS]
     S --> R7[档 7 DISK]
-    R5 --> B[ReadObjects 每对象一个 BatchLoadAsync]
+    R5 --> B[BatchLoadObjects 跨对象合批]
     B --> V[DecodeAndValidate 校验 header 与 payload CRC]
 ```
 
 ```mermaid
 flowchart LR
-    DM[RemoveMemoryReplica] --> P1[只 pop fn_is_memory_replica]
+    DM[Client::Remove / BatchRemove] --> P1[只删元数据与 memory buffer 不触达 ASU]
     P1 --> K1[对象保留 ASU 仍 COMPLETE 仍可读]
     DA[Remove 整对象 即删 ASU] --> C1[CheckRemovable 要求全部 COMPLETE]
     C1 --> C2[EraseMetadata 先捕获 AsuDescriptor]
@@ -2007,9 +1957,9 @@ flowchart LR
 
 所有 ASU 日志统一使用 `key=value` 格式，首个字段为 `action`，其余字段顺序固定，便于 grep 与结构化采集。示例：
 
-`action=asu_write_commit trace_id=... tenant=... user_key=... key_id=0x... epoch=... replica_id=... object_size=... chunk_index=... chunk_count=... phase=commit`
+`action=asu_write_commit trace_id=... tenant=... user_key=... key_id=0x... epoch=... replica_id=... object_size=... batch_entries=... phase=commit`
 
-其中 key_id 一律以 0x 前缀的 16 位十六进制打印；chunk_index 与 chunk_count 在非 chunk 级埋点打印为 -1，缺省字段打 `-1`。各埋点使用的 `action` 名称按下方埋点表顺序固定，v2.0 新增的 action 用粗体标出：`asu_init_client`、`asu_init_register`、`asu_init_master`、**`asu_master_probe`**、`asu_allocated`、**`asu_write_start_validate`**、**`asu_finalize_decision`**、`asu_req_begin`、`asu_chunk_encode`、`asu_write_commit`、`asu_chunk_wait`、`asu_write_cleanup`、`asu_write_end`、**`asu_finalize_rpc_failed`**、**`asu_read_select`**、**`asu_read_batch_begin`**、**`asu_read_entry`**、`asu_read_wait`、`asu_header_check`、`asu_read_end`、**`asu_read_undersized`**、`asu_query`、**`remove_memory_tier`**、**`asu_delete_capture`**、`asu_delete_enqueue`、`asu_delete_submit`、`asu_delete_wait`、`asu_delete_retry`、`asu_delete_drop`、`asu_restore`。
+其中 key_id 一律以 0x 前缀的 16 位十六进制打印；缺省字段打 `-1`。各埋点使用的 `action` 名称按下方埋点表顺序固定，v2.0 新增的 action 用粗体标出：`asu_init_client`、`asu_init_register`、`asu_init_master`、**`asu_master_probe`**、`asu_allocated`、**`asu_write_start_validate`**、**`asu_finalize_decision`**、`asu_req_begin`、`asu_entry_encode`、`asu_write_commit`、`asu_batch_wait`、`asu_write_cleanup`、`asu_write_end`、**`asu_finalize_rpc_failed`**、**`asu_read_select`**、**`asu_read_batch_begin`**、**`asu_read_entry`**、`asu_read_wait`、`asu_header_check`、`asu_read_end`、**`asu_read_undersized`**、`asu_query`、**`asu_delete_capture`**、`asu_delete_enqueue`、`asu_delete_submit`、`asu_delete_wait`、`asu_delete_retry`、`asu_delete_drop`、`asu_restore`。
 
 | 埋点位置（文件:函数） | 日志级别 | 打印字段 | 覆盖的阶段 |
 | --- | --- | --- | --- |
@@ -2017,43 +1967,41 @@ flowchart LR
 | mooncake-store/src/asu/asu_kv_adapter.cpp: AsuKvClientAdapter::Init 与 Register（新增） | VLOG(1)/WARNING | retry_count、view_empty、regions、bytes、handles、kInvalidMRHandle 命中数 | init 与内存注册 |
 | mooncake-store/src/asu/asu_master_runtime.cpp: AsuMasterRuntime::Create（新增） | INFO/ERROR | master_delete、probe_key、probe_exists、delete_client_ready、gc_started | Master init |
 | mooncake-store/src/master_service.cpp: PrepareWriteStart 的 ASU 校验（新增，紧邻 5111-5117） | VLOG(1)/ERROR | key、tenant、asu、nof、dfs、replica_num、check_name、result | 写前校验 |
-| mooncake-store/src/master_service.cpp: AllocateReplicas 的 ASU 分支（新增，return 之前） | VLOG(1) | tenant、user_key、key_id、key_fingerprint、epoch、object_size、chunk_count、allocated_asu、replica_index | Master 分配 |
+| mooncake-store/src/master_service.cpp: AllocateReplicas 的 ASU 分支（新增，return 之前） | VLOG(1) | tenant、user_key、key_id、key_fingerprint、epoch、object_size、allocated_asu、replica_index | Master 分配 |
 | mooncake-store/src/client_service.cpp: SubmitAsuWrites 门禁（新增） | VLOG(1)/WARNING | key、write_mode、allocated_asu、non_dfs_ok、stage、reason、trace_id | 第二阶段门禁 |
 | mooncake-store/src/client_service.cpp: DetermineFinalizeDecision 的 TIERED 分支（新增，旁挂 378-431） | VLOG(1) | key、require_asu、primary_ok、asu_ok、allocated_asu、successful_asu、failed_asu、first_asu_error、end_type、revoke_type、asu_status（OK/DEGRADED/STRICT_FAILED/SKIPPED_PRIMARY_FAILED/ABSENT） | finalize 决策 |
 | mooncake-store/src/asu/asu_config.cpp: AsuConfig::FromEnvironment（新增；v2.1 增加 require_asu 与 semantic 日志，见 §3.12） | INFO | require_asu、semantic（degrade 或 strict）、enable、client_config_path | 启动期配置快照 |
 | mooncake-store/src/client_service.cpp: Client::Put 与 Upsert 的终态（改动，2183-2206、2391-2410） | INFO/WARNING | key、revoke_type、asu_error、metric、elapsed | 单对象终态 |
-| mooncake-store/src/asu/asu_storage_backend.cpp: WriteObject 入口（新增） | VLOG(1) | trace_id、tenant、user_key、key_id、epoch、replica_id、object_size、chunk_count、write_mode | 写开始 |
-| mooncake-store/src/asu/asu_record.cpp: AsuRecordCodec::Encode（新增） | VLOG(2) | chunk_index、data_len、wire_len、data_offset、data_crc32c、header_crc32c | 每 chunk 编码 |
-| mooncake-store/src/asu/asu_storage_backend.cpp: WriteObject 每 chunk 提交（新增） | VLOG(1) | task_id、chunk_index、offset、wire_len、key_id | 每 chunk 提交 |
-| mooncake-store/src/asu/asu_storage_backend.cpp: WriteObject Wait（新增） | VLOG(1)/ERROR | task_id、chunk_index、entry_status、timeout_ms、elapsed、slot_id | 等待完成 |
-| mooncake-store/src/asu/asu_storage_backend.cpp: chunk0 提交（新增） | INFO/ERROR | key_id、epoch、task_id、entry_status | 提交点 |
-| mooncake-store/src/asu/asu_storage_backend.cpp: WriteObject 失败清理（新增） | WARNING/ERROR | key_id、epoch、failed_chunk、delete_attempted、delete_result | 半成品清理 |
-| mooncake-store/src/asu/asu_storage_backend.cpp: WriteObject 返回（新增） | INFO/ERROR | result、bytes、chunks、first_error、asu_status、elapsed | 写结束 |
+| mooncake-store/src/asu/asu_storage_backend.cpp: BatchStoreObjects 入口（新增） | VLOG(1) | trace_id、tenant、user_key、key_id、epoch、replica_id、object_size、batch_entries、write_mode | 写开始 |
+| mooncake-store/src/asu/asu_record.cpp: AsuRecordCodec::Encode（新增） | VLOG(2) | data_len、wire_len、data_offset、data_crc32c、header_crc32c | 每 entry 编码 |
+| mooncake-store/src/asu/asu_storage_backend.cpp: BatchStoreObjects 每 task 提交（新增） | VLOG(1) | task_id、entry_index、offset、wire_len、key_id | 每 task 提交 |
+| mooncake-store/src/asu/asu_storage_backend.cpp: BatchStoreObjects Wait（新增） | VLOG(1)/ERROR | task_id、entry_index、entry_status、timeout_ms、elapsed、slot_id | 等待完成 |
+| mooncake-store/src/asu/asu_storage_backend.cpp: BatchStoreObjects 返回（新增） | INFO/ERROR | result、bytes、entries、first_error、asu_status、elapsed | 写结束 |
 | mooncake-store/include/replica_selection.h: ClassifyReplicaForRead 与 SelectBestReplica（新增/改动，133-194） | VLOG(1) | candidate_count、每个候选的 replica_type、status、is_local、rank、affinity_tier、score、chosen_rank、chosen_index | 择优决策 |
 | mooncake-store/src/client_service.cpp: ReadReplicaSelector::operator()（改动，675-700） | VLOG(1)/WARNING | key、policy_as_available、replicas_size、path（first 或 best）、selected_type、selected_rank、error | Client 读选择 |
 | mooncake-store/src/client_service.cpp: Client::Get 的 ReadAsuReplica 分派（新增，1599-1603） | VLOG(1)/ERROR | key、rank、object_size、slices_bytes、runtime_ready、arena_free_slots | 单对象读入口 |
-| mooncake-store/src/asu/asu_storage_backend.cpp: ReadObjects 入口（新增） | VLOG(1) | trace_id、request_count、每对象的 key_id 与 epoch、object_size、chunk_count、requested_bytes | 批量读开始 |
-| mooncake-store/src/asu/asu_storage_backend.cpp: ReadObjects 提交与 Wait（新增） | VLOG(1)/ERROR | task_id、entry_index、chunk_index、offset、read_len、entry_status、timeout_ms、elapsed | 每 task 与每 chunk 读传输 |
-| mooncake-store/src/asu/asu_storage_backend.cpp: ReadObjects 返回（新增） | INFO/ERROR | result、outcome_count、bytes、chunks、first_error、quarantined_slots、elapsed | 批量读结束 |
+| mooncake-store/src/asu/asu_storage_backend.cpp: BatchLoadObjects 入口（新增） | VLOG(1) | trace_id、request_count、每对象的 key_id 与 epoch、object_size、requested_bytes | 批量读开始 |
+| mooncake-store/src/asu/asu_storage_backend.cpp: BatchLoadObjects 提交与 Wait（新增） | VLOG(1)/ERROR | task_id、entry_index、offset、read_len、entry_status、timeout_ms、elapsed | 每 task 与每 entry 读传输 |
+| mooncake-store/src/asu/asu_storage_backend.cpp: BatchLoadObjects 返回（新增） | INFO/ERROR | result、outcome_count、bytes、first_error、quarantined_slots、elapsed | 批量读结束 |
 | mooncake-store/src/asu/asu_record.cpp: AsuRecordCodec::DecodeAndValidate（新增） | VLOG(2)/ERROR | 每字段 expected 与 actual、header_hex、payload_crc_result | 读校验 |
 | mooncake-store/src/real_client.cpp: 四个全对象选择点（改动，4036、4425、6776、8440） | VLOG(1) | key、asu_available、selected_type、selected_rank、candidate_count | RealClient 选择 |
-| mooncake-store/src/asu/asu_storage_backend.cpp: QueryObject 与 DeleteObject（新增） | VLOG(1)/ERROR | key_ids、task_id、exists 位图、entry_status、rawResult | 物理查与删 |
-| mooncake-store/src/master_service.cpp: RemoveReplicaTier（新增） | INFO/WARNING | key、tenant、replica_type、memory_count、asu_count、busy_count、media_before、media_after、result | 只删 memory |
-| mooncake-store/src/master_service.cpp: EraseMetadata 三段（改动，2054-2116） | VLOG(1)/INFO | key、captured_asu、teardown_done、enqueue_count、order | 整对象级联删除 |
+| mooncake-store/src/asu/asu_storage_backend.cpp: BatchIsExist 与 BatchRemoveObjects（新增） | VLOG(1)/ERROR | key_ids、task_id、exists 位图、entry_status、rawResult | 物理查与删 |
+| mooncake-store/src/master_service.cpp: BatchRemoveAsuObjects（新增） | INFO/WARNING | key、tenant、captured_asu、remove_result、enqueue_count、result | 删 ASU：捕获→Remove→入队 |
+| mooncake-store/src/master_service.cpp: EraseMetadata（改动，2054-2116） | VLOG(1)/INFO | key、teardown_done、asu_enqueued（恒 false） | plain Remove 不触达 ASU |
 | mooncake-store/src/master_service.cpp: FreeAsuReplicas（新增，旁挂 7583-7591） | VLOG(1)/WARNING | key_id、epoch、user_key、release_at、not_before、site、count | Master 回收入队 |
 | mooncake-store/src/asu/asu_delete_queue.cpp: AsuDeleteQueue::Enqueue（新增） | VLOG(1) | key_id、epoch、user_key、release_at、not_before、reason、site | 删除入队 |
 | mooncake-store/src/asu/asu_delete_queue.cpp: AsuGcWorker::Loop（新增） | VLOG(1)/ERROR | drain_count、pending、free_slots、task_id、entry_status、rawResult、attempt、next_at | 延迟删除与 GC |
 | mooncake-store/src/master_service.cpp: 两处 restore 的 ASU 分支（新增，旁挂 3382-3394 与 3958-3969） | VLOG(1)/ERROR | tenant、user_key、key_id、epoch、object_size、status | HA 恢复 |
 
-日志级别约定：INFO 只打阶段边界（init 成功、写提交点、写读结束、最终 finalize 决策、删除入队与 GC 结果），默认开启；VLOG(1) 打生命周期事件、择优决策与每次传输提交，默认关闭；VLOG(2) 打每 chunk 的字段级细节，仅在排障时对指定模块打开；WARNING 打降级路径（asu_degraded、master_delete 关闭、视图为空但继续、slot 隔离、删除重试）；ERROR 打不可恢复失败与 fail-stop 校验失败。
+日志级别约定：INFO 只打阶段边界（init 成功、写提交点、写读结束、最终 finalize 决策、删除入队与 GC 结果），默认开启；VLOG(1) 打生命周期事件、择优决策与每次传输提交，默认关闭；VLOG(2) 打每 entry 的字段级细节，仅在排障时对指定模块打开；WARNING 打降级路径（asu_degraded、master_delete 关闭、视图为空但继续、slot 隔离、删除重试）；ERROR 打不可恢复失败与 fail-stop 校验失败。
 
-> **[v2.0 变更]** 新增 `asu_read_select` 这一行是要求 2 的可定位核心：它必须同时打出全部候选的 rank、affinity 与 score 以及最终选中项，否则线上无法回答「为什么这次读走了 ASU 而不是 memory」。新增 `asu_finalize_decision` 与指标 `asu_write_skipped_total` 是要求 1 的可定位核心，新增 `asu_delete_capture` 与 `remove_memory_tier` 是要求 3 的可定位核心；`asu_master_probe`、`asu_read_undersized`、`asu_finalize_rpc_failed` 对应 §3.6/§3.10/§3.11 代码中实际出现的日志。
+> **[v2.0 变更]** 新增 `asu_read_select` 这一行是要求 2 的可定位核心：它必须同时打出全部候选的 rank、affinity 与 score 以及最终选中项，否则线上无法回答「为什么这次读走了 ASU 而不是 memory」。新增 `asu_finalize_decision` 与指标 `asu_write_skipped_total` 是要求 1 的可定位核心，新增 `asu_delete_capture` 是要求 3 的可定位核心；`asu_master_probe`、`asu_read_undersized`、`asu_finalize_rpc_failed` 对应 §3.6/§3.10/§3.11 代码中实际出现的日志。v2.3 删除 `remove_memory_tier`、`asu_chunk_encode`/`asu_chunk_wait` 与所有 chunk 字段。
 
 #### 2.5.2 trace-id 与跨进程关联
 
 > **[v2.0 变更]** trace 元组从 v1.0 的六字段扩展为十字段，并补充读路径的 task_id 与 entry_index、删除路径的 release_at 与 attempt。
 
-**十字段 trace 元组**为：`trace_id`、`user_key`、`key_id`、`object_epoch`、`chunk_index`、`op`、`phase`、`write_mode`、`asu_status`、`replica_rank`。其中 `phase` 取值为 `PRIMARY_WRITE`、`ASU_WRITE`、`FINALIZE`、`READ_SELECT`、`READ_ASU`、`REMOVE_MEMORY`、`REMOVE_ASU`；`write_mode` 取值为 `SINGLE`、`FLEXIBLE`、`RELIABLE`、`TIERED`；`asu_status` 取值为 `OK`、`DEGRADED`、`STRICT_FAILED`、`SKIPPED_PRIMARY_FAILED`、`ABSENT`；其中 `STRICT_FAILED` 表示 ASU 阶段已尝试写、但 `require_asu=true` 使整体失败，仅由 `DetermineFinalizeDecision` 的严格分支产生；`replica_rank` 取值为 0 至 7。读路径另带 `task_id` 与 `entry_index`，删除路径另带 `release_at` 与 `attempt`。这四组新增字段让「顺序、选择、方向」三条要求都能从单条日志还原。
+**十字段 trace 元组**为：`trace_id`、`user_key`、`key_id`、`object_epoch`、`entry_index`、`op`、`phase`、`write_mode`、`asu_status`、`replica_rank`。其中 `phase` 取值为 `PRIMARY_WRITE`、`ASU_WRITE`、`FINALIZE`、`READ_SELECT`、`READ_ASU`、`REMOVE_MEMORY`、`REMOVE_ASU`；`write_mode` 取值为 `SINGLE`、`FLEXIBLE`、`RELIABLE`、`TIERED`；`asu_status` 取值为 `OK`、`DEGRADED`、`STRICT_FAILED`、`SKIPPED_PRIMARY_FAILED`、`ABSENT`；其中 `STRICT_FAILED` 表示 ASU 阶段已尝试写、但 `require_asu=true` 使整体失败，仅由 `DetermineFinalizeDecision` 的严格分支产生；`replica_rank` 取值为 0 至 7。读路径另带 `task_id` 与 `entry_index`，删除路径另带 `release_at` 与 `attempt`。这四组新增字段让「顺序、选择、方向」三条要求都能从单条日志还原。
 
 Client 在每个请求入口生成一个 uint64 的 trace_id，取值由进程内递增计数器生成，只保证同一进程内单调；跨重启可能重复（`steady_clock` 重启后归零），因此跨会话关联必须依赖下面的跨进程键而非 trace_id。trace_id 只存在于 Client 进程：它贯穿 RealClient、Client、AsuStorageBackend、AsuStagingArena、AsuKvClientAdapter 到 KvClient 返回的每一行日志。
 
@@ -2061,13 +2009,13 @@ Client 在每个请求入口生成一个 uint64 的 trace_id，取值由进程�
 
 v2.0 新增的四个字段分两类。`phase` 与 `write_mode` 是 Client 侧派生字段：`write_mode` 由 ReplicateConfig 经 DetermineReplicaWriteMode（replica.h:291-302）得出，Master 侧只要知道 asu_replica_num 就能复算；`asu_status` 是 Client 在 finalize 时判定的终态，Master 侧对应的事实是「PutEnd 用了哪个 replica_type、PutRevoke 用了哪个 replica_type」。因此跨进程对齐规则是：Client 的 `asu_status=OK` 必然对应 Master 见到 PutEnd(ALL)；`DEGRADED` 必然对应 PutEnd(MEMORY) 加 PutRevoke(ASU)；`STRICT_FAILED` 必然对应 PutRevoke(ALL) 且此前确有 ASU 写请求；`SKIPPED_PRIMARY_FAILED` 必然对应从未收到任何 ASU 写请求且随后 PutRevoke(ALL)。`replica_rank` 只在 Client 侧有意义，Master 不参与选择。
 
-KvClient 的 TaskId 是进程内句柄，只在 Client 侧有效。设计上要求每次 BatchStore 或 BatchLoad 提交后立即把 task_id 与该 task 覆盖的 entry 列表（entry_index、chunk_index、offset、read_len 或 wire_len 四元组）以 VLOG(1) 打在一行里，Wait 返回后复用同一 task_id 打结果。这样即使 SDK 内部切了子批，也能按 task_id 把「提交了哪些 entry」与「哪些 entry 失败了」对上；v2.0 因为默认每对象一个 task，task_id 与 user_key 之间还多了一层天然的一对一关系，使跨对象批量读的归因不必依赖下标推断。
+KvClient 的 TaskId 是进程内句柄，只在 Client 侧有效。设计上要求每次 `BatchStore` 或 `BatchLoad` 提交后立即把 task_id 与该 task 覆盖的 entry 列表（entry_index、offset、read_len 或 wire_len 三元组）以 VLOG(1) 打在一行里，Wait 返回后复用同一 task_id 打结果。这样即使 SDK 内部切了子批，也能按 task_id 把「提交了哪些 entry」与「哪些 entry 失败了」对上；v2.3 因为一个对象只对应一条 entry，task 内的 entry_index 与 user_key 之间是稳定的一对一映射，使跨对象批量读的归因不必依赖下标推断。
 
 设备侧没有应用层回调上下文，跨到设备后的锚点是 record header 里的 replica_id 与 object_epoch。任何从设备读到的 header 都能反查回 Master 日志中的同一次分配；反过来，Master 日志中的 key_id 与 epoch 可以直接喂给离线诊断工具去设备上定位记录。删除路径同理：GC 日志打 key_id、epoch、release_at 与 attempt，与当初 Put 日志的同名字段直接对齐，且 attempt 让「第一次就删掉」与「重试 N 次后丢掉」在单行日志里可区分。
 
 #### 2.5.3 日志量控制
 
-按 chunk 打印的日志数量与对象大小成正比，默认必须关闭。控制手段有四层：一是级别隔离，每 chunk 细节只走 VLOG(2)，生命周期只走 VLOG(1)，默认只开 INFO 及以上；二是动态调级，沿用 glog 的 `--v` 与 `--vmodule`，可只对 asu_storage_backend 与 asu_record 两个源文件临时开到 2，不必全进程放大；三是按 key 过滤，调试开关接受一个 key_id 或 user_key 前缀过滤串，命中才输出 VLOG，未命中直接返回，避免热点对象刷屏；四是采样，Wait 超时、删除重试与 `asu_read_select`（每次读都会打）这类可能高频的事件按「首次必打、之后每 N 次打一次」采样，同时靠计数器保留总量。`asu_write_skipped` 与 `asu_finalize_decision` 是低频决策点，不做采样。上述过滤与采样只影响日志，不影响任何功能路径与错误返回。
+按 entry 打印的日志数量与批大小成正比，默认必须关闭。控制手段有四层：一是级别隔离，每 entry 细节只走 VLOG(2)，生命周期只走 VLOG(1)，默认只开 INFO 及以上；二是动态调级，沿用 glog 的 `--v` 与 `--vmodule`，可只对 asu_storage_backend 与 asu_record 两个源文件临时开到 2，不必全进程放大；三是按 key 过滤，调试开关接受一个 key_id 或 user_key 前缀过滤串，命中才输出 VLOG，未命中直接返回，避免热点对象刷屏；四是采样，Wait 超时、删除重试与 `asu_read_select`（每次读都会打）这类可能高频的事件按「首次必打、之后每 N 次打一次」采样，同时靠计数器保留总量。`asu_write_skipped` 与 `asu_finalize_decision` 是低频决策点，不做采样。上述过滤与采样只影响日志，不影响任何功能路径与错误返回。
 
 #### 2.5.4 计数器与指标
 
@@ -2089,9 +2037,9 @@ KvClient 的 TaskId 是进程内句柄，只在 Client 侧有效。设计上要�
 | asu_alloc_missing_total | counter | 请求了 ASU 但 Master 未分配的次数 | 无 |
 | asu_get_total | counter | 对象级 ASU 读尝试数 | result |
 | asu_get_bytes_total | counter | 成功读出的逻辑字节数 | 无 |
-| asu_read_objects_total | counter | ReadObjects 处理的对象数 | result |
-| asu_read_batch_tasks_total | counter | 提交的 BatchLoadAsync task 数 | chunk_count 分桶 |
-| asu_read_latency_us | histogram | ASU 读阶段耗时 | chunk_count 分桶 |
+| asu_read_objects_total | counter | BatchLoadObjects 处理的对象数 | result |
+| asu_read_batch_tasks_total | counter | 提交的 BatchLoadAsync task 数 | batch_entries 分桶 |
+| asu_read_latency_us | histogram | ASU 读阶段耗时 | batch_entries 分桶 |
 | asu_slot_exhausted_total | counter | 全部 staging slot 被 quarantine 导致不可服务的次数 | 无 |
 | asu_wait_timeout_total | counter | Wait 超时次数 | phase |
 | asu_canceled_batch_total | counter | 预发送失败导致整批 CANCELED 的次数 | phase |
@@ -2105,8 +2053,8 @@ KvClient 的 TaskId 是进程内句柄，只在 Client 侧有效。设计上要�
 | asu_orphan_suspect_total | counter | 疑似孤儿条目数 | reason |
 | asu_descriptor_restore_total | counter | restore 重建的 ASU 描述符数 | 无 |
 | asu_descriptor_restore_fail | counter | restore 重建失败数 | error |
-| asu_write_wait_seconds | histogram | 单批写 Wait 耗时 | chunk_count 分桶 |
-| asu_read_wait_seconds | histogram | 单批读 Wait 耗时 | chunk_count 分桶 |
+| asu_write_wait_seconds | histogram | 单批写 Wait 耗时 | batch_entries 分桶 |
+| asu_read_wait_seconds | histogram | 单批读 Wait 耗时 | batch_entries 分桶 |
 | asu_delete_wait_seconds | histogram | 单批删除 Wait 耗时 | 无 |
 
 排查时先看三条主线的入口计数：写侧看 `asu_write_skipped_total` 与 `asu_put_total` 之和是否等于带 asu 配置的 Put 次数，不等说明门禁接线错误（要求 1）；`asu_degraded_total` 与 `asu_required_failures_total` 是 `asu_put_total{result!=OK}` 的细分子集，不参与该恒等式，避免重复计数；两者互斥，`require_asu=false` 只累加前者，`true` 只累加后者；读侧看 `asu_read_objects_total` 的 result 分布与 `asu_read_select` 日志的 rank 分布，若 ASU 命中率异常高而 memory 副本存在，优先怀疑 policy 或 rank 表（要求 2）；删侧看 `master_asu_delete_queue_depth` 是否单调增长，增长说明 GC 卡住或 ASU 不可达（要求 3）。之后再用 `asu_wait_timeout_total`、`asu_canceled_batch_total`、`asu_staging_quarantined_slots` 判断是超时、预发送失败还是内存隔离，最后用延迟直方图确认是设备慢还是本层排队。
@@ -2115,29 +2063,29 @@ KvClient 的 TaskId 是进程内句柄，只在 Client 侧有效。设计上要�
 
 失败现场的目标是「不重启、不加日志也能回答是哪一条 entry 失败、失败在哪一步」。具体保留策略如下。
 
-第一，header 或 CRC 校验失败时，以 ERROR 打印该 512B header 的完整十六进制（只打 header，不打 payload），同时逐字段打印 expected 与 actual，并打印该次 BatchLoad 的**全部** entryStatus（含 OK 条目），因为 PARTIAL_FAILED 场景下失败条目与成功条目的下标对应关系是归因的关键。第二，提供可选的 dump 目录：设置后把失败的 header 按 `key_id-epoch-chunk_index.hdr` 命名落盘，便于事后离线解析；不设置则不产生任何磁盘写入。第三，Wait 超时时打印整个批次的 key_id、epoch、task_id、entry 列表、slot_id 与 timeout_ms，并把该 slot 标记为 `kQuarantined`；由于 Wait 超时后 task 结果不可再取，这行日志是该批次唯一可用的现场，同时必须更新 `asu_staging_free_slots` 与 `asu_slot_exhausted_total`。第四，ASU 写失败进入 degrade 时，以 WARNING 打印该对象覆盖的全部 chunk 列表与 first_error，并打印 best-effort Delete 的结果，因为此时元数据会被 revoke、物理残留只能靠这行日志与 GC 队列追溯。第五，删除重试耗尽时以 ERROR 打印 key_id、epoch、user_key、not_before、release_at、最后一次 rawResult 与尝试次数，同时累加 master_asu_delete_dropped_total，保证「设备上还有残留」这件事一定留下可检索的记录。
+第一，header 或 CRC 校验失败时，以 ERROR 打印该 512B header 的完整十六进制（只打 header，不打 payload），同时逐字段打印 expected 与 actual，并打印该次 BatchLoad 的**全部** entryStatus（含 OK 条目），因为 PARTIAL_FAILED 场景下失败条目与成功条目的下标对应关系是归因的关键。第二，提供可选的 dump 目录：设置后把失败的 header 按 `key_id-epoch.hdr` 命名落盘，便于事后离线解析；不设置则不产生任何磁盘写入。第三，Wait 超时时打印整个批次的 key_id、epoch、task_id、entry 列表、slot_id 与 timeout_ms，并把该 slot 标记为 `kQuarantined`；由于 Wait 超时后 task 结果不可再取，这行日志是该批次唯一可用的现场，同时必须更新 `asu_staging_free_slots` 与 `asu_slot_exhausted_total`。第四，ASU 写失败进入 degrade 时，以 WARNING 打印该对象的 entry 与 first_error，并打印 best-effort 删除的结果。第五，删除重试耗尽时以 ERROR 打印 key_id、epoch、user_key、not_before、release_at、最后一次 rawResult 与尝试次数，同时累加 master_asu_delete_dropped_total。
 
 #### 2.5.6 离线诊断工具 mooncake-asu-dump
 
-该工具用于回答「数据到底写进去没有」，全程只读，不执行 Store 也不执行 Delete。输入可以直接从日志复制：config 路径、key_id、object_epoch、object_size、chunk_count。工具按 chunk_count 与 chunk_payload 常量派生每个 chunk 的 offset，先调用 QueryAsync 取 exists 位图，再对存在的 chunk 做仅 512B header 的 BatchLoad（512B 本身是合法 entry，不违反 v2.0 的入口尺寸契约），逐 chunk 输出存在性、magic 与 version、header CRC 结果、key_id 与 key_fingerprint 与 epoch 与 object_size 与 chunk_index 与 chunk_count 与 data_offset 的交叉校验结果；需要时可选择整 chunk 读并校验 data_crc32c。输出结论只有四种：物理存在且记录合法、物理存在但记录损坏、物理不存在、视图不可达。这四种结论正好对应定位时的四条分叉，避免把「元数据在但物理丢失」误判成代码 bug。v2.0 中该工具还承担一个额外职责：在 degrade 之后确认 ASU 上是否确实没有 complete 的 chunk0，从而区分「ASU 真没写成功」与「写成功了但 finalize 判定错误」。
+该工具用于回答「数据到底写进去没有」，全程只读，不执行 Store 也不执行 Delete。输入可以直接从日志复制：config 路径、key_id、object_epoch、object_size。工具先调用 `QueryAsync` 取 exists 位图，再对存在的 key 做仅 512B header 的 `BatchLoad`（512B 本身是合法 entry，不违反入口尺寸契约），输出存在性、magic 与 version、header CRC 结果、key_id 与 key_fingerprint 与 epoch 与 object_size 与 data_offset（必须为 0）与 data_len 的交叉校验结果；需要时可选择整 entry 读并校验 data_crc32c。输出结论只有四种：物理存在且记录合法、物理存在但记录损坏、物理不存在、视图不可达。这四种结论正好对应定位时的四条分叉，避免把「元数据在但物理丢失」误判成代码 bug。
 
 #### 2.5.7 运维视图
 
-ASU 副本必须出现在既有的介质视图与管理查询里，否则运维只能靠日志猜测。介质视图侧，KvMediaForMetadata 与 KvMediaForRemoval 把所有非 memory 副本归一到 disk 介质（master_service.cpp:11151-11203），ASU 需要加入这两处的判定，使订阅者能看到 disk 介质的出现与回收；**v2.0 新增的可见变化是「删 memory」**：对象从 `{cpu, disk}` 变为 `{disk}` 而对象本身仍存在，订阅方必须据此区分「降级为只剩 ASU」与「整对象被删」。管理查询侧，admin BatchQueryKeys 的副本类型分支当前覆盖 memory、disk、local_disk、nof（master_admin_service.cpp:1195-1216），需要增加 ASU 分支并回显 AsuDescriptor 的 key_id、epoch、object_size、chunk_count；否则接口返回 ok 为 true 但 values 为空，看起来像对象没有副本。这两处只做展示，不改变任何读写删语义。
+ASU 副本必须出现在既有的介质视图与管理查询里，否则运维只能靠日志猜测。介质视图侧，KvMediaForMetadata 与 KvMediaForRemoval 把所有非 memory 副本归一到 disk 介质（master_service.cpp:11151-11203），ASU 需要加入这两处的判定，使订阅者能看到 disk 介质的出现与回收；**v2.0 新增的可见变化是「删 memory」**：对象从 `{cpu, disk}` 变为 `{disk}` 而对象本身仍存在，订阅方必须据此区分「降级为只剩 ASU」与「整对象被删」。管理查询侧，admin BatchQueryKeys 的副本类型分支当前覆盖 memory、disk、local_disk、nof（master_admin_service.cpp:1195-1216），需要增加 ASU 分支并回显 AsuDescriptor 的 key_id、epoch、object_size；否则接口返回 ok 为 true 但 values 为空，看起来像对象没有副本。这两处只做展示，不改变任何读写删语义。
 
 #### 2.5.8 典型问题定位路径
 
 > **[v2.0 变更]** 问题集按 v2.0 的三条新要求重写：新增「Put 成功但 ASU 无数据」「删 memory 后 ASU 仍在是否预期」「级联删除卡在哪一步」「读走 ASU 且慢是决策还是设备」四个核心场景，保留长度不符场景并改写为全对象读契约下的版本。
 
-**问题一：Put 返回成功但 ASU 上没有数据。** 这是要求 1 引入的核心新问题，因为成功现在有两种含义。先看 `asu_finalize_decision` 的 `asu_status`：`DEGRADED` 说明主层成功、ASU 失败，Put 成功是预期行为（仅 `require_asu=false`；若 `require_asu=true` 仍看到 `DEGRADED`，即为接线错误，见 FMEA-58）；`require_asu=true` 时 ASU 失败应表现为 `STRICT_FAILED` 且 Put 返回失败，此时按 `asu_write_failures_total{code}` 判断失败原因，并用 mooncake-asu-dump 以日志中的 key_id 与 epoch 确认 chunk0 是否真的未提交。若 `asu_status=OK` 而 GetReplicaList 没有 ASU，问题在 Master：检查 PutEnd 的 replica_type 是否为 ALL，以及 is_target_replica 的 ALL 分支（master_service.cpp:5300-5307）是否命中 is_asu_replica；ASU 停在 PROCESSING 是典型症状（FMEA-42）。若 `asu_status=SKIPPED_PRIMARY_FAILED`，则是主层失败触发了正确的门禁，不需要查 ASU；此时 Put 本应返回失败，若返回成功说明 finalize 判定接线错误（FMEA-44）。若日志里完全没有 `asu_write_start_validate`，先确认 requested_asu_replicas 是否被 InitializeRequestedReplicas 正确读取，再看 Master 是否真的分配了 ASU；`asu_alloc_missing_total` 增长说明请求了但 Master 没给，客户端应在传输前就以 NO_AVAILABLE_HANDLE 失败（FMEA-43）。最后看 `asu_write_commit` 与 `asu_write_end`：没有 chunk0 提交说明对象从未成为可读（FMEA-34），有提交但 `asu_write_end` 失败说明 finalize 阶段出错。
+**问题一：Put 返回成功但 ASU 上没有数据。** 先看 `asu_finalize_decision` 的 `asu_status`：`DEGRADED` 说明主层成功、ASU 失败，Put 成功是预期行为（仅 `require_asu=false`；若 `require_asu=true` 仍看到 `DEGRADED`，即为接线错误，见 FMEA-58）；`require_asu=true` 时 ASU 失败应表现为 `STRICT_FAILED` 且 Put 返回失败，此时按 `asu_write_failures_total{code}` 判断失败原因，并用 mooncake-asu-dump 以日志中的 key_id 与 epoch 确认该对象的 entry 是否真的未提交。若 `asu_status=OK` 而 GetReplicaList 没有 ASU，问题在 Master：检查 PutEnd 的 replica_type 是否为 ALL，以及 is_target_replica 的 ALL 分支（master_service.cpp:5300-5307）是否命中 is_asu_replica；ASU 停在 PROCESSING 是典型症状（FMEA-42）。若 `asu_status=SKIPPED_PRIMARY_FAILED`，则是主层失败触发了正确的门禁，不需要查 ASU；此时 Put 本应返回失败，若返回成功说明 finalize 判定接线错误（FMEA-44）。若日志里完全没有 `asu_write_start_validate`，先确认 requested_asu_replicas 是否被 InitializeRequestedReplicas 正确读取，再看 Master 是否真的分配了 ASU；`asu_alloc_missing_total` 增长说明请求了但 Master 没给，客户端应在传输前就以 NO_AVAILABLE_HANDLE 失败（FMEA-43）。最后看 `asu_write_commit` 与 `asu_write_end`：没有成功提交说明对象 entry 未落地（FMEA-34），有提交但 `asu_write_end` 失败说明 finalize 阶段出错。
 
-**问题二：删了 memory 但 ASU 还在，是否预期。** 先确认调用的是哪个入口。`remove_memory_tier` 出现说明走的是 RemoveMemoryReplica，ASU 仍在是**预期且必须**的结果：对象仍 IsValid，GetReplicaList 应返回 ASU，KvMedia 应从 `{cpu, disk}` 变为 `{disk}`，随后的 Get 应由 rank 5 选中 ASU。若期望的是整对象删除，则应看到 `asu_delete_capture` 与 `asu_delete_enqueue` 而不是 `remove_memory_tier`；若两者同时出现，说明接线错误（FMEA-57），重点查 `FreeAsuReplicas` 的 `is_asu_replica` 过滤是否被移除、是否错误地读取了 `GetAllReplicas` 而不是传入集合，或 `RemoveReplicaTier` 的谓词是否被改成了宽谓词。若 `remove_memory_tier` 的 result 是 OBJECT_REPLICA_BUSY，说明 offload 或 promotion 仍持有 source refcnt，等 task 结束重试即可（FMEA-47）。若 result 是 REPLICA_IS_NOT_READY，说明还有副本处于 PROCESSING，即写删并发（对应 FMEA-42 的永久 PROCESSING 残留）。
+**问题二：删了 memory 但 ASU 还在，是否预期。** 先确认调用的是哪个入口。调用 `Client::Remove` / `BatchRemove` 时，ASU 仍在是**预期且必须**的结果（plain Remove 不触达 ASU）：对象已从元数据消失，ASU entry 成为孤儿，审计日志里不应出现 `asu_delete_capture`/`asu_delete_enqueue`。若期望的是删除 ASU，应调用 `BatchRemoveAsuObjects`，日志顺序为 `asu_delete_capture` → 既有 Remove → `asu_delete_enqueue`。若在 plain Remove 后仍看到 `asu_delete_enqueue`，说明 `EraseMetadata`/HA finalize 又错误地捕获并入队了 ASU（FMEA-57），重点查 `enqueue_asu_deletes` 标志是否被置真、`FreeAsuReplicas` 是否被接回 `EraseMetadata`。若 `BatchRemoveAsuObjects` 的 result 是 REPLICA_IS_NOT_READY，说明还有副本处于 PROCESSING，即写删并发（FMEA-42 的永久 PROCESSING 残留）；`OBJECT_HAS_LEASE` 表示对象仍持有读租约，该 key 被跳过、不入队。
 
-**问题三：级联删除卡在哪一步。** 正确顺序在日志上必须是 `asu_delete_capture`、随后 memory buffer 释放、再 `asu_delete_enqueue`，三段之间不应出现 `asu_delete_enqueue` 早于 teardown 的情况。若只看到 `asu_delete_capture` 而没有 `asu_delete_enqueue`，检查 EraseMetadata（master_service.cpp:2054-2116）是否仍在走旧的「直接以 GetAllReplicas 入队」分支，或 hold.TearDown 抛异常；若对象在 Master 已不可见而 ASU 仍在，且队列非空，说明在宽限期内，用 `release_at` 与当前时间比较即可，宽限期内残留是预期。若 `asu_delete_submit` 出现但 `entry_status` 非 OK，看 `asu_delete_retry` 的 attempt 与 next_at 判断退避是否生效，超过 asu_delete_max_attempts 后应出现 `asu_delete_drop` 且 master_asu_delete_dropped_total 增长。若 HA 路径，检查 FinalizeRemovedReplicasAfterDurable（1757-1807）是否先 pop memory 子集、再 pop 其余并调用 FreeAsuReplicas；一次 pop 全部会导致顺序日志缺失（FMEA-16）。
+**问题三：删除链路卡在哪一步。** plain Remove 的正确日志是只有 `EraseMetadata` teardown，不出现 `asu_delete_capture`/`asu_delete_enqueue`；若出现即为误接线。`BatchRemoveAsuObjects` 的正确顺序是 `asu_delete_capture`（捕获 descriptor）→ 既有 RemoveObject 执行 → `asu_delete_enqueue`，且入队只发生在 Remove 返回 OK 或 `OBJECT_NOT_FOUND` 之后。若只看到 `asu_delete_capture` 而没有 `asu_delete_enqueue`，检查 Remove 是否返回 `OBJECT_HAS_LEASE`/`REPLICA_IS_NOT_READY`（该 key 被跳过）或 persist 失败。若对象在 Master 已不可见而 ASU 仍在、且队列非空，说明在宽限期内，用 `release_at` 与当前时间比较即可。若 `asu_delete_submit` 出现但 `entry_status` 非 OK，看 `asu_delete_retry` 的 attempt 与 next_at 判断退避是否生效，超过 asu_delete_max_attempts 后应出现 `asu_delete_drop` 且 master_asu_delete_dropped_total 增长。HA 路径下 `FinalizeRemovedReplicasAfterDurable` 只在 `enqueue_asu_deletes=true` 时入队，plain Remove 传 false。
 
-**问题四：读走了 ASU 而且慢，是择优决策还是设备慢。** 先看 `asu_read_select` 的候选快照：若候选里本来就没有 COMPLETE 的 local MEMORY 或 LOCAL_DISK（例如它们已被删或处于非 COMPLETE），ASU 被选中是**正确决策**，慢是设备或传输问题，转下一步；若候选里有 rank 更小的副本却没被选中，是选择器缺陷，重点查 ClassifyReplicaForRead 对 is_local 与 status 的判定，以及 `asu_available` 是否错误地为 true 或 false（FMEA-48）。确认决策正确后，看 `asu_read_batch_begin` 的 entries 与 task_id、`asu_read_entry` 的 entry_status，以及 `asu_read_latency_us` 的分位数；若 `asu_read_latency_us` 升高且 `asu_staging_free_slots` 接近 0，说明在排队而非失败；只有**全部 slot 被 quarantine** 时 `Acquire` 才返回 `ASU_SERVICE_UNAVAILABLE` 并让 `asu_slot_exhausted_total` 增长（FMEA-50）。若 `asu_read_wait` 频繁 TIMEOUT，先核对 timeout_ms 是否由 `EstimateTimeoutMs` 显式传入而不是 100ms 默认值（FMEA-05）。若 task 数远大于对象数，说明每对象打包逻辑错误（不提供跨对象合并开关，不应出现合并批）。最后用 asu_read_bytes 与对象大小核对是否有 over-read：v2.0 的 read_len 恒为 512 加 align_up(object_size)，出现更大的值说明 chunk 规划或切片尺寸错误。
+**问题四：读走了 ASU 而且慢，是择优决策还是设备慢。** 先看 `asu_read_select` 的候选快照：若候选里本来就没有 COMPLETE 的 local MEMORY 或 LOCAL_DISK（例如它们已被删或处于非 COMPLETE），ASU 被选中是**正确决策**，慢是设备或传输问题，转下一步；若候选里有 rank 更小的副本却没被选中，是选择器缺陷，重点查 ClassifyReplicaForRead 对 is_local 与 status 的判定，以及 `asu_available` 是否错误地为 true 或 false（FMEA-48）。确认决策正确后，看 `asu_read_batch_begin` 的 entries 与 task_id、`asu_read_entry` 的 entry_status，以及 `asu_read_latency_us` 的分位数；若 `asu_read_latency_us` 升高且 `asu_staging_free_slots` 接近 0，说明在排队而非失败；只有**全部 slot 被 quarantine** 时 `Acquire` 才返回 `ASU_SERVICE_UNAVAILABLE` 并让 `asu_slot_exhausted_total` 增长（FMEA-50）。若 `asu_read_wait` 频繁 TIMEOUT，先核对 timeout_ms 是否由 `EstimateTimeoutMs` 显式传入而不是 100ms 默认值（FMEA-05）。若 task 数远大于对象数，说明打包逻辑错误（一个对象只应贡献一条 entry）。最后用 asu_read_bytes 与对象大小核对是否有 over-read：v2.3 的 read_len 恒为 512 加 align_up(object_size)，出现更大的值说明切片尺寸错误。
 
-**问题五：Get 返回的长度与写入长度不符。** 先看 `asu_req_begin` 中的 requested_bytes 与调用方 slices 总长是否一致；v2.0 要求 slices 总长大于等于 object_size，小于则在入口返回 INVALID_PARAMS，因此若进入了 ReadObjects 就说明尺寸契约已满足。接着看 descriptor.object_size 与 chunk_count 是否等于写入时的值；若 descriptor 正确，进入 `asu_header_check` 看 object_size、chunk_index、chunk_count、data_offset 四组 expected 与 actual，任何一组不符都是 ASU_RECORD_CORRUPT，且 payload CRC 此时必然被校验过，不会出现「CRC 跳过所以没发现」的情况。若 header 全部通过而长度仍不符，检查 client_buffer 的 calculate_total_size 是否已经为 AsuDescriptor.object_size 增加分支（client_buffer.cpp:144-159 当前只覆盖 disk、local_disk、dfs、nof、memory）；缺少分支会落到 `else` 调 `get_memory_descriptor()` 并抛 `std::runtime_error`（不是读错长度），因此必须为 ASU 增加 `object_size` 分支（`get_memory_descriptor` 见 replica.h:831）。最后看 asu_get_bytes_total 与 asu_get_total 的 result 分布，注意对象级 checksum 默认关闭（client_object_checksum_config.cpp:14-16），长度不符不一定会以 CHECKSUM_MISMATCH 暴露。
+**问题五：Get 返回的长度与写入长度不符。** 先看 `asu_req_begin` 中的 requested_bytes 与调用方 slices 总长是否一致；v2 要求 slices 总长大于等于 object_size，小于则在入口返回 INVALID_PARAMS，因此若进入了 BatchLoadObjects 就说明尺寸契约已满足。接着看 descriptor.object_size 是否等于写入时的值；若 descriptor 正确，进入 `asu_header_check` 看 object_size、data_offset（必须为 0）、data_len（必须等于 object_size）三组 expected 与 actual，任何一组不符都是 ASU_RECORD_CORRUPT，且 payload CRC 此时必然被校验过，不会出现「CRC 跳过所以没发现」的情况。若 header 全部通过而长度仍不符，检查 client_buffer 的 calculate_total_size 是否已经为 AsuDescriptor.object_size 增加分支（client_buffer.cpp:144-159 当前只覆盖 disk、local_disk、dfs、nof、memory）；缺少分支会落到 `else` 调 `get_memory_descriptor()` 并抛 `std::runtime_error`（不是读错长度），因此必须为 ASU 增加 `object_size` 分支（`get_memory_descriptor` 见 replica.h:831）。最后看 asu_get_bytes_total 与 asu_get_total 的 result 分布，注意对象级 checksum 默认关闭（client_object_checksum_config.cpp:14-16），长度不符不一定会以 CHECKSUM_MISMATCH 暴露。
 
 ## 3. shard 设计描述
 
@@ -2150,7 +2098,7 @@ ASU 副本必须出现在既有的介质视图与管理查询里，否则运维�
 | 3.3 | asu_record | `asu_record.{h,cpp}` | 依赖 3.1/3.2，被 3.6 依赖 |
 | 3.4 | asu_staging_arena | `asu_staging_arena.{h,cpp}` | 依赖 3.5，被 3.6 依赖 |
 | 3.5 | asu_kv_adapter | `asu_kv_adapter.{h,cpp}` | 包装 `kv::KvClient` |
-| 3.6 | asu_storage_backend | `asu_storage_backend.{h,cpp}` | 依赖 3.1/3.2/3.3/3.4/3.5；写是 Put 的第二阶段，读是 `ReadObjects` 批量读 |
+| 3.6 | asu_storage_backend | `asu_storage_backend.{h,cpp}` | 依赖 3.1/3.2/3.3/3.4/3.5；写是 Put 的第二阶段，读是 `BatchLoadObjects` 批量读 |
 | 3.7 | asu_allocator | `asu_allocator.{h,cpp}` | 依赖 3.2/3.1，被 3.11 依赖 |
 | 3.8 | asu_delete_queue | `asu_delete_queue.{h,cpp}` | 依赖 3.6，被 3.11 依赖；Master 侧物理删除的唯一执行者 |
 | 3.9 | replica.h 集成 | `AsuDescriptor` / `AsuReplicaData` / variant / 写模式 | 被 3.10/3.11 依赖 |
@@ -2158,7 +2106,7 @@ ASU 副本必须出现在既有的介质视图与管理查询里，否则运维�
 | 3.11 | Master 集成 | `AsuMasterRuntime` 与分配/终态/级联删除/恢复 | 依赖 3.7/3.8 |
 | 3.12 | asu_config | `asu_config.{h,cpp}`、CMake 登记 | 被全部 shard 依赖 |
 
-> **[v2.0 变更]** 本章按 v2.0 的三条修订要求逐 shard 修改。三条要求的落点：要求 1（写序）→ 3.6 写入口语义 + 3.9 的 `ReplicaWriteMode::TIERED_MEMORY_THEN_ASU` + 3.10 的 `SubmitAsuWrites` + 3.11 的 `AllocateReplicas`/`PutEnd`；要求 2（读择优）→ 3.6 `ReadObjects` + 3.10 `ReadAsuReplica` 与批量收集 + 3.10 的 `ReplicaReadRank` 接线；要求 3（删除分层）→ 3.11 `RemoveReplicaTier` 与 `EraseMetadata` 三段式级联 + 3.8 的 `not_before`。未受影响的 shard（3.1 常量与公式、3.2 键派生、3.3 记录头与 CRC）保持 v1.0 内容，只做与 v2 冲突处的最小修正。
+> **[v2.3 变更]** 本章按 v2.3 的修订要求逐 shard 修改。三条要求的落点：要求 1（写序）→ 3.6 写入口语义 + 3.9 的 `ReplicaWriteMode::TIERED_MEMORY_THEN_ASU` + 3.10 的 `SubmitAsuWrites` + 3.11 的 `AllocateReplicas`/`PutEnd`；要求 2（读择优）→ 3.6 `BatchLoadObjects` + 3.10 `ReadAsuReplica` 与批量收集 + 3.10 的 `ReplicaReadRank` 接线；要求 3（删除分层）→ 3.11 `BatchRemoveAsuObjects`（捕获→既有 Remove→入队）+ 3.8 的 `not_before`。3.1 常量与纯函数、3.3 记录头与 CRC 已按「一个对象一条 entry」重写。
 
 统一约定：错误返回类型为 `tl::expected<T, ErrorCode>`（`<ylt/util/tl/expected.hpp>`），错误码来自 `mooncake-store/include/types.h` 的 `ErrorCode`；日志用 glog；线程同步用 `std::mutex` + `std::condition_variable`；方法命名沿用 §2.1 类图的 PascalCase（Mooncake 既有代码多用 snake_case，这一点作为风格差异记录在末尾说明）。
 
@@ -2166,54 +2114,38 @@ ASU 副本必须出现在既有的介质视图与管理查询里，否则运维�
 
 **职责**
 
-固定 ASU 的全部硬边界（512B 对齐、24-bit 长度、32-bit offset）并给出 chunk 分块公式。本 shard 是 header-only、无状态、无锁、无 I/O 的纯函数与常量集合，不负责任何缓冲区分配或 SDK 调用。Master 与 Client 编译同一份头文件，保证两端对 `chunk_count`/`chunk_payload`/offset 的理解完全一致。
+固定 ASU 的全部硬边界（512B 对齐、24-bit 长度、32-bit offset）并给出「一个对象一条 entry」与跨对象合批的纯函数。本 shard 是 header-only、无状态、无锁、无 I/O 的纯函数与常量集合，不负责任何缓冲区分配或 SDK 调用。Master 与 Client 编译同一份头文件，保证两端对 `object_size`/`offset`/批量切分的理解完全一致。
 
 **设计说明**
 
-常量来源是 SDK 的协议约束：SQE 的 `buffer_length`/`length` 必须 512B 对齐且不超过 24-bit（`kv_semantics/src/trans/proto/kv_protocol.cc:188-215`），因此单 entry 的绝对上限是 `0xFFFFFF` 向下取 512 对齐，即 `0xFFFFE00 = 16,776,704 B`。`offset` 是 32-bit 且 512B 对齐（`kv_types.h:125` 的 `std::uint32_t offset`；协议校验见 `kv_protocol.cc:202-206`；`sqe_request.cc:187`、`:208`、`:225`、`:248` 只是把 `KVBuffer.offset` 原样搬进请求；`:190`、`:206`、`:223`、`:251` 才是 `buffer.region.size` 先 `static_cast<std::uint32_t>` 的位置）。
+常量来源是 SDK 的协议约束：SQE 的 `buffer_length`/`length` 必须 512B 对齐且不超过 24-bit（`kv_semantics/src/trans/proto/kv_protocol.cc:188-215`），因此单 entry 的绝对上限是 `0xFFFFFF` 向下取 512 对齐，即 `0xFFFFE00 = 16,776,704 B`。`offset` 是 32-bit 且 512B 对齐（`kv_types.h:125`）；取消分块后 `offset` 恒为 0。
 
 | 常量 | 值 | 含义 |
 | --- | --- | --- |
 | `kAlign` | 512 | SDK 要求的对齐粒度（`kv_types.h:42-43`） |
-| `kHeaderBytes` | 512 | 每 chunk 的记录头长度 |
+| `kHeaderBytes` | 512 | 每条 entry 的记录头长度 |
 | `kEntryMaxBytes` | 16,776,704 | 单 entry 单次 Store/Load 上限 |
-| `kChunkPayloadBytes` | 16,776,192 | 每 chunk 可承载的 payload 上限 |
-| `kChunkStrideBytes` | 16,776,704 | 相邻 chunk 的 ASU offset 间距 |
-| `kMaxChunks` | 256 | 单对象 chunk 数上限 |
-| `kMaxObjectBytes` | 4,294,705,152 | 单对象逻辑字节上限 |
+| `kMaxObjectBytes` | 16,776,192 | 单对象逻辑字节上限 = `kEntryMaxBytes - kHeaderBytes` |
 | `kAsuMaxObjectBytes` | 同 `kMaxObjectBytes` | ASU 对象上限的语义别名，供 `PrepareWriteStart` 与 `AsuConfig` 引用 |
 | `kBatchMaxEntries` | 110 | 单 task 提交条数上限（对齐 `batchStoreIoNum`/`batchLoadIoNum`，`kv_types.h:196-197`） |
 | `kBatchMaxBytes` | 64 MiB | 单 task 提交字节上限（SDK 的 `maxInflightBytes` 只解析不生效，不能依赖） |
 | `kDefaultWaitTimeoutMs` | 30000 | `Wait` 的基准超时 |
 
-> **[v2.0 变更]** 新增 `kAsuMaxObjectBytes` 别名与 `IsValidEntry` 纯函数。v1.0 把 `IsValidEntry` 藏在 3.6 的匿名命名空间里，导致 3.6、3.10、3.11 三处各写一份；v2 把它上提到 header-only 常量的同一处，作为「单个 entry 是否可提交」的唯一判据。
+> **[v2.3 变更]** 删除 `kChunkPayloadBytes`、`kChunkStrideBytes`、`kMaxChunks` 与全部 chunk 公式；`kMaxObjectBytes` 从错误的 4,294,705,152 修正为 **16,776,192**。新增 `WireLen` 与 `PlanBatches`：前者定义单 entry 线上长度，后者是「按对象边界、按条数与字节切 task」的唯一实现。
 
-分块公式（`S` 为 `object_size`，`A = align_up(S, 512)`，`N = ChunkCount(S)`）：
+单 entry 布局与公式（`S` 为 `object_size`）：
 
-- `N = ceil(A / kChunkPayloadBytes)`，取值 1..256；
-- `data_len_i = min(kChunkPayloadBytes, S - i * kChunkPayloadBytes)`；
-- `wire_len_i = kHeaderBytes + align_up(data_len_i, 512)`，恒 ≤ `kEntryMaxBytes`；
-- `offset_i = i * kChunkStrideBytes`，恒 512B 对齐且 < 2^32。
+- `wire_len = kHeaderBytes + AlignUp(S, 512)`，恒 ≤ `kEntryMaxBytes`；
+- `offset = 0`；
+- `data_len = S`，零填充到 `wire_len` 不参与 CRC。
 
-读路径在 v2 恒为全对象读：入口要求 `CalculateSliceSize(slices) >= object_size`（否则 `INVALID_PARAMS`），因此 `R = object_size`、`M = N`，且每片 `need_i == data_len_i`，payload CRC-32C 永远可校验。后端内部保留 `R = min(SliceBytes, object_size)` 作为不变量，但公开路径不会触发截断。
+**1,008 B 边界（必须精确，不得含糊成「约 16 MiB」）**
 
-**具体数字例子（40 MiB 对象）**
+`kEntryMaxBytes = 16,776,704`，减去 512B header 后单 key 最大 object = **16,776,192 B**。CACHELIB 的 `kMaxSliceSize = Slab::kSize - 16 = 16,777,200 B`（`mooncake-store/include/types.h:468-469`），比 16,776,192 大 **1,008 B**。因此窗口 `(16,776,192, 16,777,200]` 内 CACHELIB 放行但单 entry 装不下，必须由 `PrepareWriteStart` 的 ASU 校验显式拒绝为 `ASU_OBJECT_TOO_LARGE`；`S > 16,777,200` 时 CACHELIB 检查先返回 `INVALID_PARAMS`。
 
-`S = 41,943,040 B`，`A = S`（已是 512 的倍数），`N = 3`：
+**跨对象合批（`PlanBatches`）**
 
-| chunk | `data_len` | `wire_len` | `offset` | ASU key |
-| --- | --- | --- | --- | --- |
-| 0 | 16,776,192 | 16,776,704 | 0 | 同一个 `key_id` |
-| 1 | 16,776,192 | 16,776,704 | 16,776,704 | 同一个 `key_id` |
-| 2 | 8,390,656 | 8,391,168 | 33,553,408 | 同一个 `key_id` |
-
-三点必须讲清：第一，**所有 chunk 共用同一个 8B ASU key**，区分靠 `offset`，这是 ASU 官方的「一个 key + 多 offset 写 tensor」用法；第二，最后一片 `33,553,408 + 8,391,168 = 41,944,576 < 2^32`，offset 不溢出；第三，写入总量等于 `N * 512 + A = 1,536 + 41,943,040 = 41,944,576 B`。
-
-> **[v2.0 变更]** v1.0 在这里给了 20 MiB 前缀读的例子并说明「chunk 1 截断读、跳过 payload CRC」。v2 明确不支持前缀/截断读：入口要求 slices 覆盖整个对象，该例子与对应分支一并作废（见 3.6 与 3.10）。
-
-**默认部署的 chunk_count 恒为 1**
-
-CACHELIB 默认分配器的 `kMaxSliceSize = Slab::kSize - 16`（`mooncake-store/include/types.h:468-469`），`PrepareWriteStart` 在 `master_service.cpp:5111-5117` 对**所有副本类型**都做该检查，ASU-only 写同样受约束。因此默认部署下单对象约 ≤ 16 MiB，`N == 1`。多 chunk 路径已设计但默认不可达（v1.0 H14）；本节与 3.6 都不得把多 chunk 写成可用路径。
+多个对象按对象边界打包进同一 task：条数 ≤ `min(kBatchMaxEntries, staging_slots)`，字节 ≤ `kBatchMaxBytes`（默认 64 MiB）。超过任一上限时在对象边界切 task，**绝不切开单个对象**。一个对象始终只贡献一条 entry。
 
 **必要代码**
 
@@ -2223,17 +2155,17 @@ CACHELIB 默认分配器的 `kMaxSliceSize = Slab::kSize - 16`（`mooncake-store
 
 #include <algorithm>
 #include <cstdint>
+#include <span>
+#include <vector>
 
 namespace mooncake::asu {
 
 inline constexpr uint32_t kAlign = 512;
 inline constexpr uint32_t kHeaderBytes = 512;
+// 0xFFFFFF rounded down to 512B alignment.
 inline constexpr uint32_t kEntryMaxBytes = 16u * 1024u * 1024u - 512u;
-inline constexpr uint32_t kChunkPayloadBytes = kEntryMaxBytes - kHeaderBytes;
-inline constexpr uint32_t kChunkStrideBytes = kHeaderBytes + kChunkPayloadBytes;
-inline constexpr uint32_t kMaxChunks = 256;
-inline constexpr uint64_t kMaxObjectBytes =
-    static_cast<uint64_t>(kMaxChunks) * kChunkPayloadBytes;
+// One object = one ASU key = one entry: 512B header + payload.
+inline constexpr uint64_t kMaxObjectBytes = kEntryMaxBytes - kHeaderBytes;
 inline constexpr uint64_t kAsuMaxObjectBytes = kMaxObjectBytes;
 inline constexpr size_t kBatchMaxEntries = 110;
 inline constexpr uint64_t kBatchMaxBytes = 64ull << 20;
@@ -2243,47 +2175,57 @@ inline constexpr uint32_t kMagic = 0x31555341u;  // "ASU1" little-endian
 
 static_assert(kEntryMaxBytes == (0xFFFFFFu & ~(kAlign - 1u)),
               "24-bit SQE length must round down to 512B alignment");
-static_assert(kChunkPayloadBytes % kAlign == 0);
-static_assert(kChunkStrideBytes == kEntryMaxBytes);
-static_assert(static_cast<uint64_t>(kMaxChunks) * kChunkStrideBytes +
-                      kHeaderBytes <
-                  (1ull << 32),
-              "last chunk offset + wire_len must fit in 32-bit offset");
+static_assert(kMaxObjectBytes == 16776192ull);
 static_assert(kMaxObjectBytes < (1ull << 32));
 
 constexpr uint64_t AlignUp(uint64_t value, uint64_t align = kAlign) {
     return (value + align - 1) / align * align;
 }
 
-constexpr uint32_t ChunkCount(uint64_t object_size) {
-    if (object_size == 0) return 0;
-    return static_cast<uint32_t>((AlignUp(object_size) + kChunkPayloadBytes - 1) /
-                                 kChunkPayloadBytes);
+// Full wire length of the single entry that represents one object.
+constexpr uint32_t WireLen(uint64_t object_size) {
+    return static_cast<uint32_t>(kHeaderBytes + AlignUp(object_size));
 }
 
-constexpr uint32_t ChunkDataLen(uint64_t object_size, uint32_t index) {
-    const uint64_t begin = static_cast<uint64_t>(index) * kChunkPayloadBytes;
-    if (object_size <= begin) return 0;
-    return static_cast<uint32_t>(
-        std::min<uint64_t>(kChunkPayloadBytes, object_size - begin));
-}
+// Cross-object batching by object boundary. Each object contributes exactly
+// one entry; the plan never splits a single object across tasks.
+struct BatchSpan {
+    size_t begin{0};
+    size_t count{0};
+    uint64_t bytes{0};
+};
 
-constexpr uint32_t ChunkWireLen(uint32_t data_len) {
-    return kHeaderBytes + static_cast<uint32_t>(AlignUp(data_len));
-}
-
-constexpr uint64_t ChunkOffset(uint32_t index) {
-    return static_cast<uint64_t>(index) * kChunkStrideBytes;
+inline std::vector<BatchSpan> PlanBatches(std::span<const uint64_t> object_sizes,
+                                          size_t max_entries,
+                                          uint64_t max_bytes) {
+    std::vector<BatchSpan> batches;
+    size_t i = 0;
+    while (i < object_sizes.size()) {
+        BatchSpan b{.begin = i, .count = 0, .bytes = 0};
+        while (i < object_sizes.size() && b.count < max_entries) {
+            const uint64_t wire = WireLen(object_sizes[i]);
+            if (b.count > 0 && b.bytes + wire > max_bytes) break;
+            b.bytes += wire;
+            ++b.count;
+            ++i;
+        }
+        if (b.count == 0) {  // a single object larger than max_bytes is not split
+            b.bytes = WireLen(object_sizes[i]);
+            b.count = 1;
+            ++i;
+        }
+        batches.push_back(b);
+    }
+    return batches;
 }
 
 // Single-entry submit gate. A violation here is rejected locally by the SDK
 // during PackSqe, which aborts the whole transport task and cancels every
 // entry in the batch (trans_task_executor.cc:227-232). Callers must check it
-// before SubmitLoad/SubmitStore.
+// before BatchStoreAsync / BatchLoadAsync.
 constexpr bool IsValidEntry(uint32_t wire_len, uint64_t offset) {
     return wire_len % kAlign == 0 && wire_len >= kHeaderBytes &&
-           wire_len <= kEntryMaxBytes && offset % kAlign == 0 &&
-           offset + wire_len <= (1ull << 32);
+           wire_len <= kEntryMaxBytes && offset == 0;
 }
 
 constexpr bool IsValidObjectSize(uint64_t object_size) {
@@ -2419,11 +2361,11 @@ kv::CacheKey AsuKeyCodec::ToCacheKey(uint64_t key_id) {
 
 **职责**
 
-负责每个 chunk 前 512B 自描述头的逐字节编码、解码与字段交叉校验，以及 header CRC-32C 与 payload CRC-32C 的覆盖范围定义。本 shard 是纯函数，不持有缓冲区、不做 I/O、不做重试；「CRC 覆盖哪一段」由调用方（3.6）按本节规则执行。CRC 实现复用 `mooncake-store/include/crc32c.h` 的 `Crc32c`/`Crc32cValue`（`crc32c.h:122-142`）。
+负责每条 entry 前 512B 自描述头的逐字节编码、解码与字段交叉校验，以及 header CRC-32C 与 payload CRC-32C 的覆盖范围定义。本 shard 是纯函数，不持有缓冲区、不做 I/O、不做重试；「CRC 覆盖哪一段」由调用方（3.6）按本节规则执行。CRC 实现复用 `mooncake-store/include/crc32c.h` 的 `Crc32c`/`Crc32cValue`（`crc32c.h:122-142`）。
 
 **设计说明**
 
-每个 chunk 在 ASU 上占一段连续地址：`[ChunkOffset(i), ChunkOffset(i) + wire_len_i)`。前 512B 是 header，紧接着是 `data_len_i` 字节 payload，再零填充到 `align_up(data_len_i, 512)`。因此 **payload 起始 offset 恒为 `chunk_offset + 512`**，且整个记录长度恒为 512 的整数倍。
+每条 entry 在 ASU 上占一段连续地址：`[0, wire_len)`。前 512B 是 header，紧接着是 `data_len` 字节 payload，再零填充到 `align_up(data_len, 512)`。取消分块后 `offset` 恒为 0，**payload 起始 offset 恒为 512**，且整个记录长度恒为 512 的整数倍。
 
 全小端，逐字段 `memcpy`/显式移位，禁止 `sizeof(AsuRecordHeader)` 直接落盘。
 
@@ -2439,20 +2381,18 @@ kv::CacheKey AsuKeyCodec::ToCacheKey(uint64_t key_id) {
 | 24 | 8 | `key_fingerprint` | 64-bit key 碰撞检测 | 是 |
 | 32 | 8 | `object_epoch` | 写世代号，拒绝上一世代记录 | 是 |
 | 40 | 8 | `object_size` | 对象逻辑字节数，长度自描述与交叉校验 | 是 |
-| 48 | 4 | `chunk_index` | 本 chunk 序号 i，防错位 | 是 |
-| 52 | 4 | `chunk_count` | 对象 chunk 总数 N，防旧记录残留块 | 是 |
-| 56 | 4 | `data_offset` | 恒为 `i * kChunkStrideBytes`，防写错 offset | 是 |
-| 60 | 4 | `data_len` | 本 chunk 未填充的真实字节数 | 是 |
-| 64 | 4 | `data_crc32c` | 覆盖前 `data_len` 字节，不含零填充 | 是 |
-| 68 | 4 | `chunk_payload` | 恒为 16,776,192，常量漂移检测 | 是 |
-| 72 | 8 | `replica_id` | 仅诊断与 Master 日志对账 | 否 |
-| 80 | 432 | `reserved` | 全 0 | 否 |
+| 48 | 4 | `data_offset` | **恒为 0**（取消分块），防写错 offset | 是 |
+| 52 | 4 | `data_len` | 本 entry 的真实字节数，恒等于 `object_size` | 是 |
+| 56 | 4 | `data_crc32c` | 覆盖前 `data_len` 字节，不含零填充 | 是 |
+| 60 | 4 | `reserved32` | 固定 0 | 否 |
+| 64 | 8 | `replica_id` | 仅诊断与 Master 日志对账 | 否 |
+| 72 | 440 | `reserved` | 全 0 | 否 |
 
-合计 80 + 432 = 512。payload CRC 只覆盖真实数据字节，零填充不参与。CRC 必须**按地址序**对内存块一次性计算；读侧同样按地址序校验，避免写侧按 slice 顺序增量拼出与读侧不一致的值。
+合计 72 + 440 = 512。payload CRC 只覆盖真实数据字节，零填充不参与。CRC 必须**按地址序**对内存块一次性计算；读侧同样按地址序校验。
 
-解码顺序（任一失败即返回错误，不返回部分数据）：`magic` → `version`/`header_bytes` → `header_crc32c` → `flags` 未知位 → `key_id` → `key_fingerprint` → `object_epoch` → `object_size`/`chunk_index`/`chunk_count`/`data_offset`/`chunk_payload` → `data_len` 与期望一致。payload CRC 由 3.6 在拷贝前单独校验。
+解码顺序（任一失败即返回错误，不返回部分数据）：`magic` → `version`/`header_bytes` → `header_crc32c` → `flags` 未知位 → `key_id` → `key_fingerprint` → `object_epoch` → `object_size`/`data_offset==0`/`data_len==object_size`/`data_crc32c`。payload CRC 由 3.6 在拷贝前单独校验。
 
-> **[v2.0 变更]** 记录头布局、字段语义、双 CRC 与 `data_len` 交叉校验全部不变，不需要新增 `write_stage`/`commit` 字段：提交点由「chunk0 最后写」表达（3.6），状态由 Master 的 `ReplicaStatus` 表达（3.9）。v2 只确认 payload CRC-32C 在全部公开读路径上都必须校验（全对象读使 `need == data_len` 恒成立），v1.0 的「截断读跳过 payload CRC」分支作废。
+> **[v2.3 变更]** 删除 `chunk_index`、`chunk_count`、`chunk_payload`；`data_offset` 固定 0，`data_len` 恒等于 `object_size`。记录头布局、双 CRC 与交叉校验其余不变；payload CRC-32C 在全部公开读路径上都必须校验。
 
 **必要代码**
 
@@ -2482,26 +2422,23 @@ struct AsuRecordHeader {
     uint64_t key_fingerprint{0};
     uint64_t object_epoch{0};
     uint64_t object_size{0};
-    uint32_t chunk_index{0};
-    uint32_t chunk_count{0};
-    uint32_t data_offset{0};
-    uint32_t data_len{0};
+    uint32_t data_offset{0};  // always 0 (one object = one entry)
+    uint32_t data_len{0};     // always == object_size
     uint32_t data_crc32c{0};
-    uint32_t chunk_payload{0};
+    uint32_t reserved32{0};
     uint64_t replica_id{0};
-    uint8_t reserved[432]{};
+    uint8_t reserved[440]{};
 };
 static_assert(sizeof(AsuRecordHeader) == 512);
 
 class AsuRecordCodec final {
    public:
     static void Encode(AsuRecordHeader& header, const AsuDescriptor& descriptor,
-                       uint32_t chunk_index, uint32_t data_len,
-                       uint32_t data_crc32c, ReplicaID replica_id);
+                       uint32_t data_len, uint32_t data_crc32c,
+                       ReplicaID replica_id);
 
     static tl::expected<AsuRecordHeader, ErrorCode> DecodeAndValidate(
-        std::span<const std::byte, 512> raw, const AsuDescriptor& expected,
-        uint32_t chunk_index);
+        std::span<const std::byte, 512> raw, const AsuDescriptor& expected);
 };
 
 }  // namespace mooncake::asu
@@ -2532,13 +2469,10 @@ constexpr size_t kKeyIdOff = 16;
 constexpr size_t kFingerprintOff = 24;
 constexpr size_t kEpochOff = 32;
 constexpr size_t kObjectSizeOff = 40;
-constexpr size_t kChunkIndexOff = 48;
-constexpr size_t kChunkCountOff = 52;
-constexpr size_t kDataOffsetOff = 56;
-constexpr size_t kDataLenOff = 60;
-constexpr size_t kDataCrcOff = 64;
-constexpr size_t kChunkPayloadOff = 68;
-constexpr size_t kReplicaIdOff = 72;
+constexpr size_t kDataOffsetOff = 48;
+constexpr size_t kDataLenOff = 52;
+constexpr size_t kDataCrcOff = 56;
+constexpr size_t kReplicaIdOff = 64;
 
 constexpr uint16_t kFlagHasPayloadCrc = 1u << 0;
 
@@ -2546,8 +2480,8 @@ constexpr uint16_t kFlagHasPayloadCrc = 1u << 0;
 
 void AsuRecordCodec::Encode(AsuRecordHeader& header,
                             const AsuDescriptor& descriptor,
-                            uint32_t chunk_index, uint32_t data_len,
-                            uint32_t data_crc32c, ReplicaID replica_id) {
+                            uint32_t data_len, uint32_t data_crc32c,
+                            ReplicaID replica_id) {
     auto* raw = reinterpret_cast<std::byte*>(&header);
     std::memset(raw, 0, kHeaderBytes);
 
@@ -2559,13 +2493,9 @@ void AsuRecordCodec::Encode(AsuRecordHeader& header,
     StoreLE64(raw + kFingerprintOff, descriptor.key_fingerprint);
     StoreLE64(raw + kEpochOff, descriptor.object_epoch);
     StoreLE64(raw + kObjectSizeOff, descriptor.object_size);
-    StoreLE32(raw + kChunkIndexOff, chunk_index);
-    StoreLE32(raw + kChunkCountOff, descriptor.chunk_count);
-    StoreLE32(raw + kDataOffsetOff,
-              static_cast<uint32_t>(ChunkOffset(chunk_index)));
+    StoreLE32(raw + kDataOffsetOff, 0);  // one object = one entry
     StoreLE32(raw + kDataLenOff, data_len);
     StoreLE32(raw + kDataCrcOff, data_crc32c);
-    StoreLE32(raw + kChunkPayloadOff, descriptor.chunk_payload);
     StoreLE64(raw + kReplicaIdOff, static_cast<uint64_t>(replica_id));
 
     // header_crc32c: 覆盖 0..512，计算时本字段为 0。
@@ -2574,8 +2504,7 @@ void AsuRecordCodec::Encode(AsuRecordHeader& header,
 }
 
 tl::expected<AsuRecordHeader, ErrorCode> AsuRecordCodec::DecodeAndValidate(
-    std::span<const std::byte, 512> raw, const AsuDescriptor& expected,
-    uint32_t chunk_index) {
+    std::span<const std::byte, 512> raw, const AsuDescriptor& expected) {
     if (LoadLE32(raw.data() + kMagicOff) != kMagic) {
         return tl::make_unexpected(ErrorCode::ASU_RECORD_CORRUPT);
     }
@@ -2608,25 +2537,13 @@ tl::expected<AsuRecordHeader, ErrorCode> AsuRecordCodec::DecodeAndValidate(
     if (LoadLE64(raw.data() + kObjectSizeOff) != expected.object_size) {
         return tl::make_unexpected(ErrorCode::ASU_RECORD_CORRUPT);
     }
-    if (LoadLE32(raw.data() + kChunkIndexOff) != chunk_index) {
+    if (LoadLE32(raw.data() + kDataOffsetOff) != 0) {
         return tl::make_unexpected(ErrorCode::ASU_RECORD_CORRUPT);
     }
-    if (LoadLE32(raw.data() + kChunkCountOff) != expected.chunk_count) {
+    if (LoadLE32(raw.data() + kDataLenOff) != expected.object_size) {
         return tl::make_unexpected(ErrorCode::ASU_RECORD_CORRUPT);
     }
-    if (LoadLE32(raw.data() + kDataOffsetOff) !=
-        static_cast<uint32_t>(ChunkOffset(chunk_index))) {
-        return tl::make_unexpected(ErrorCode::ASU_RECORD_CORRUPT);
-    }
-    if (LoadLE32(raw.data() + kChunkPayloadOff) != kChunkPayloadBytes ||
-        expected.chunk_payload != kChunkPayloadBytes) {
-        return tl::make_unexpected(ErrorCode::ASU_RECORD_CORRUPT);
-    }
-    if (LoadLE32(raw.data() + kDataLenOff) !=
-        ChunkDataLen(expected.object_size, chunk_index)) {
-        return tl::make_unexpected(ErrorCode::ASU_RECORD_CORRUPT);
-    }
-
+    // data_crc32c is validated by the caller against the payload bytes.
     AsuRecordHeader header;
     std::memcpy(&header, raw.data(), kHeaderBytes);
     return header;
@@ -2635,24 +2552,24 @@ tl::expected<AsuRecordHeader, ErrorCode> AsuRecordCodec::DecodeAndValidate(
 }  // namespace mooncake::asu
 ```
 
-> 说明：`AsuDescriptor` 含 `uint64_t object_epoch`，共 **48B**（见 §3.9）。记录头必须写入并校验承重的 `object_epoch`，而 `AsuStorageBackend` 只能从 descriptor 拿到 epoch；`key_id` 已经通过 `canonical` 承诺了 epoch，但为了让记录头能独立 fail-stop 与排障，显式携带更稳妥。
+> 说明：`AsuDescriptor` 含 `uint64_t object_epoch`，共 **40B**（见 §3.9）。记录头必须写入并校验承重的 `object_epoch`，而 `AsuStorageBackend` 只能从 descriptor 拿到 epoch；`key_id` 已经通过 `canonical` 承诺了 epoch，但为了让记录头能独立 fail-stop 与排障，显式携带更稳妥。
 
 ### 3.4 asu_staging_arena（已注册 staging 池）
 
 **职责**
 
-提供一块 512B 对齐、在 Init 时一次性 `RegisterRegions` 的常驻 pinned host 缓冲区，按 slot 出租给 3.6 做 D2H/H2D 中转。负责 slot 的分配、释放、超时隔离与可用性上报；**不负责** ASU 提交、不负责错误映射、**不复用** `PinnedBufferPool` 或 `FileStorage` 的任何成员。上游是 `AsuStorageBackend`，下游是 `IAsuKvClient::Register`。
+提供一块 512B 对齐、在 Init 时一次性 `RegisterRegions` 的常驻 pinned host 缓冲区，按 slot 出租给 3.6 做 D2H/H2D 中转。负责 slot 的分配、释放、超时隔离与可用性上报；**不负责** ASU 提交、不负责错误映射、**不复用** `PinnedBufferPool` 或 `FileStorage` 的任何成员。上游是 `AsuStorageBackend`，下游是 `AsuKvClientInterface::Register`。
 
 **设计说明**
 
 为什么需要 staging：`KVBuffer.buffer.region.addr` 必须是已注册的 buffer address，而 Mooncake 的 `Slice` 可能来自任意用户内存（device 或 host）。先把对象字节按 512B 对齐拷入 arena，再让 SDK 从 arena 读写，可以把「注册」与「业务内存布局」解耦，也天然满足「CRC 按地址序计算」的要求。
 
-- 全部 slot 大小相同（`slot_bytes = kChunkStrideBytes`），一次注册整个 arena 为一个 region，所有 slot 共享同一个 `MRHandle`。`RegisteredMemory` 的三个字段归属是：`region` 是注册时的原样回显（仅诊断）、`handle` 是 entry 唯一可用的凭证、`tokenId` 是设备侧凭证编号（UB `tokenValue` 或 RDMA `rkey`），**只用于日志对账，不进入 `KVBuffer`，也不得与 `handle` 混用**。SDK 把 `HOST` 与 `HOST_PINNED` 都折叠成 `MEM_HOST`（kv_client_impl.cc:350-354），`deviceId` / `numaNode` 不参与注册，因此 `-1/-1` 是惰性字段、没有任何 NUMA 亲和效果。
+- 全部 slot 大小相同（`slot_bytes = kEntryMaxBytes`，即单 entry 上限 16,776,704 B），一次注册整个 arena 为一个 region，所有 slot 共享同一个 `MRHandle`。`RegisteredMemory` 的三个字段归属是：`region` 是注册时的原样回显（仅诊断）、`handle` 是 entry 唯一可用的凭证、`tokenId` 是设备侧凭证编号（UB `tokenValue` 或 RDMA `rkey`），**只用于日志对账，不进入 `KVBuffer`，也不得与 `handle` 混用**。SDK 把 `HOST` 与 `HOST_PINNED` 都折叠成 `MEM_HOST`（kv_client_impl.cc:350-354），`deviceId` / `numaNode` 不参与注册，因此 `-1/-1` 是惰性字段、没有任何 NUMA 亲和效果。
 - `Acquire` 分两种模式：`kWait`（数据面默认）在 slot 被瞬时占满时在 condition_variable 上等待，超时返回 `BUFFER_OVERFLOW`；`kFailFast`（读选择器等控制面）在没有任何空闲 slot 时立即返回 `ASU_SERVICE_UNAVAILABLE`。**唯一不等待的不可恢复条件是「全部 slot 都已 quarantine」**：此时任何模式都立即返回 `ASU_SERVICE_UNAVAILABLE`。把「瞬时占满」与「永久隔离」分开是要求 2 的前提——默认 `staging_slots=8` 时，一个含 9 个对象的 BatchGet 不能因为前 8 个对象占满 slot 就让第 9 个失败。
 - `AcquireBatch(sizes)` 是数据面的原子预留：一次性等到 `sizes.size()` 个满足容量要求的空闲 slot 后全部置 `kInUse`，避免「逐个 Acquire 时持有部分 slot 再阻塞」造成的跨线程死锁（FMEA-50/要求 2）。
 - `Release` 仅对 `kInUse` 生效并归还 free 计数；`Quarantine` 把 slot 永久置为 `kQuarantined`，进程生命周期内绝不复用——这是 `Wait` 超时后设备侧 DMA 可能仍在飞时的唯一安全做法。被隔离的 slot 不计入 free。
 - `FreeSlots()` / `IsAvailable()` / `QuarantinedCount()` 对上层暴露可用性；`IsAvailable()` 的语义是「至少还有一个未被 quarantine 的 slot」，而不是「当前有空闲 slot」——后者会把瞬时繁忙误报成不可服务。`AsuClientRuntime::IsReady()` 纳入该判据，使读选择器只在 arena **永久**耗尽时改选其它副本。
-- **不显式 `UnregisterRegions`**：`IAsuKvClient` 接口只暴露 `Register`（见 3.5），与 `kv::KvClient` 的 `UnregisterRegions` 不对称；因此 arena 内存的释放必须在 client 析构之前、且所有 in-flight task 已经 `Wait` 完成之后。成员声明顺序保证 `arena_` 后声明先析构，`AsuStorageBackend` 在析构前先 `Shutdown` 排空。SDK 的 `Shutdown` 只用 `defaultWaitTimeoutMs`（默认 100ms）排空，超时后仍会继续注销（kv_client_impl.cc:187-240），不替我们兜底；因此 `AsuStorageBackend::Shutdown()` 必须断言 `arena_->InUseSlots() == 0`（不满足打 ERROR，不允许静默释放），这就是 `kv_client.h:58-59`「handles referenced by queued or in-flight tasks must remain registered」在本层的兑现方式。
+- **不显式 `UnregisterRegions`**：`AsuKvClientInterface` 接口只暴露 `Register`（见 3.5），与 `kv::KvClient` 的 `UnregisterRegions` 不对称；因此 arena 内存的释放必须在 client 析构之前、且所有 in-flight task 已经 `Wait` 完成之后。成员声明顺序保证 `arena_` 后声明先析构，`AsuStorageBackend` 在析构前先 `Shutdown` 排空。SDK 的 `Shutdown` 只用 `defaultWaitTimeoutMs`（默认 100ms）排空，超时后仍会继续注销（kv_client_impl.cc:187-240），不替我们兜底；因此 `AsuStorageBackend::Shutdown()` 必须断言 `arena_->InUseSlots() == 0`（不满足打 ERROR，不允许静默释放），这就是 `kv_client.h:58-59`「handles referenced by queued or in-flight tasks must remain registered」在本层的兑现方式。
 
 > **[v2.0 变更]** v1.0 的 slot 一旦超时被隔离，在进程生命周期内永不复用，且没有任何可用性上报：默认 `staging_slots=8`，读路径连续两次超时就会让该 client 的 ASU 读永久静默失败。v2 保留「隔离后不复用」，新增 `FreeSlots()`/`IsAvailable()`/`QuarantinedCount()`，并把「瞬时占满（等待）」与「全部隔离（fail-fast）」分开：只有后者才让 `IsReady()` 变假。`AcquireBatch` 保证一个读 task 的多个 entry 原子预留，配合 §3.6 的跨对象在飞上限，使默认 8 slot 能承载任意大小的 BatchGet（FMEA-50）。
 
@@ -2688,7 +2605,7 @@ class AsuStagingArena final {
     };
 
     static tl::expected<std::unique_ptr<AsuStagingArena>, ErrorCode> Create(
-        IAsuKvClient& client, size_t slot_bytes, size_t slot_count);
+        AsuKvClientInterface& client, size_t slot_bytes, size_t slot_count);
 
     ~AsuStagingArena();
     AsuStagingArena(const AsuStagingArena&) = delete;
@@ -2745,7 +2662,7 @@ constexpr auto kAcquireTimeout = std::chrono::milliseconds(30000);
 }  // namespace
 
 tl::expected<std::unique_ptr<AsuStagingArena>, ErrorCode>
-AsuStagingArena::Create(IAsuKvClient& client, size_t slot_bytes,
+AsuStagingArena::Create(AsuKvClientInterface& client, size_t slot_bytes,
                         size_t slot_count) {
     if (slot_count == 0 || slot_bytes == 0 || slot_bytes % kAlign != 0) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
@@ -2964,7 +2881,7 @@ ErrorCode PreflightSharedProvider(const std::string& config_path) {
 **注册规格**：一个 region、一个 `MRHandle`，`tokenId` 仅诊断。
 
 ```cpp
-const size_t slot_bytes = kChunkStrideBytes;        // 16,776,704
+const size_t slot_bytes = kEntryMaxBytes;            // 16,776,704
 const size_t total = slot_bytes * staging_slots;    // 默认 8 -> 134,213,632
 void* base = ::operator new(total, std::align_val_t{kAlign}, std::nothrow);
 if (base == nullptr) return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
@@ -2972,7 +2889,7 @@ const std::vector<kv::MemoryRegion> regions{kv::MemoryRegion{
     kv::MemoryType::HOST_PINNED, reinterpret_cast<uint64_t>(base),
     static_cast<uint64_t>(total), /*deviceId=*/-1, /*numaNode=*/-1}};
 std::vector<kv::RegisteredMemory> out;
-const auto st = client.Register(regions, out);  // IAsuKvClient&，返回 expected<void, ErrorCode>
+const auto st = client.Register(regions, out);  // AsuKvClientInterface&，返回 expected<void, ErrorCode>
 if (!st.has_value() || out.size() != regions.size() ||
     out.front().handle == kv::kInvalidMRHandle || out.front().tokenId == 0) {
     ::operator delete(base, std::align_val_t{kAlign});
@@ -3000,7 +2917,7 @@ if (!st.has_value() || out.size() != regions.size() ||
 
 **职责**
 
-把 `kv::KvClient` 的异步接口收敛成「同步等待 + 逐 entry 结果」的窄接口 `IAsuKvClient`，并集中处理四件容易出错的事：显式 `Wait` 超时、`Status`→`ErrorCode` 映射、`PARTIAL_FAILED` 不得早退、测试替身注入点。为支持 3.6 的「多对象分批 submit 再逐个 Wait」，本层额外暴露 `SubmitLoad`/`WaitTask` 一对，`BatchLoad` 退化为二者的同步包装。本 shard 不关心 chunk 语义、不解析记录头、不做任何重试策略（重试属于 3.6/3.8）。
+把 `kv::KvClient` 的异步接口收敛成「同步等待 + 逐 entry 结果」的窄接口 `AsuKvClientInterface`，并集中处理四件容易出错的事：显式 `Wait` 超时、`Status`→`ErrorCode` 映射、`PARTIAL_FAILED` 不得早退、测试替身注入点。为支持 3.6 的「多对象分批 submit 再逐个 Wait」，本层额外暴露 `SubmitLoad`/`WaitTask` 一对，`BatchLoad` 退化为二者的同步包装。本 shard 不关心对象字节语义、不解析记录头、不做任何重试策略（重试属于 3.6/3.8）。
 
 **设计说明**
 
@@ -3043,9 +2960,9 @@ struct AsuEntryResult {
     std::string message;
 };
 
-class IAsuKvClient {
+class AsuKvClientInterface {
    public:
-    virtual ~IAsuKvClient() = default;
+    virtual ~AsuKvClientInterface() = default;
 
     virtual tl::expected<void, ErrorCode> Init(const AsuConfig& config) = 0;
     virtual void Shutdown() = 0;
@@ -3073,7 +2990,7 @@ class IAsuKvClient {
         const std::vector<kv::CacheKey>& keys, uint64_t timeout_ms) = 0;
 };
 
-class AsuKvClientAdapter final : public IAsuKvClient {
+class AsuKvClientAdapter final : public AsuKvClientInterface {
    public:
     explicit AsuKvClientAdapter(std::unique_ptr<kv::KvClient> client)
         : client_(std::move(client)) {}
@@ -3263,7 +3180,7 @@ AsuKvClientAdapter::Delete(const std::vector<kv::CacheKey>& keys,
 }  // namespace mooncake::asu
 ```
 
-> 说明：`IAsuKvClient` 新增的 `SubmitLoad`/`WaitTask` 是 v2 为「多对象先提交再逐个等待」引入的；`BatchLoad` 保持同步签名以兼容 §2.1 类图与既有测试替身。§2.1 的 `IAsuKvClient` / `AsuKvClientAdapter` 类图已列出这两个方法。
+> 说明：`AsuKvClientInterface` 新增的 `SubmitLoad`/`WaitTask` 是 v2 为「多对象先提交再逐个等待」引入的；`BatchLoad` 保持同步签名以兼容 §2.1 类图与既有测试替身。§2.1 的 `AsuKvClientInterface` / `AsuKvClientAdapter` 类图已列出这两个方法。
 
 #### 3.5.1 Register 契约与 BuildEntry（entry 构建）
 
@@ -3292,8 +3209,7 @@ namespace mooncake::asu {
 // canonical handle is slot_handle; the slot stays owned by this entry until
 // the task carrying it has been Wait()-ed (kv_client.h:58-59).
 inline kv::KVBuffer BuildEntry(const AsuDescriptor& descriptor, void* slot_addr,
-                               kv::MRHandle slot_handle, uint32_t entry_len,
-                               uint32_t chunk_index) {
+                               kv::MRHandle slot_handle, uint32_t entry_len) {
     return kv::KVBuffer{
         AsuKeyCodec::ToCacheKey(descriptor.key_id),  // 8B; must not be all zero
         kv::Buffer{kv::MemoryRegion{
@@ -3302,7 +3218,7 @@ inline kv::KVBuffer BuildEntry(const AsuDescriptor& descriptor, void* slot_addr,
                        static_cast<std::uint64_t>(entry_len),  // entry length, not slot capacity
                        /*deviceId=*/-1, /*numaNode=*/-1},
                    slot_handle},  // canonical handle from RegisterRegions
-        static_cast<std::uint32_t>(ChunkOffset(chunk_index)),
+        /*offset=*/0,           // one object = one entry
         std::nullopt};  // mrKey MUST stay empty; SubmitAsync resolves it
 }
 
@@ -3319,7 +3235,7 @@ inline kv::KVBuffer BuildEntry(const AsuDescriptor& descriptor, void* slot_addr,
 | `buffer.region.size` | 调用方 | 写 = `wire_len`；读 = `read_len` | 是（`buffer_length` 与 `length`） | 精确等于本次 entry 长度，不是 slot 容量；SDK 先 `static_cast<uint32_t>`（sqe_request.cc:190、206、223、251） |
 | `buffer.region.deviceId` / `numaNode` | 调用方 | `-1` / `-1` | 否 | 惰性字段，无 NUMA 语义 |
 | `buffer.handle` | 调用方 | `slot->handle`（== `RegisteredMemory.handle` == `arena->Handle()`） | 否（只用于查 `tokenId`） | 精确等值；所有 slot 共享同一个 handle |
-| `offset` | 调用方 | `ChunkOffset(chunk_index)` | 是（`offset`） | ASU 侧 value 内偏移，512B 对齐且 < 2^32；不是本地内存偏移 |
+| `offset` | 调用方 | 恒 `0` | 是（`offset`） | 一个对象一条 entry；取消分块后不再有 ASU 侧 value 内偏移 |
 | `mrKey` | **`KvClient::SubmitAsync`** | `std::nullopt` | 是（`mr_key`） | 调用方传入的任何值都会被无条件 `reset()` 后按 handle 重查（kv_client_impl.cc:452-458） |
 
 三条硬约束：
@@ -3332,40 +3248,39 @@ inline kv::KVBuffer BuildEntry(const AsuDescriptor& descriptor, void* slot_addr,
 
 **职责**
 
-把「一个对象」翻译成「同一 ASU key 上的 N 个 512B 对齐记录」，并完成写（分块 + 两段提交）、批量读（分块 + 逐 entry 校验 + 回填）、查（物理探活）、删（按 key 删除）。Client 与 Master 共用同一个类：Client 用 `register_staging=true` 做数据面，Master 用 `register_staging=false` 做 delete-only。本 shard 不解析 Mooncake 元数据、不决定副本选择、不做重试循环（GC 重试在 3.8）。
+把「一个对象」翻译成「同一 ASU key 上的一条 512B 对齐 entry」，并完成批量写、批量读（逐 entry 校验 + 回填）、批量物理探活与批量按 key 删除。Client 与 Master 共用同一个类：Client 用 `register_staging=true` 做数据面，Master 用 `register_staging=false` 做 delete-only。本 shard 不解析 Mooncake 元数据、不决定副本选择、不做重试循环（GC 重试在 3.8）。
 
 **设计说明**
 
-写入：本类只提供 `WriteObject`，它是「有序写第二阶段」的执行体。是否调用由 3.10 的 `SubmitAsuWrites` 决定，门禁是主层（memory/nof）已全部成功；本类不读回 memory，也不感知 memory 副本，数据源就是调用方传入的 `slices`。
+写入：本类只提供 `BatchStoreObjects(span<const AsuStoreRequest>, trace_id)`，它是「有序写第二阶段」的执行体。是否调用由 3.10 的 `SubmitAsuWrites` 决定，门禁是主层（memory/nof）已全部成功；本类不读回 memory，也不感知 memory 副本，数据源就是调用方传入的 `slices`。
 
-1. 校验 `descriptor` 与 `object_size`：`chunk_count == ChunkCount(object_size)`、`chunk_payload == kChunkPayloadBytes`，否则 `ASU_DESCRIPTOR_INVALID`。
-2. 依次写 `chunk 1 .. N-1`（无特定顺序，但必须全部成功）。
-3. 最后单独写 `chunk 0`。**chunk 0 是提交标记**：读端只有读到合法 chunk 0 头才认为对象可能存在；半写对象即使被读到，也会因为 chunk 0 缺失或 header 不合法而 fail-stop。
-4. 任一步失败：整对象回滚只需删除该 key 一次（ASU 的删除粒度是 key，不是 offset），然后向上返回错误；上层按降级语义处理（见 3.10）。
-5. 默认部署 `chunk_count == 1`（3.1），此时「chunk1..N-1 为空、chunk0 单独提交」退化为一次 `BatchStore`，两段提交仍然成立但是单次调用。
+1. 每个请求校验 `descriptor` 与 `object_size`：`object_size > 0`、`object_size <= kMaxObjectBytes`、`slices` 总长 ≥ `object_size`，否则 `ASU_DESCRIPTOR_INVALID`/`INVALID_PARAMS`。
+2. 用 `PlanBatches` 按对象边界把本批对象切成若干 task（条数 ≤ `min(batch_max_entries, staging_slots)`，字节 ≤ `batch_max_bytes`）；每个对象只编码**一条** entry：`wire_len = WireLen(object_size)`、`offset = 0`。
+3. 每个 task 一次 `BatchStoreAsync` + 显式 `Wait`。提交前对该 task 内**每个 entry** 做逐条预检，把可预防的错误挡在提交之前。
+4. 提交后按 `entryStatus` **逐 entry** 映射回每个对象；task 级 `CANCELED`/超时表示本 task 内**全部对象**失败。失败对象 best-effort `BatchRemoveObjects` 清理，上层按 `require_asu` 处理。
+5. 绝不切开单个对象；多个对象可以合并进同一 task。
 
-落盘前的逐 entry 预检（缺一不可，否则 SDK 会把整批 `CANCELED`）：`IsValidEntry(wire_len, offset)`、`buffer.region.addr % 512 == 0`、`buffer.region.size == wire_len`（不是 slot 容量）、`key` 非全零、`buffer.region.memoryType == kv::MemoryType::HOST_PINNED`、`buffer.handle` **精确等于** `arena_->Handle()`（不是「非 0」——非 0 但未注册的 handle 在提交阶段不报错，要到 `Wait` 才以 `BUFFER_NOT_REGISTERED` 暴露，sqe_request.cc:45-55）、`mrKey` 必须为空。注意 `region.size` 在 SDK 内会先 `static_cast<uint32_t>`（`sqe_request.cc:190-193`、`:206-209`、`:223-226`、`:251-254`），所以本层必须自己禁止任何 ≥ 4 GiB 的 entry。
+落盘前的逐 entry 预检（缺一不可，否则 SDK 会把整批 `CANCELED`）：`IsValidEntry(wire_len, /*offset=*/0)`、`buffer.region.addr % 512 == 0`、`buffer.region.size == wire_len`（不是 slot 容量）、`key` 非全零、`buffer.region.memoryType == kv::MemoryType::HOST_PINNED`、`buffer.handle` **精确等于** `arena_->Handle()`（不是「非 0」——非 0 但未注册的 handle 在提交阶段不报错，要到 `Wait` 才以 `BUFFER_NOT_REGISTERED` 暴露，sqe_request.cc:45-55）、`mrKey` 必须为空。注意 `region.size` 在 SDK 内会先 `static_cast<uint32_t>`（`sqe_request.cc:190-193`、`:206-209`、`:223-226`、`:251-254`），所以本层必须自己禁止任何 ≥ 4 GiB 的 entry。
 
-entry 的构建位置固定为「`AcquireBatch` 成功之后、预检与提交之前」：写侧在 D2H 拷贝与 header 编码之后（`StoreChunks`），读侧在 slot 按 `read_len` 置零之后（`FillAndSubmitLoad`）。两处都调用 §3.5.1 的 `BuildEntry`，字段来源只有 descriptor 与 arena slot，禁止调用方自行拼装 `kv::KVBuffer`。
+entry 的构建位置固定为「`AcquireBatch` 成功之后、预检与提交之前」：写侧在 D2H 拷贝与 header 编码之后，读侧在 slot 按 `read_len` 置零之后。两处都调用 §3.5.1 的 `BuildEntry`，字段来源只有 descriptor 与 arena slot，禁止调用方自行拼装 `kv::KVBuffer`。
 
-批量与流控：SDK 只有 BATCH 系列会按 `batchStoreIoNum`/`batchLoadIoNum`（均 110，`kv_types.h:196-197`）切子批，`LOAD`/`STORE` 恒为 1 条（`io_scheduler.cc:80-90`）；`maxInflightBytes` 只解析不生效（`trans_config_utils.cc:145-146`），必须自己按字节限流。因此每个 task 同时受 `min(kBatchMaxEntries, staging_slots)` 条与 `batch_max_bytes`（默认 64 MiB）字节约束，且一个 task 的全部 entry 必须用 `AcquireBatch` 原子预留；多对象读的在飞 slot 总数另受 `staging_slots` 约束（§3.6 ReadObjectsImpl）。
+批量与流控：SDK 只有 BATCH 系列会按 `batchStoreIoNum`/`batchLoadIoNum`（均 110，`kv_types.h:196-197`）切子批，`LOAD`/`STORE` 恒为 1 条（`io_scheduler.cc:80-90`）；`maxInflightBytes` 只解析不生效（`trans_config_utils.cc:145-146`），必须自己按字节限流。因此每个 task 同时受 `min(kBatchMaxEntries, staging_slots)` 条与 `batch_max_bytes`（默认 64 MiB）字节约束，且一个 task 的全部 entry 必须用 `AcquireBatch` 原子预留。
 
-读取（v2 新增批量入口）：
+读取（唯一批量入口）：
 
-- `ReadObjects(span<const AsuReadRequest>, trace_id)` 是主入口，`ReadObject` 退化为单元素包装。逐对象规划全部 chunk，默认**每对象一个 `BatchLoadAsync`**（该对象全部 chunk 在同一 task），多对象时先对所有对象 `SubmitLoad`、再逐个 `WaitTask`，与已提交的 RDMA future 并行。
-- 入口要求 `CalculateSliceSize(slices) >= descriptor.object_size`，否则该对象 `INVALID_PARAMS`。因此 `R == object_size`、`need_i == data_len_i`，payload CRC-32C 对每片都校验，不存在截断读跳过 CRC 的分支。
-- 逐 entry 预检同写入；`read_len_i = ChunkWireLen(need_i)`，`offset_i = ChunkOffset(i)`。
-- `PARTIAL_FAILED` 继续逐 entry 归因；只有 `TIMEOUT`/`NOT_FOUND`/`NOT_INITIALIZED`/`CONNECTION_ERROR`/`IO_ERROR` 这类 task 级错误才把本 task 内全部 entry 置同一错误。task 级超时后该 task 的全部 slot 进 quarantine。
-- 单个对象失败不影响同批其它对象；同一对象绝不按「部分 chunk 成功」返回成功。
-- 多 chunk 对象在 `batch_max_bytes` 约束下可能拆成多个 task。v2 明确：默认部署 `chunk_count == 1`，故「每对象一个 task」与「同一对象不拆 task」同时成立；多 chunk 路径在默认部署不可达（H14 已裁决不豁免，约 16 MiB 为正确上限，v2.1 见 §6.5），本节不宣称其单 task 语义（见 P-3）。
+- `BatchLoadObjects(span<const AsuReadRequest>, trace_id)` 是唯一入口；按同样的 `PlanBatches` 把多个对象合并进同一 `BatchLoadAsync`，逐 entry 归因回每个对象。没有单对象 `ReadObject` 分支。
+- 入口要求 `CalculateSliceSize(slices) >= descriptor.object_size`，否则该对象 `INVALID_PARAMS`。每个对象读一整条 entry：`read_len = WireLen(object_size)`、`offset = 0`，payload CRC-32C 永远全量校验。
+- 逐 entry 预检同写入。
+- `PARTIAL_FAILED` 继续逐 entry 归因；task 级 `TIMEOUT`/`NOT_FOUND`/`NOT_INITIALIZED`/`CONNECTION_ERROR`/`IO_ERROR`/`CANCELED` 才把本 task 内全部 entry 置同一错误。task 级超时后该 task 的全部 slot 进 quarantine。
+- 单个对象失败不影响其它 task 的对象；**同一 task 内的对象在 task 级错误下一起失败**，这是明确语义，不能靠「只让坏的那条失败」（SDK 不支持）。
 
 超时：`Wait` 必须显式传超时。本层用 `EstimateTimeoutMs(bytes) = cfg_.wait_base_ms + bytes / 1 MiB` 的保守估算。任务级超时返回后整个批次的所有 slot 全部 `Quarantine`（设备侧 DMA 可能仍在飞），并按 `TRANSFER_FAIL` 上抛。
 
-线程模型：`WriteObject`/`ReadObjects`/`ReadObject`/`QueryObject`/`DeleteObject`/`DeleteObjects` 可被多个 Put/Get/GC 线程并发调用；`IAsuKvClient` 与 `Arena` 内部各自同步；本类除 `arena_`/`client_` 外无可变状态。
+线程模型：`BatchStoreObjects`/`BatchLoadObjects`/`BatchIsExist`/`BatchRemoveObjects` 可被多个 Put/Get/GC 线程并发调用；`AsuKvClientInterface` 与 `Arena` 内部各自同步；本类除 `arena_`/`client_` 外无可变状态。
 
-一个容易忽略的语义：`DeleteObject` 只使用 `key_id`；ASU 的 `DeleteAsync` 以 key 为单位，删除的是该对象全部 chunk 的记录（该前提由 H15 真机确认，未确认前不得写成 O(1)）。分块只是为了绕开单 entry 上限与 offset 寻址，不改变删除粒度。
+一个容易忽略的语义：`BatchRemoveObjects` 只使用 `key_id`；ASU 的 `DeleteAsync` 以 key 为单位。取消分块后一个对象只有一条 entry，不存在按 offset 展开的删除。
 
-> **[v2.0 变更]** 写路径结构不变，语义从「与 memory 并行的同步副本」改为「memory 全部成功后的第二阶段」，并明确失败后由上层走降级而非整 Put revoke。读路径从 `ReadObject` 单对象改写为 `ReadObjects` 批量入口 + `ReadObject` 包装，新增 `AsuReadRequest`/`AsuReadOutcome`；删除 v1.0 的前缀/截断读分支、`asu_partial_read_crc_skipped_total` 与「读请求可以小于存储长度」的叙事。
+> **[v2.3 变更]** 写路径从 `WriteObject` 单对象 + 两段 chunk 提交改为 `BatchStoreObjects` 跨对象合批、每对象一条 entry；读路径从 `ReadObjects`+`ReadObject` 改为唯一入口 `BatchLoadObjects`；删除从 `DeleteObject(s)` 改为 `BatchRemoveObjects`；新增 `AsuStoreRequest`，`AsuReadOutcome` 改名 `AsuReadResult` 并去掉 chunk 计数。前缀/截断读分支与 `asu_partial_read_crc_skipped_total` 保持废弃。
 
 **必要代码**
 
@@ -3390,22 +3305,27 @@ namespace mooncake::asu {
 
 struct AsuConfig;
 
+struct AsuStoreRequest {
+    std::string key;
+    AsuDescriptor descriptor;
+    std::span<const Slice> slices;
+};
+
 struct AsuReadRequest {
     std::string key;
     AsuDescriptor descriptor;
     std::span<const Slice> slices;
 };
 
-struct AsuReadOutcome {
+struct AsuReadResult {
     ErrorCode error{ErrorCode::OK};
     uint64_t bytes{0};
-    uint32_t chunks{0};
 };
 
 class AsuStorageBackend final {
    public:
     static tl::expected<std::unique_ptr<AsuStorageBackend>, ErrorCode> Create(
-        const AsuConfig& config, std::unique_ptr<IAsuKvClient> client,
+        const AsuConfig& config, std::unique_ptr<AsuKvClientInterface> client,
         bool register_staging);
 
     ~AsuStorageBackend();
@@ -3413,24 +3333,20 @@ class AsuStorageBackend final {
     AsuStorageBackend& operator=(const AsuStorageBackend&) = delete;
 
     // Ordered second write stage. Caller guarantees the primary tier already
-    // succeeded; this method never reads back memory.
-    tl::expected<void, ErrorCode> WriteObject(const AsuDescriptor& descriptor,
-                                              std::span<const Slice> slices,
-                                              uint64_t trace_id);
+    // succeeded; this method never reads back memory. Returns per-object status
+    // aligned with `requests`; a top-level error means the backend is unusable.
+    tl::expected<std::vector<ErrorCode>, ErrorCode> BatchStoreObjects(
+        std::span<const AsuStoreRequest> requests, uint64_t trace_id);
     // Batch read primary entry. Per-object errors are reported inside the
     // returned vector; only a non-serviceable backend is a top-level error.
-    tl::expected<std::vector<AsuReadOutcome>, ErrorCode> ReadObjects(
+    tl::expected<std::vector<AsuReadResult>, ErrorCode> BatchLoadObjects(
         std::span<const AsuReadRequest> requests, uint64_t trace_id);
-    // Single-object wrapper; equivalent to a one-element ReadObjects.
-    tl::expected<void, ErrorCode> ReadObject(const AsuDescriptor& descriptor,
-                                             std::span<const Slice> slices,
-                                             uint64_t trace_id);
-    tl::expected<bool, ErrorCode> QueryObject(const AsuDescriptor& descriptor,
-                                              uint64_t trace_id);
-    tl::expected<void, ErrorCode> DeleteObject(const AsuDescriptor& descriptor,
-                                               uint64_t trace_id);
-    // Used by AsuGcWorker: delete several objects, batching <= deleteIoNum keys.
-    tl::expected<void, ErrorCode> DeleteObjects(
+    // Physical existence per descriptor (diagnostics only).
+    tl::expected<std::vector<bool>, ErrorCode> BatchIsExist(
+        std::span<const AsuDescriptor> descriptors, uint64_t trace_id);
+    // Used by BatchRemoveAsuObjects / AsuGcWorker: delete several objects,
+    // batching <= deleteIoNum keys.
+    tl::expected<void, ErrorCode> BatchRemoveObjects(
         std::span<const AsuDescriptor> descriptors, uint64_t trace_id);
 
     bool IsReady() const;
@@ -3441,35 +3357,12 @@ class AsuStorageBackend final {
 
    private:
     AsuStorageBackend(const AsuConfig& config,
-                      std::unique_ptr<IAsuKvClient> client);
+                      std::unique_ptr<AsuKvClientInterface> client);
 
-    struct PlannedChunk {
-        uint32_t index{0};
-        uint32_t need{0};
-        uint32_t wire_len{0};
-        uint64_t offset{0};
-    };
-    struct LoadTaskPlan {
-        std::vector<PlannedChunk> chunks;
-        std::vector<AsuStagingArena::Slot*> slots;
-        std::vector<kv::KVBuffer> entries;
-        uint64_t bytes{0};
-        kv::TaskId handle{kv::kInvalidTaskId};
-    };
-
-    tl::expected<void, ErrorCode> StoreChunks(
-        const AsuDescriptor& descriptor, std::span<const Slice> slices,
-        std::span<const uint32_t> indices, uint64_t trace_id);
-    ErrorCode FillAndSubmitLoad(const AsuDescriptor& descriptor,
-                                std::span<const Slice> slices, uint64_t read_bytes,
-                                std::span<const uint32_t> indices,
-                                LoadTaskPlan& plan);
-    tl::expected<std::vector<AsuReadOutcome>, ErrorCode> ReadObjectsImpl(
-        std::span<const AsuReadRequest> requests, uint64_t trace_id);
     uint64_t EstimateTimeoutMs(uint64_t bytes) const;
 
     const AsuConfig cfg_;
-    std::unique_ptr<IAsuKvClient> client_;
+    std::unique_ptr<AsuKvClientInterface> client_;
     std::unique_ptr<AsuStagingArena> arena_;
     bool initialized_{false};
     bool register_staging_{false};
@@ -3575,16 +3468,14 @@ ErrorCode AsuEntryPrecheck(const kv::KVBuffer& e, uint32_t wire_len,
 
 bool IsValidDescriptor(const AsuDescriptor& d) {
     return d.key_id != 0 && d.object_size > 0 &&
-           d.chunk_payload == kChunkPayloadBytes &&
-           d.chunk_count == ChunkCount(d.object_size) &&
-           d.chunk_count <= kMaxChunks;
+           d.object_size <= kMaxObjectBytes;
 }
 
 }  // namespace
 
 tl::expected<std::unique_ptr<AsuStorageBackend>, ErrorCode>
 AsuStorageBackend::Create(const AsuConfig& config,
-                          std::unique_ptr<IAsuKvClient> client,
+                          std::unique_ptr<AsuKvClientInterface> client,
                           bool register_staging) {
     if (!config.Validate() || !client) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
@@ -3600,7 +3491,7 @@ AsuStorageBackend::Create(const AsuConfig& config,
             PreflightSharedProvider(config.client_config_path);
         if (preflight != ErrorCode::OK) return tl::make_unexpected(preflight);
         auto arena = AsuStagingArena::Create(*backend->client_,
-                                             kChunkStrideBytes,
+                                             kEntryMaxBytes,
                                              config.staging_slots);
         if (!arena.has_value()) return tl::make_unexpected(arena.error());
         backend->arena_ = std::move(arena.value());
@@ -3634,77 +3525,52 @@ uint64_t AsuStorageBackend::EstimateTimeoutMs(uint64_t bytes) const {
     return cfg_.wait_base_ms + bytes / (1ull << 20);
 }
 
-tl::expected<void, ErrorCode> AsuStorageBackend::WriteObject(
-    const AsuDescriptor& descriptor, std::span<const Slice> slices,
-    uint64_t trace_id) {
+tl::expected<std::vector<ErrorCode>, ErrorCode>
+AsuStorageBackend::BatchStoreObjects(
+    std::span<const AsuStoreRequest> requests, uint64_t trace_id) {
     if (!IsReady() || arena_ == nullptr) {
         return tl::make_unexpected(ErrorCode::ASU_SERVICE_UNAVAILABLE);
     }
-    if (!IsValidDescriptor(descriptor)) {
-        return tl::make_unexpected(ErrorCode::ASU_DESCRIPTOR_INVALID);
-    }
-    if (SliceBytes(slices) < descriptor.object_size) {
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-    }
-
-    const uint32_t chunk_count = descriptor.chunk_count;
-    std::vector<uint32_t> tail(chunk_count > 1 ? chunk_count - 1 : 0);
-    for (uint32_t i = 1; i < chunk_count; ++i) tail[i - 1] = i;
-
-    // 1) chunks 1..N-1
-    if (!tail.empty()) {
-        auto stored = StoreChunks(descriptor, slices, tail, trace_id);
-        if (!stored.has_value()) {
-            (void)DeleteObject(descriptor, trace_id);  // best-effort rollback
-            return stored;
+    std::vector<ErrorCode> status(requests.size(), ErrorCode::OK);
+    std::vector<uint64_t> sizes;
+    sizes.reserve(requests.size());
+    for (size_t i = 0; i < requests.size(); ++i) {
+        const auto& req = requests[i];
+        if (!IsValidDescriptor(req.descriptor)) {
+            status[i] = ErrorCode::ASU_DESCRIPTOR_INVALID;
+            sizes.push_back(0);
+            continue;
         }
+        if (SliceBytes(req.slices) < req.descriptor.object_size) {
+            status[i] = ErrorCode::INVALID_PARAMS;
+            sizes.push_back(0);
+            continue;
+        }
+        sizes.push_back(req.descriptor.object_size);
     }
-    // 2) chunk 0 is the commit marker, always its own final task
-    const std::vector<uint32_t> commit{0};
-    auto committed = StoreChunks(descriptor, slices, commit, trace_id);
-    if (!committed.has_value()) {
-        (void)DeleteObject(descriptor, trace_id);
-        return committed;
-    }
-    return {};
-}
 
-tl::expected<void, ErrorCode> AsuStorageBackend::StoreChunks(
-    const AsuDescriptor& descriptor, std::span<const Slice> slices,
-    std::span<const uint32_t> indices, uint64_t trace_id) {
+    // Pack by object boundary; a single object is never split.
     const size_t max_entries =
         std::min<size_t>(cfg_.batch_max_entries, cfg_.staging_slots);
-    size_t cursor = 0;
-    while (cursor < indices.size()) {
-        // Plan the batch first (holding no slots), then reserve all slots
-        // atomically. Acquiring one by one and blocking on the next entry can
-        // deadlock against another writer/reader holding the remaining slots.
-        std::vector<uint32_t> batch;
+    const auto batches = PlanBatches(sizes, max_entries, cfg_.batch_max_bytes);
+    for (const auto& batch : batches) {
+        std::vector<size_t> indices;
         std::vector<size_t> wire_lens;
         uint64_t batch_bytes = 0;
-        ErrorCode error = ErrorCode::OK;
-        while (cursor < indices.size()) {
-            const uint32_t index = indices[cursor];
-            const uint32_t data_len =
-                ChunkDataLen(descriptor.object_size, index);
-            const uint32_t wire_len = ChunkWireLen(data_len);
-            const uint64_t offset = ChunkOffset(index);
-            if (!IsValidEntry(wire_len, offset)) {
-                error = ErrorCode::ASU_OBJECT_TOO_LARGE;
-                break;
+        for (size_t k = 0; k < batch.count; ++k) {
+            const size_t i = batch.begin + k;
+            if (status[i] != ErrorCode::OK) continue;
+            const uint32_t wire_len =
+                WireLen(requests[i].descriptor.object_size);
+            if (!IsValidEntry(wire_len, /*offset=*/0)) {
+                status[i] = ErrorCode::ASU_OBJECT_TOO_LARGE;
+                continue;
             }
-            if (!batch.empty() &&
-                (batch.size() >= max_entries ||
-                 batch_bytes + wire_len > cfg_.batch_max_bytes)) {
-                break;
-            }
-            batch.push_back(index);
+            indices.push_back(i);
             wire_lens.push_back(wire_len);
             batch_bytes += wire_len;
-            ++cursor;
         }
-        if (error != ErrorCode::OK) return tl::make_unexpected(error);
-        if (batch.empty()) return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+        if (indices.empty()) continue;
 
         auto slots_result = arena_->AcquireBatch(wire_lens, trace_id);
         if (!slots_result.has_value()) {
@@ -3712,36 +3578,40 @@ tl::expected<void, ErrorCode> AsuStorageBackend::StoreChunks(
         }
         std::vector<AsuStagingArena::Slot*>& slots = *slots_result;
         std::vector<kv::KVBuffer> entries;
-        entries.reserve(batch.size());
-        for (size_t k = 0; k < batch.size(); ++k) {
-            const uint32_t index = batch[k];
+        entries.reserve(indices.size());
+        ErrorCode precheck = ErrorCode::OK;
+        for (size_t k = 0; k < indices.size(); ++k) {
+            const size_t i = indices[k];
+            const auto& req = requests[i];
             const uint32_t wire_len = static_cast<uint32_t>(wire_lens[k]);
-            const uint32_t data_len =
-                ChunkDataLen(descriptor.object_size, index);
-            const uint64_t offset = ChunkOffset(index);
             auto* slot = slots[k];
             auto* dst = static_cast<std::byte*>(slot->addr);
-            CopyFromSlices(slices,
-                           static_cast<uint64_t>(index) * kChunkPayloadBytes,
-                           dst + kHeaderBytes, data_len);
-            std::memset(dst + kHeaderBytes + data_len, 0,
-                        wire_len - kHeaderBytes - data_len);
-            const uint32_t data_crc = Crc32cValue(dst + kHeaderBytes, data_len);
+            CopyFromSlices(req.slices, 0, dst + kHeaderBytes,
+                           static_cast<size_t>(req.descriptor.object_size));
+            std::memset(dst + kHeaderBytes + req.descriptor.object_size, 0,
+                        wire_len - kHeaderBytes - req.descriptor.object_size);
+            const uint32_t data_crc =
+                Crc32cValue(dst + kHeaderBytes, req.descriptor.object_size);
             AsuRecordCodec::Encode(*reinterpret_cast<AsuRecordHeader*>(dst),
-                                   descriptor, index, data_len, data_crc,
-                                   static_cast<ReplicaID>(0));
-            entries.push_back(BuildEntry(descriptor, dst, slot->handle,
-                                         wire_len, index));
-            const ErrorCode precheck = AsuEntryPrecheck(
-                entries.back(), wire_len, offset, arena_->Handle());
-            if (precheck != ErrorCode::OK) {
-                for (auto* acquired : slots) arena_->Release(acquired);
-                return tl::make_unexpected(precheck);
-            }
+                                   req.descriptor,
+                                   static_cast<uint32_t>(req.descriptor.object_size),
+                                   data_crc, static_cast<ReplicaID>(0));
+            entries.push_back(
+                BuildEntry(req.descriptor, dst, slot->handle, wire_len));
+            precheck = AsuEntryPrecheck(entries.back(), wire_len, 0,
+                                        arena_->Handle());
+            if (precheck != ErrorCode::OK) break;
+        }
+        if (precheck != ErrorCode::OK) {
+            for (auto* acquired : slots) arena_->Release(acquired);
+            for (size_t i : indices) status[i] = precheck;
+            continue;
         }
         auto results =
             client_->BatchStore(entries, EstimateTimeoutMs(batch_bytes));
         if (!results.has_value()) {
+            // Task-level failure (CANCELED / TIMEOUT / IO): every object in
+            // this task fails. SDK cannot fail just one entry.
             const bool uncertain = results.error() == ErrorCode::RPC_TIMEOUT;
             for (auto* slot : slots) {
                 if (uncertain) {
@@ -3750,294 +3620,196 @@ tl::expected<void, ErrorCode> AsuStorageBackend::StoreChunks(
                     arena_->Release(slot);
                 }
             }
-            return tl::make_unexpected(results.error());
+            for (size_t i : indices) status[i] = results.error();
+            continue;
         }
         if (results->size() != entries.size()) {
             for (auto* slot : slots) arena_->Release(slot);
-            return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+            for (size_t i : indices) status[i] = ErrorCode::INTERNAL_ERROR;
+            continue;
         }
-        for (size_t i = 0; i < results->size(); ++i) {
+        std::vector<AsuDescriptor> failed;
+        for (size_t k = 0; k < results->size(); ++k) {
             const ErrorCode mapped =
-                MapEntryStatus((*results)[i].code, /*is_load=*/false);
-            if (mapped != ErrorCode::OK) {
-                for (auto* slot : slots) arena_->Release(slot);
-                return tl::make_unexpected(mapped);
-            }
+                MapEntryStatus((*results)[k].code, /*is_load=*/false);
+            status[indices[k]] = mapped;
+            if (mapped != ErrorCode::OK) failed.push_back(requests[indices[k]].descriptor);
         }
         for (auto* slot : slots) arena_->Release(slot);
+        if (!failed.empty()) {
+            (void)BatchRemoveObjects(failed, trace_id);  // best-effort cleanup
+        }
     }
-    return {};
+    return status;
 }
 
-tl::expected<std::vector<AsuReadOutcome>, ErrorCode>
-AsuStorageBackend::ReadObjects(std::span<const AsuReadRequest> requests,
-                               uint64_t trace_id) {
+tl::expected<std::vector<AsuReadResult>, ErrorCode>
+AsuStorageBackend::BatchLoadObjects(
+    std::span<const AsuReadRequest> requests, uint64_t trace_id) {
     if (!IsReady() || arena_ == nullptr) {
         return tl::make_unexpected(ErrorCode::ASU_SERVICE_UNAVAILABLE);
     }
-    return ReadObjectsImpl(requests, trace_id);
-}
-
-tl::expected<void, ErrorCode> AsuStorageBackend::ReadObject(
-    const AsuDescriptor& descriptor, std::span<const Slice> slices,
-    uint64_t trace_id) {
-    const AsuReadRequest request{std::string{}, descriptor, slices};
-    auto outcomes = ReadObjects(std::span<const AsuReadRequest>(&request, 1),
-                                trace_id);
-    if (!outcomes.has_value()) return tl::make_unexpected(outcomes.error());
-    if (outcomes->size() != 1) {
-        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
-    }
-    return (*outcomes)[0].error == ErrorCode::OK
-               ? tl::expected<void, ErrorCode>{}
-               : tl::make_unexpected((*outcomes)[0].error);
-}
-
-// Plan and submit one task of `indices`; fills plan.slots/entries/handle.
-ErrorCode AsuStorageBackend::FillAndSubmitLoad(
-    const AsuDescriptor& descriptor, std::span<const Slice> slices,
-    uint64_t read_bytes, std::span<const uint32_t> indices,
-    LoadTaskPlan& plan) {
-    // Validate and collect sizes first so the whole set can be reserved
-    // atomically; partial holds would deadlock against a concurrent reader.
-    std::vector<size_t> sizes;
-    sizes.reserve(indices.size());
-    for (uint32_t index : indices) {
-        const uint32_t need = ChunkDataLen(read_bytes, index);
-        const uint32_t read_len = ChunkWireLen(need);
-        if (!IsValidEntry(read_len, ChunkOffset(index))) {
-            return ErrorCode::ASU_OBJECT_TOO_LARGE;
-        }
-        sizes.push_back(read_len);
-    }
-    auto slots_result = arena_->AcquireBatch(sizes, /*trace_id=*/0);
-    if (!slots_result.has_value()) return slots_result.error();
-    plan.slots = std::move(*slots_result);
-    for (size_t k = 0; k < indices.size(); ++k) {
-        const uint32_t index = indices[k];
-        const uint32_t need = ChunkDataLen(read_bytes, index);
-        const uint32_t read_len = static_cast<uint32_t>(sizes[k]);
-        const uint64_t offset = ChunkOffset(index);
-        auto* slot = plan.slots[k];
-        auto* dst = static_cast<std::byte*>(slot->addr);
-        std::memset(dst, 0, read_len);
-        plan.entries.push_back(BuildEntry(descriptor, dst, slot->handle,
-                                          read_len, index));
-        const ErrorCode precheck = AsuEntryPrecheck(
-            plan.entries.back(), read_len, offset, arena_->Handle());
-        if (precheck != ErrorCode::OK) {
-            for (auto* acquired : plan.slots) arena_->Release(acquired);
-            plan.slots.clear();
-            return precheck;
-        }
-        plan.chunks.push_back(PlannedChunk{index, need, read_len, offset});
-        plan.bytes += read_len;
-    }
-    auto handle = client_->SubmitLoad(plan.entries);
-    if (!handle.has_value()) {
-        for (auto* acquired : plan.slots) arena_->Release(acquired);
-        plan.slots.clear();
-        return handle.error();
-    }
-    plan.handle = *handle;
-    return ErrorCode::OK;
-}
-
-tl::expected<std::vector<AsuReadOutcome>, ErrorCode>
-AsuStorageBackend::ReadObjectsImpl(std::span<const AsuReadRequest> requests,
-                                   uint64_t trace_id) {
-    std::vector<AsuReadOutcome> outcomes(requests.size());
-    // Objects are submitted in input order; each object's tasks are waited
-    // either when the in-flight slot budget is exhausted (Phase 1) or at the
-    // end (Phase 2). The cap is what makes a BatchGet larger than
-    // `staging_slots` work under the default 8-slot arena.
-    struct PendingObject {
-        std::vector<LoadTaskPlan> tasks;
-        uint32_t chunks{0};
-        size_t slots{0};
-    };
-    std::vector<PendingObject> pending(requests.size());
-    std::deque<size_t> in_flight;
-    size_t in_flight_slots = 0;
-    const size_t max_entries =
-        std::min<size_t>(cfg_.batch_max_entries, cfg_.staging_slots);
-
-    // Wait every task of one object, decode, copy back and free its slots.
-    auto wait_and_decode = [&](size_t i) {
-        const auto& req = requests[i];
-        const uint64_t read_bytes = req.descriptor.object_size;
-        bool object_ok = true;
-        ErrorCode object_error = ErrorCode::OK;
-        for (auto& task : pending[i].tasks) {
-            auto result =
-                client_->WaitTask(task.handle, EstimateTimeoutMs(task.bytes));
-            if (!result.has_value()) {
-                const bool uncertain = result.error() == ErrorCode::RPC_TIMEOUT;
-                for (auto* slot : task.slots) {
-                    if (uncertain) {
-                        arena_->Quarantine(slot);
-                    } else {
-                        arena_->Release(slot);
-                    }
-                }
-                object_ok = false;
-                object_error = result.error();
-                continue;  // other tasks of this object must still be drained
-            }
-            if (result->entryStatus.size() != task.entries.size()) {
-                for (auto* slot : task.slots) arena_->Release(slot);
-                object_ok = false;
-                object_error = ErrorCode::INTERNAL_ERROR;
-                continue;
-            }
-            for (size_t e = 0; e < task.slots.size(); ++e) {
-                const ErrorCode mapped =
-                    MapEntryStatus(result->entryStatus[e].code,
-                                   /*is_load=*/true);
-                if (mapped != ErrorCode::OK) {
-                    object_ok = false;
-                    object_error = mapped;
-                    continue;
-                }
-                auto* raw = static_cast<std::byte*>(task.slots[e]->addr);
-                auto header = AsuRecordCodec::DecodeAndValidate(
-                    std::span<const std::byte, 512>(raw, 512), req.descriptor,
-                    task.chunks[e].index);
-                if (!header.has_value()) {
-                    object_ok = false;
-                    object_error = header.error();
-                    continue;
-                }
-                // Full-object read: need == header->data_len, so payload CRC
-                // is always verified.
-                if (header->data_len != task.chunks[e].need ||
-                    Crc32cValue(raw + kHeaderBytes, header->data_len) !=
-                        header->data_crc32c) {
-                    object_ok = false;
-                    object_error = ErrorCode::ASU_RECORD_CORRUPT;
-                    continue;
-                }
-                auto copied = CopyToSlices(
-                    req.slices,
-                    static_cast<uint64_t>(task.chunks[e].index) *
-                        kChunkPayloadBytes,
-                    raw + kHeaderBytes, header->data_len);
-                if (!copied.has_value()) {
-                    object_ok = false;
-                    object_error = copied.error();
-                }
-            }
-            for (auto* slot : task.slots) arena_->Release(slot);
-        }
-        in_flight_slots -= pending[i].slots;
-        pending[i].slots = 0;
-        pending[i].tasks.clear();
-        if (object_ok) {
-            outcomes[i].error = ErrorCode::OK;
-            outcomes[i].bytes = read_bytes;
-            outcomes[i].chunks = pending[i].chunks;
-        } else {
-            outcomes[i].error = object_error;
-        }
-    };
-
-    // ---- Phase 1: validate + submit ----
+    std::vector<AsuReadResult> results(requests.size());
+    std::vector<uint64_t> sizes;
+    std::vector<bool> valid(requests.size(), false);
+    sizes.reserve(requests.size());
     for (size_t i = 0; i < requests.size(); ++i) {
         const auto& req = requests[i];
-        auto& outcome = outcomes[i];
         if (!IsValidDescriptor(req.descriptor)) {
-            outcome.error = ErrorCode::ASU_DESCRIPTOR_INVALID;
+            results[i].error = ErrorCode::ASU_DESCRIPTOR_INVALID;
+            sizes.push_back(0);
             continue;
         }
         if (SliceBytes(req.slices) < req.descriptor.object_size) {
-            outcome.error = ErrorCode::INVALID_PARAMS;
+            results[i].error = ErrorCode::INVALID_PARAMS;
+            sizes.push_back(0);
             continue;
         }
-        const uint64_t read_bytes = req.descriptor.object_size;  // full object
-        const uint32_t m = ChunkCount(read_bytes);
-        std::vector<uint32_t> indices(m);
-        std::iota(indices.begin(), indices.end(), 0);
+        sizes.push_back(req.descriptor.object_size);
+        valid[i] = true;
+    }
 
-        size_t cursor = 0;
-        ErrorCode error = ErrorCode::OK;
-        while (cursor < indices.size()) {
-            LoadTaskPlan plan;
-            size_t take = 0;
-            uint64_t bytes = 0;
-            while (cursor + take < indices.size()) {
-                const uint32_t need =
-                    ChunkDataLen(read_bytes, indices[cursor + take]);
-                const uint32_t wire = ChunkWireLen(need);
-                if (take > 0 &&
-                    (take >= max_entries || bytes + wire > cfg_.batch_max_bytes)) {
-                    break;
+    const size_t max_entries =
+        std::min<size_t>(cfg_.batch_max_entries, cfg_.staging_slots);
+    const auto batches = PlanBatches(sizes, max_entries, cfg_.batch_max_bytes);
+    for (const auto& batch : batches) {
+        std::vector<size_t> indices;
+        std::vector<size_t> read_lens;
+        uint64_t bytes = 0;
+        for (size_t k = 0; k < batch.count; ++k) {
+            const size_t i = batch.begin + k;
+            if (!valid[i]) continue;
+            const uint32_t read_len =
+                WireLen(requests[i].descriptor.object_size);
+            if (!IsValidEntry(read_len, /*offset=*/0)) {
+                results[i].error = ErrorCode::ASU_OBJECT_TOO_LARGE;
+                continue;
+            }
+            indices.push_back(i);
+            read_lens.push_back(read_len);
+            bytes += read_len;
+        }
+        if (indices.empty()) continue;
+
+        auto slots_result = arena_->AcquireBatch(read_lens, trace_id);
+        if (!slots_result.has_value()) {
+            return tl::make_unexpected(slots_result.error());
+        }
+        std::vector<AsuStagingArena::Slot*>& slots = *slots_result;
+        std::vector<kv::KVBuffer> entries;
+        entries.reserve(indices.size());
+        ErrorCode precheck = ErrorCode::OK;
+        for (size_t k = 0; k < indices.size(); ++k) {
+            const auto& req = requests[indices[k]];
+            const uint32_t read_len = static_cast<uint32_t>(read_lens[k]);
+            auto* slot = slots[k];
+            auto* dst = static_cast<std::byte*>(slot->addr);
+            std::memset(dst, 0, read_len);
+            entries.push_back(
+                BuildEntry(req.descriptor, dst, slot->handle, read_len));
+            precheck =
+                AsuEntryPrecheck(entries.back(), read_len, 0, arena_->Handle());
+            if (precheck != ErrorCode::OK) break;
+        }
+        if (precheck != ErrorCode::OK) {
+            for (auto* acquired : slots) arena_->Release(acquired);
+            for (size_t i : indices) results[i].error = precheck;
+            continue;
+        }
+        auto task = client_->SubmitLoad(entries);
+        if (!task.has_value()) {
+            for (auto* slot : slots) arena_->Release(slot);
+            for (size_t i : indices) results[i].error = task.error();
+            continue;
+        }
+        auto waited = client_->WaitTask(*task, EstimateTimeoutMs(bytes));
+        if (!waited.has_value()) {
+            // Task-level failure: every object in this task fails.
+            const bool uncertain = waited.error() == ErrorCode::RPC_TIMEOUT;
+            for (auto* slot : slots) {
+                if (uncertain) {
+                    arena_->Quarantine(slot);
+                } else {
+                    arena_->Release(slot);
                 }
-                bytes += wire;
-                ++take;
             }
-            // Make room before the blocking batch reservation. Draining the
-            // oldest object keeps in_flight_slots + take <= staging_slots.
-            while (!in_flight.empty() &&
-                   in_flight_slots + take > cfg_.staging_slots) {
-                const size_t victim = in_flight.front();
-                in_flight.pop_front();
-                wait_and_decode(victim);
-            }
-            error = FillAndSubmitLoad(
-                req.descriptor, req.slices, read_bytes,
-                indices.subspan(cursor, take), plan);
-            if (error != ErrorCode::OK) break;
-            const size_t task_slots = plan.slots.size();
-            pending[i].tasks.push_back(std::move(plan));
-            pending[i].chunks += static_cast<uint32_t>(take);
-            pending[i].slots += task_slots;
-            in_flight_slots += task_slots;
-            cursor += take;
+            for (size_t i : indices) results[i].error = waited.error();
+            continue;
         }
-        if (error != ErrorCode::OK) {
-            outcome.error = error;
-            // Release/quarantine whatever was already submitted for this object;
-            // it is unusable as a whole.
-            for (auto& task : pending[i].tasks) {
-                (void)client_->WaitTask(task.handle,
-                                        EstimateTimeoutMs(task.bytes));
-                for (auto* slot : task.slots) arena_->Quarantine(slot);
-                in_flight_slots -= task.slots.size();
-            }
-            pending[i].tasks.clear();
-            pending[i].slots = 0;
-        } else {
-            in_flight.push_back(i);
+        if (waited->entryStatus.size() != entries.size()) {
+            for (auto* slot : slots) arena_->Release(slot);
+            for (size_t i : indices) results[i].error = ErrorCode::INTERNAL_ERROR;
+            continue;
         }
+        for (size_t k = 0; k < indices.size(); ++k) {
+            const size_t i = indices[k];
+            const ErrorCode mapped =
+                MapEntryStatus(waited->entryStatus[k].code, /*is_load=*/true);
+            if (mapped != ErrorCode::OK) {
+                results[i].error = mapped;
+                continue;
+            }
+            auto* raw = static_cast<std::byte*>(slots[k]->addr);
+            auto header = AsuRecordCodec::DecodeAndValidate(
+                std::span<const std::byte, 512>(raw, 512),
+                requests[i].descriptor);
+            if (!header.has_value()) {
+                results[i].error = header.error();
+                continue;
+            }
+            // One object = one entry; data_len must equal object_size and the
+            // payload CRC is always verified.
+            if (header->data_len != requests[i].descriptor.object_size ||
+                Crc32cValue(raw + kHeaderBytes, header->data_len) !=
+                    header->data_crc32c) {
+                results[i].error = ErrorCode::ASU_RECORD_CORRUPT;
+                continue;
+            }
+            auto copied = CopyToSlices(requests[i].slices, 0, raw + kHeaderBytes,
+                                       header->data_len);
+            if (!copied.has_value()) {
+                results[i].error = copied.error();
+                continue;
+            }
+            results[i].error = ErrorCode::OK;
+            results[i].bytes = header->data_len;
+        }
+        for (auto* slot : slots) arena_->Release(slot);
     }
-
-    // ---- Phase 2: drain whatever is still in flight, in submission order ----
-    while (!in_flight.empty()) {
-        const size_t i = in_flight.front();
-        in_flight.pop_front();
-        wait_and_decode(i);
-    }
-    return outcomes;
+    return results;
 }
 
-tl::expected<bool, ErrorCode> AsuStorageBackend::QueryObject(
-    const AsuDescriptor& descriptor, uint64_t trace_id) {
+
+tl::expected<std::vector<bool>, ErrorCode> AsuStorageBackend::BatchIsExist(
+    std::span<const AsuDescriptor> descriptors, uint64_t trace_id) {
     if (!IsReady()) return tl::make_unexpected(ErrorCode::ASU_SERVICE_UNAVAILABLE);
-    const std::vector<kv::CacheKey> keys{
-        AsuKeyCodec::ToCacheKey(descriptor.key_id)};
-    auto exists = client_->Query(keys, EstimateTimeoutMs(0));
-    if (!exists.has_value()) return tl::make_unexpected(exists.error());
-    if (exists->size() != 1) return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
-    return (*exists)[0] != 0;
+    std::vector<kv::CacheKey> keys;
+    keys.reserve(descriptors.size());
+    for (const auto& descriptor : descriptors) {
+        if (descriptor.key_id == 0) {
+            return tl::make_unexpected(ErrorCode::ASU_DESCRIPTOR_INVALID);
+        }
+        keys.push_back(AsuKeyCodec::ToCacheKey(descriptor.key_id));
+    }
+    std::vector<bool> out;
+    constexpr size_t kMaxKeysPerTask = 256;  // queryIoNum
+    size_t cursor = 0;
+    while (cursor < keys.size()) {
+        const size_t end = std::min(keys.size(), cursor + kMaxKeysPerTask);
+        const std::vector<kv::CacheKey> key_batch(keys.begin() + cursor,
+                                                  keys.begin() + end);
+        auto exists = client_->Query(key_batch, EstimateTimeoutMs(0));
+        if (!exists.has_value()) return tl::make_unexpected(exists.error());
+        if (exists->size() != key_batch.size()) {
+            return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+        }
+        for (auto bit : *exists) out.push_back(bit != 0);
+        cursor = end;
+    }
+    return out;
 }
 
-tl::expected<void, ErrorCode> AsuStorageBackend::DeleteObject(
-    const AsuDescriptor& descriptor, uint64_t trace_id) {
-    return DeleteObjects(std::span<const AsuDescriptor>(&descriptor, 1),
-                         trace_id);
-}
-
-tl::expected<void, ErrorCode> AsuStorageBackend::DeleteObjects(
+tl::expected<void, ErrorCode> AsuStorageBackend::BatchRemoveObjects(
     std::span<const AsuDescriptor> descriptors, uint64_t trace_id) {
     if (!IsReady()) return tl::make_unexpected(ErrorCode::ASU_SERVICE_UNAVAILABLE);
     constexpr size_t kMaxKeysPerTask = 254;  // deleteIoNum, kv_types.h:198
@@ -4078,7 +3850,7 @@ tl::expected<void, ErrorCode> AsuStorageBackend::DeleteObjects(
 | --- | --- | --- |
 | `mooncake-store/include/types.h` | 在错误码区（`types.h:320-445` 区段）追加 `ASU_SERVICE_UNAVAILABLE = -1800`、`ASU_OBJECT_TOO_LARGE = -1801`、`ASU_KEY_COLLISION = -1802`、`ASU_RECORD_CORRUPT = -1803`、`ASU_DESCRIPTOR_INVALID = -1804` | pure-additive |
 | `mooncake-store/src/types.cpp` | `toString(ErrorCode)` 映射表登记上述 5 个错误码 | pure-additive |
-| `mooncake-store/include/asu/asu_layout.h` | 新增 `kAsuMaxObjectBytes`、`IsValidEntry`（从 3.6 匿名命名空间上提） | pure-additive |
+| `mooncake-store/include/asu/asu_layout.h` | 新增 `kMaxObjectBytes = 16,776,192`、`kAsuMaxObjectBytes`、`WireLen`、`IsValidEntry`、`IsValidObjectSize`、`PlanBatches` | pure-additive |
 | Client 侧接线（`Client::ReadAsuReplica`、`BatchGet` 的 ASU 收集、`TransferRead` 拒绝、`client_buffer` 两个分支、`real_client` 四个调用点与 multi-buffer 分支） | 全部在 **3.10.1** 统一登记，本节不重复 | modify |
 
 ### 3.7 asu_allocator（Master 纯命名分配）
@@ -4180,8 +3952,6 @@ AsuDescriptor AsuAllocator::Allocate(const TenantId& tenant,
     descriptor.key_fingerprint = material.key_fingerprint;
     descriptor.object_epoch = object_epoch;
     descriptor.object_size = object_size;
-    descriptor.chunk_payload = kChunkPayloadBytes;
-    descriptor.chunk_count = ChunkCount(object_size);
     descriptor.record_version = kRecordVersion;
     descriptor.flags = 0;
     return descriptor;
@@ -4214,7 +3984,7 @@ Master 侧按 `key_id` 去重的延迟删除队列，加一个独立 GC 线程�
 - 为什么延迟：删除必须先删元数据、后删物理；且宽限期不能小于最大读租约 TTL，否则会删掉仍被持租约读者引用的旧 key。`release_at = max(now, not_before.value_or(now)) + max(default_kv_lease_ttl_, asu_delete_grace_ms)`。
 - `not_before` 的用途：被 `DiscardExpiredProcessingReplicas`、`PutStart` 陈旧清理、`Upsert` 抢占丢弃的 PROCESSING ASU，其 `Wait` 可能已经超时但 DMA 仍在飞；此时 `not_before = put_start_time + put_start_release_timeout_sec_`，让物理删除落在在飞写之后。COMPLETE ASU 的整对象删除传 `nullopt`。
 - 去重：同一个 `key_id` 多次入队只保留一项，`release_at` 取最早。这样重复的 `FreeAsuReplicas`（例如 HA finalizer 与常规 Erase 都触发）不会把删除无限推后。
-- 批大小：`DeleteObjects` 内部已按 254 key 切批（`deleteIoNum = 254`，`kv_types.h:198`）。
+- 批大小：`BatchRemoveObjects` 内部已按 254 key 切批（`deleteIoNum = 254`，`kv_types.h:198`）。
 - 幂等：删除不存在的 key 在 SDK 里映射为 raw `0x00` → `OK`（`trans_task_utils.cc:55-57`），所以重复删除不会报错。
 - 失败策略：可重试错误（`TRANSFER_FAIL`）指数退避最多 `asu_delete_max_attempts` 次；超限打 ERROR（含 `key_id`、`object_epoch`、`user_key`），`DroppedCount()` 自增并丢弃条目。丢弃后就是不可枚举孤儿，只能靠日志与 runbook 人工清理。
 - 线程模型：队列自身用 mutex 保护；GC 线程按 `asu_gc_idle_ms` 节拍轮询最近到期项（入队延迟上界即该节拍），`Stop` 用 condition_variable 唤醒。进程退出时只处理已到期项，未到期项保留在队列中并打 `asu_delete_shutdown_pending` 告警，绝不提前删除（见 FMEA-35）。
@@ -4422,7 +4192,7 @@ void AsuGcWorker::DeleteBatch(std::vector<AsuDeleteItem>& batch) {
         descriptor.object_epoch = item.object_epoch;
         descriptors.push_back(descriptor);
     }
-    auto result = client_.DeleteObjects(descriptors, /*trace_id=*/0);
+    auto result = client_.BatchRemoveObjects(descriptors, /*trace_id=*/0);
     if (result.has_value()) {
         return;
     }
@@ -4456,7 +4226,7 @@ void AsuGcWorker::DeleteBatch(std::vector<AsuDeleteItem>& batch) {
 
 - `ReplicaType::ASU = 101` 只用于 RPC 参数、日志与 Master 分派，不是继承体系。追加在 `DFS = 100` 之后，不重排、不复用 0..4 或 100。`ALL = 4` 的语义在本期扩展为「含 ASU 的全部同步副本」，注释必须同步更新。
 - `AsuDescriptor` 是唯一跨进程契约：随 `PutStart` 响应下发、随 `GetReplicaList` 下发、进 oplog payload（`MetadataPayload::replicas`，`metadata_store.h:104-115`）。字段全部 `YLT_REFL`，只能追加在 `descriptor_variant` 末尾，否则会改变 struct_pack 的类型索引。
-- `AsuDescriptor` 含 `object_epoch`，因此是 48B（8+8+8+8+4+4+4+4）。
+- `AsuDescriptor` 含 `object_epoch` 但不含任何 chunk 字段，因此是 **40B**（4×`uint64_t` + 2×`uint32_t`：8+8+8+8+4+4）。
 - `AsuReplicaData` 只包含一个 `AsuDescriptor`，进程内用于 Master 的副本容器。
 - `is_available()` 对 ASU 直接返回 true：ASU 是全局寻址服务，没有 segment/owner 存活性问题；实际不可用只会在读的时候以 `REPLICA_IS_GONE` 或 `ASU_SERVICE_UNAVAILABLE` 暴露。
 - `transport_endpoint()` 返回 `std::nullopt`、`get_segment_names()` 返回空 vector：ASU 不经过 TransferEngine，没有 endpoint/segment。
@@ -4474,7 +4244,7 @@ void AsuGcWorker::DeleteBatch(std::vector<AsuDeleteItem>& batch) {
 - `PROCESSING`：`AllocateReplicas` 铸造时的初始状态。v2 是同步内联写，ASU 只在 Put 调用内部停留于此。
 - `COMPLETE`：仅由 `PutEnd(ALL)`（happy）或 `PutEnd(ASU)`（显式单副本 end，本设计不主动使用）转移。
 - `REMOVED`：`PutRevoke(ALL/ASU)`、`PutStart` 陈旧清理、`Upsert` 抢占、`DiscardExpiredProcessingReplicas`。
-- 观测规则：`GetReadableReplicaDescriptors` 只返回 COMPLETE（`IsReplicaReadable = completed && available && !IsAwaitingRemount`，`master_service.cpp:4502-4505`），所以「ASU 尚在写」对读路径完全不可见；`CheckRemovable` 的 `AllReplicas(fn_is_completed)`（`master_service.cpp:7248`）让删除路径也看不见它。任何 PROCESSING ASU 都会让 Remove/RemoveMemoryReplica 返回 `REPLICA_IS_NOT_READY`，这正是要求 1 与要求 3 的写删互斥。
+- 观测规则：`GetReadableReplicaDescriptors` 只返回 COMPLETE（`IsReplicaReadable = completed && available && !IsAwaitingRemount`，`master_service.cpp:4502-4505`），所以「ASU 尚在写」对读路径完全不可见；`CheckRemovable` 的 `AllReplicas(fn_is_completed)`（`master_service.cpp:7248`）让删除路径也看不见它。任何 PROCESSING ASU 都会让 `Remove`/`BatchRemove`/`BatchRemoveAsuObjects` 返回 `REPLICA_IS_NOT_READY`，这正是要求 1 与要求 3 的写删互斥。
 
 ```mermaid
 stateDiagram-v2
@@ -4512,14 +4282,12 @@ struct AsuDescriptor {
     uint64_t key_fingerprint{0};
     uint64_t object_epoch{0};
     uint64_t object_size{0};
-    uint32_t chunk_payload{0};
-    uint32_t chunk_count{0};
     uint32_t record_version{1};
     uint32_t flags{0};
     YLT_REFL(AsuDescriptor, key_id, key_fingerprint, object_epoch, object_size,
-             chunk_payload, chunk_count, record_version, flags);
+             record_version, flags);
 };
-static_assert(sizeof(AsuDescriptor) == 48);
+static_assert(sizeof(AsuDescriptor) == 40);
 
 struct AsuReplicaData {
     AsuDescriptor descriptor;
@@ -4718,7 +4486,7 @@ inline Replica::Descriptor Replica::get_descriptor() const {
 2. `ReplicaTransferSummary` 增加 `allocated_asu_replicas`/`successful_asu_transfers`/`failed_asu_transfers`，`RecordAllocatedReplica`/`RecordSuccess`/`RecordFailure` 各加一个 `ReplicaType::ASU` 分支。
 3. `NonDfsTransfersSucceeded` 保持原义（只判 memory/nof），它是 ASU 阶段的门禁；`AllAllocatedTransfersSucceeded` **不纳入 ASU**（v1.0 曾纳入，v2 撤销：ASU 是可选第二层，不能强迫整体成功）。
 4. `HasExpectedReplicaAllocation` **不改**（两侧都不加 allocated_asu）。ASU 在门槛之后铸造、纯命名不会失败，不参与分配期望判定。
-5. 新增 `SubmitAsuWrites`（结构照抄 `SubmitDfsWrites`，`client_service.cpp:3201-3259`）：跳过 `IsResolved` 或 `allocated_asu == 0`；`!NonDfsTransfersSucceeded` 时记 `asu_write_skipped_total{reason=primary_tier_failed}` 并**零调用**；找不到 ASU descriptor 记 `INVALID_REPLICA`；runtime 未就绪记 `ASU_SERVICE_UNAVAILABLE`；否则 `WriteObject(desc, op.slices, trace_id)` 并 `RecordSuccess/Failure(ASU)`。
+5. 新增 `SubmitAsuWrites`（结构照抄 `SubmitDfsWrites`，`client_service.cpp:3201-3259`）：跳过 `IsResolved` 或 `allocated_asu == 0`；`!NonDfsTransfersSucceeded` 时记 `asu_write_skipped_total{reason=primary_tier_failed}` 并**零调用**；找不到 ASU descriptor 记 `INVALID_REPLICA`；runtime 未就绪记 `ASU_SERVICE_UNAVAILABLE`；否则 `BatchStoreObjects(requests, trace_id)` 并逐对象 `RecordSuccess/Failure(ASU)`。
 6. 单 key 路径：`Client::Put` 在 DFS 块之后、finalize 之前调 `WriteAsuReplicaForSingle`；`Client::Upsert` 同构，避免复制粘贴。
 7. 批量路径：`BatchPut` 在 `SubmitDfsWrites(ops)` 之后、`FinalizeBatchPut(ops)` 之前插入 `SubmitAsuWrites(ops)`（`client_service.cpp:3685`、`:3693` 一带）；`BatchUpsert` 同理（`:3735` 一带）。
 8. 数据源是 `op.slices`，不读回 memory；契约是 Put 返回前调用方不得修改 buffer。
@@ -4759,8 +4527,7 @@ sequenceDiagram
     alt 主层失败
         C->>M: PutRevoke ALL
     else 主层成功
-        C->>A: WriteObject chunk1 到 N-1
-        C->>A: WriteObject chunk0 提交点
+        C->>A: BatchStoreObjects 一个对象一条 entry 多对象可合批
         alt ASU 成功
             C->>M: PutEnd ALL
         else ASU 失败 且 require_asu=false（默认）
@@ -4787,7 +4554,7 @@ sequenceDiagram
 - `client_buffer.cpp` 的 `calculate_total_size`（`:144-159`）与 `allocateSlices`（`:161-191`）增加 ASU 分支，放在最后 else 之前：总长取 `object_size`，slices 为单个 `Slice{buffer_ptr, object_size}`。
 - `Client::Get`（`client_service.cpp:1578-1653`）在 DFS 分支旁增加 `else if (replica.is_asu_replica()) err = ReadAsuReplica(...)`。`ReadAsuReplica` 入口要求 `CalculateSliceSize(slices) >= object_size`，否则 `INVALID_PARAMS`（与 memory 在 `TransferRead` 的尺寸契约一致），因此永远整对象读、payload CRC-32C 全量校验。后置 `VerifyObjectChecksum`、hot cache、租约原样；`ProcessSlicesAsync` 因 `is_memory_replica` 门控跳过 ASU。
 - `TransferRead`（`client_service.cpp:5160-5194`）入口显式 `if (is_asu_replica) return INVALID_REPLICA`；不新增 size 分支（v1.0 的 size 分支作废，否则会落入 file-read 分支）。
-- `Client::BatchGet`（`client_service.cpp:1718-1997`）：在 DFS 分支旁收集 `AsuReadRequest`，在 DFS 同步批量读（`:1889-1955`）之后、RDMA 统一 Wait（`:1957-1997`）之前调一次 `ReadObjects`；逐 outcome 映射并复用 `VerifyObjectChecksum`。
+- `Client::BatchGet`（`client_service.cpp:1718-1997`）：在 DFS 分支旁收集 `AsuReadRequest`，在 DFS 同步批量读（`:1889-1955`）之后、RDMA 统一 Wait（`:1957-1997`）之前调一次 `BatchLoadObjects`；逐 outcome 映射并复用 `VerifyObjectChecksum`。
 
 #### `AsuClientRuntime` 与可用性
 
@@ -4795,7 +4562,7 @@ sequenceDiagram
 
 #### 删 memory：只删 memory
 
-新增 `Client::RemoveMemoryReplica(key, force = false)`，转发 `MasterClient::RemoveReplica(key, ReplicaType::MEMORY, force)`。它是要求 3 的「删 memory」入口；「删 ASU」不是新 API，而是现有 `Client::Remove` 的整对象级联（见 3.11）。若要求 2 未落地，`RemoveMemoryReplica` 应返回 `NOT_SUPPORTED`（两要求同版本上线，见 §6）。
+新增 `Client::BatchRemoveAsuObjects(keys, force = false)`，Master 侧同名。Phase 1 在 key 写锁内只读捕获 `AsuDescriptor`；Phase 2 调用**既有** `RemoveObject`（一行不改，先删 memory 与元数据）；Phase 3 用捕获的 key_id 入 `AsuDeleteQueue`。删 memory 仍复用既有 `Client::Remove` / `BatchRemove`，不新增任何 RPC。
 
 **必要代码**
 
@@ -5043,9 +4810,22 @@ ErrorCode Client::WriteAsuReplicaForSingle(
         return ErrorCode::INVALID_REPLICA;
     }
     const auto started = std::chrono::steady_clock::now();
-    auto result = asu_runtime_->backend().WriteObject(
-        asu_it->get_asu_descriptor(), slices, trace_id);
-    if (result.has_value()) {
+    const AsuStoreRequest request{key, asu_it->get_asu_descriptor(), slices};
+    auto result = asu_runtime_->backend().BatchStoreObjects(
+        std::span<const AsuStoreRequest>(&request, 1), trace_id);
+    if (!result.has_value()) {
+        summary.RecordFailure(ReplicaType::ASU, result.error());
+        if (auto* m = GetAsuMetricPtr()) {
+            m->RecordWriteFailure(toString(result.error()));
+        }
+        return result.error();
+    }
+    if (result->size() != 1) {
+        summary.RecordFailure(ReplicaType::ASU, ErrorCode::INTERNAL_ERROR);
+        return ErrorCode::INTERNAL_ERROR;
+    }
+    const ErrorCode error = (*result)[0];
+    if (error == ErrorCode::OK) {
         summary.RecordSuccess(ReplicaType::ASU);
         if (auto* m = GetAsuMetricPtr()) {
             m->ObserveWrite(elapsed_us_since(started),
@@ -5053,11 +4833,11 @@ ErrorCode Client::WriteAsuReplicaForSingle(
         }
         return ErrorCode::OK;
     }
-    summary.RecordFailure(ReplicaType::ASU, result.error());
+    summary.RecordFailure(ReplicaType::ASU, error);
     if (auto* m = GetAsuMetricPtr()) {
-        m->RecordWriteFailure(toString(result.error()));
+        m->RecordWriteFailure(toString(error));
     }
-    return result.error();
+    return error;
 }
 
 void Client::SubmitAsuWrites(std::vector<PutOperation>& ops) {
@@ -5213,9 +4993,13 @@ ErrorCode Client::ReadAsuReplica(const std::string& key,
                    << " provided=" << CalculateSliceSize(slices);
         return ErrorCode::INVALID_PARAMS;
     }
-    auto result = asu_runtime_->backend().ReadObject(asu, slices,
-                                                     NextTraceId());
-    return result.has_value() ? ErrorCode::OK : result.error();
+    const AsuReadRequest request{key, asu, slices};
+    auto result = asu_runtime_->backend().BatchLoadObjects(
+        std::span<const AsuReadRequest>(&request, 1), NextTraceId());
+    if (result.has_value() && result->size() == 1) {
+        return (*result)[0].error;
+    }
+    return result.has_value() ? ErrorCode::INTERNAL_ERROR : result.error();
 }
 
 // Client::Get dispatch
@@ -5244,7 +5028,7 @@ std::vector<size_t> asu_read_indices;
 // ... after the DFS batch read block, before the RDMA wait loop ...
 if (!asu_read_requests.empty()) {
     auto outcomes =
-        asu_runtime_->backend().ReadObjects(asu_read_requests, NextTraceId());
+        asu_runtime_->backend().BatchLoadObjects(asu_read_requests, NextTraceId());
     if (!outcomes.has_value()) {
         for (size_t index : asu_read_indices) {
             results[index] = tl::unexpected(outcomes.error());
@@ -5277,10 +5061,10 @@ if (replica_descriptor.is_asu_replica()) {
     return ErrorCode::INVALID_REPLICA;
 }
 
-// RemoveMemoryReplica
-tl::expected<void, ErrorCode> Client::RemoveMemoryReplica(
-    const ObjectKey& key, bool force) {
-    return master_client_.RemoveReplica(key, ReplicaType::MEMORY, force);
+// BatchRemoveAsuObjects
+tl::expected<void, ErrorCode> Client::BatchRemoveAsuObjects(
+    const std::vector<ObjectKey>& keys, bool force) {
+    return master_client_.BatchRemoveAsuObjects(keys, force);
 }
 
 bool Client::AsuReadAvailable() const {
@@ -5478,7 +5262,7 @@ if (op.IsResolved() || op.replicas.empty() ||
 | 文件 | 位置 | 改动 | kind |
 | --- | --- | --- | --- |
 | `mooncake-store/include/client_service.h` | 90-108 | `ReadReplicaSelector` 增加 `allow_asu_`；`MakeReadReplicaSelector(bool allow_asu = true)` | modify |
-| `mooncake-store/include/client_service.h` | 764、1179 附近 | 新增 `SetAsuClientRuntime`、`std::shared_ptr<AsuClientRuntime> asu_runtime_`、`AsuReadAvailable()`、`AsuRequired()`、`RemoveMemoryReplica`、`SubmitAsuWrites`、`WriteAsuReplicaForSingle`、`ReadAsuReplica` 声明 | pure-additive |
+| `mooncake-store/include/client_service.h` | 764、1179 附近 | 新增 `SetAsuClientRuntime`、`std::shared_ptr<AsuClientRuntime> asu_runtime_`、`AsuReadAvailable()`、`AsuRequired()`、`BatchRemoveAsuObjects`、`SubmitAsuWrites`、`WriteAsuReplicaForSingle`、`ReadAsuReplica` 声明 | pure-additive |
 | `mooncake-store/include/asu/asu_client_runtime.h` | `AsuClientRuntime` private | 保存 `AsuConfig config_` 并新增 `bool require_asu() const` 只读访问器（v2.1） | modify |
 | `mooncake-store/src/client_service.cpp` | 275-319 | summary 增加 ASU 三计数、`first_asu_error` 与 `Record*` 分支；`RecordFailure(ASU)` 只写 `first_asu_error`，不污染 `first_error`（v2.1）；`AllAllocatedTransfersSucceeded` 保持不含 ASU | modify |
 | `mooncake-store/src/client_service.cpp` | 378-431 | `DetermineFinalizeDecision` 新增 TIERED 四分支（含 `require_asu` 严格映射）；签名增加 `bool require_asu`（无默认值）；`FinalizeDecision` 结构不变 | modify |
@@ -5487,7 +5271,7 @@ if (op.IsResolved() || op.replicas.empty() ||
 | `mooncake-store/src/client_service.cpp` | 675-700 | `ReadReplicaSelector` 增加含 ASU 的 best-select 分支、`allow_asu_` 与 `NoReplicaError` 映射 | risky |
 | `mooncake-store/src/client_service.cpp` | 1578-1653 | `Client::Get` 增加 `ReadAsuReplica` 分派 | modify |
 | `mooncake-store/src/client_service.cpp` | 1661 | range 读的 `MakeReadReplicaSelector()` 传 `false` | modify |
-| `mooncake-store/src/client_service.cpp` | 1718-1997 | `Client::BatchGet` 收集 `AsuReadRequest` 并在 DFS 批量读后、RDMA Wait 前调 `ReadObjects`；复用 `VerifyObjectChecksum` | modify |
+| `mooncake-store/src/client_service.cpp` | 1718-1997 | `Client::BatchGet` 收集 `AsuReadRequest` 并在 DFS 批量读后、RDMA Wait 前调 `BatchLoadObjects`；复用 `VerifyObjectChecksum` | modify |
 | `mooncake-store/src/client_service.cpp` | 2105-2203、2315-2408 | `Put`/`Upsert` 在 PutStart/UpsertStart 后校验 allocated ASU，主层后调用 ASU 写；`revoke_type==ASU` 失败只记 metric | risky |
 | `mooncake-store/src/client_service.cpp` | 2433-2539 | `PutOperation` 增加 `requested_asu_replicas`；`InitializeRequestedReplicas`/`ToReplicateConfig` 同步 | modify |
 | `mooncake-store/src/client_service.cpp` | 3201-3259 旁 | 新增 `SubmitAsuWrites` 与 `WriteAsuReplicaForSingle` | pure-additive |
@@ -5497,7 +5281,7 @@ if (op.IsResolved() || op.replicas.empty() ||
 | `mooncake-store/src/client_service.cpp` | 4907 | `BatchTransferReadRanges` 的 selector 传 `false` | modify |
 | `mooncake-store/src/client_service.cpp` | 5160-5194 | `TransferRead` 入口显式拒绝 ASU；不新增 size 分支 | modify |
 | `mooncake-store/src/client_service.cpp` | 5196-5243 旁 | 新增 `ReadAsuReplica` | pure-additive |
-| `mooncake-store/src/client_service.cpp` | 新增 | 新增 `RemoveMemoryReplica`、`AsuReadAvailable` | pure-additive |
+| `mooncake-store/src/client_service.cpp` | 新增 | 新增 `BatchRemoveAsuObjects`、`AsuReadAvailable` | pure-additive |
 | `mooncake-store/include/replica_selection.h` | 39-90、133-194 | 新增 `ReplicaReadRank`/`ReadSelectionPolicy`/`ClassifyReplicaForRead`/`HasCompleteAsuReplica`/`NoReplicaError`；`SelectBestReplica` 加第 4 参与显式 min-rank | risky |
 | `mooncake-store/src/client_buffer.cpp` | 144-191 | `calculate_total_size`/`allocateSlices` 增加 ASU 分支 | modify |
 | `mooncake-store/src/real_client.cpp` | 4036、4425、6776、8440 | 四个全对象 `SelectBestReplica` 调用点传 `ReadSelectionPolicy` 与统一错误映射 | modify |
@@ -5514,7 +5298,7 @@ if (op.IsResolved() || op.replicas.empty() ||
 
 **职责**
 
-把 ASU 接进 MasterService 的控制面：`AllocateReplicas` 的 descriptor 铸造、`PrepareWriteStart` 的白名单校验、`PutEnd`/`PutRevoke` 的 ALL 谓词、offload 排除、全部资源回收点的入队、`EraseMetadata` 的 memory→ASU 级联、HA 两段 pop、`UpsertStart` 的 Case C 强制、`RemoveReplicaTier`、KvMedia 视图，以及 `AsuMasterRuntime` 的生命周期。本 shard **绝不经手对象字节**；Master 侧的 ASU client 是 delete-only（只 Query/Delete，不注册数据 buffer）。
+把 ASU 接进 MasterService 的控制面：`AllocateReplicas` 的 descriptor 铸造、`PrepareWriteStart` 的白名单校验、`PutEnd`/`PutRevoke` 的 ALL 谓词、offload 排除、资源回收点的入队、`BatchRemoveAsuObjects`（捕获→既有 Remove→入队）、HA finalize 的 `enqueue_asu_deletes` 标志、`UpsertStart` 的 Case C 强制、KvMedia 视图，以及 `AsuMasterRuntime` 的生命周期。plain `Remove`/`EraseMetadata` **不拥有 ASU 物理删除权**。本 shard **绝不经手对象字节**；Master 侧的 ASU client 是 delete-only（只 Query/Delete，不注册数据 buffer）。
 
 **设计说明**
 
@@ -5544,55 +5328,43 @@ Offload 排除：`enable_offload_` 的触发条件增加 `!metadata.HasReplica(&
 
 ASU 副本出生即 PROCESSING，只能经 `PutEnd(ALL)` 转 COMPLETE、经 `PutRevoke` 移除、或被 `DiscardExpiredProcessingReplicas` 按 `fn_is_processing` 丢弃。
 
-#### 回收：`FreeAsuReplicas` 与 11 个挂点
+#### 回收：`FreeAsuReplicas` 挂点与 ASU 删除权收口
 
 签名 `void FreeAsuReplicas(const std::string& key, std::span<const Replica> replicas, std::optional<std::chrono::system_clock::time_point> not_before = std::nullopt)`，只遍历传入集合、只对 `is_asu_replica` 入队，绝不读 `GetAllReplicas`。`EraseReplicasWithCacheTotalAccounting` 现有的第三个参数已经是 `std::vector<ReplicaID>* erased_replica_ids`（`master_service.h:1297-1299`、`master_service.cpp:1731-1734`），因此 `not_before` 必须作为**第四个**可选参数追加（`std::optional<std::chrono::system_clock::time_point> not_before = std::nullopt`），默认值不改变任何既有调用；1753 的 `FreeAsuReplicas(metadata.user_key, erased_replicas, not_before)` 使用它。
 
-> **「删 memory 不误删 ASU」的真实机制**：`RemoveReplicaTier` 以 `&Replica::fn_is_memory_replica` 谓词调用 `EraseReplicasWithCacheTotalAccounting`，而该函数内部第 1753 行确实会执行 `FreeAsuReplicas`；由于传入集合只含 MEMORY 副本，`FreeAsuReplicas` 的 `is_asu_replica` 过滤使其恒为 no-op。也就是说，这条不变量由「谓词 + 过滤器」共同保证，而不是「RemoveReplicaTier 不调用 FreeAsuReplicas」。必须用单测钉住（注入一个 ASU 副本后调用 `RemoveMemoryReplica`，断言 `AsuDeleteQueue.Size()==0`），并加一条静态守卫禁止把 1753 的入参改成 `GetAllReplicas`（FMEA-57）。
+> **「plain Remove 不触达 ASU」的真实机制**：`EraseMetadata` 与 `FinalizeRemovedReplicasAfterDurable` 都只在 `enqueue_asu_deletes == true` 时捕获/入队 ASU；既有 `RemoveObject` / `RemoveAll` / `RemoveByRegex` / `BatchReplicaClear` 全部传 `false`，因此删 memory 只删 memory，ASU entry 成为孤儿（预期行为）。拥有 ASU 物理删除权的唯一入口是 `BatchRemoveAsuObjects`：它先捕获 descriptor，再调用既有 `RemoveObject`（`enqueue_asu_deletes=false`），最后自己入队。必须用单测钉住（对象有 memory+ASU 时调 `Client::Remove`，断言 `AsuDeleteQueue.Size()==0`、ASU 仍 COMPLETE 可读），并加 grep/静态守卫禁止把 `EraseMetadata` 重新接回 `FreeAsuReplicas`（FMEA-57）。
 
-| 挂点 | 上下文 | `not_before` |
+| 挂点 | 上下文 | ASU 入队裁决 |
 | --- | --- | --- |
-| 1753 | `EraseReplicasWithCacheTotalAccounting` | 由调用方透传；`PutRevoke` 传 `put_start_time + put_start_release_timeout_sec_` |
-| 1795 | HA `FinalizeRemovedReplicasAfterDurable` | 无（COMPLETE 删除）；见下方两段 pop |
-| 1844 | 过期 processing 副本 | `ttl` |
-| 1907 | 复制过期 | `ttl` |
-| 2110 | `EraseMetadata` 整对象 teardown | `nullopt`（改为捕获→TearDown→入队） |
-| 5257 | `PutStart` 陈旧清理 | `metadata.put_start_time + put_start_release_timeout_sec_` |
-| 5897 | `Upsert` 抢占 | `now + put_start_release_timeout_sec_`（与该处 `discarded_replicas_` 的 TTL 一致） |
-| 6099 | `Upsert` Case C 旧副本 | 该处已算好的 `release_at` = `max(default_kv_lease_ttl_, put_start_release_timeout_sec_)` |
-| 7080 | 复制 source | `now + put_start_release_timeout_sec_`（ASU 场景为 no-op，仍需配对） |
-| 9535 | `DiscardExpiredProcessingReplicas` 非 HA 直 pop | 该循环的 `ttl` |
-| 9623 | 复制 targets | 该处 `ttl`（ASU 场景为 no-op，仍需配对） |
+| 1753 | `EraseReplicasWithCacheTotalAccounting` | 保留配对；仅作用于传入集合（`is_asu_replica` 过滤）。未被 plain Remove/EraseMetadata 调用 |
+| 1795 | HA `FinalizeRemovedReplicasAfterDurable` | **由 `enqueue_asu_deletes` 标志门控**：plain Remove 传 `false`，不捕获、不入队；`BatchRemoveAsuObjects` 自己负责入队 |
+| 1844 | 过期 processing 副本 | 保留，`ttl`（这是真正丢弃 PROCESSING ASU，不属 plain Remove） |
+| 1907 | 复制过期 | 保留，`ttl` |
+| 2110 | `EraseMetadata` 整对象 teardown | **不捕获、不入队**（plain Remove 不拥有 ASU 删除权）；`EraseMetadata` 保持只删 memory 与元数据 |
+| 5257 | `PutStart` 陈旧清理 | 保留，`metadata.put_start_time + put_start_release_timeout_sec_` |
+| 5897 | `Upsert` 抢占 | 保留，`now + put_start_release_timeout_sec_` |
+| 6099 | `Upsert` Case C 旧副本 | 保留，该处已算好的 `release_at` |
+| 7080 | 复制 source | 保留配对（ASU 场景为 no-op） |
+| 9535 | `DiscardExpiredProcessingReplicas` 非 HA 直 pop | 保留，该循环的 `ttl` |
+| 9623 | 复制 targets | 保留配对（ASU 场景为 no-op） |
 
-关键更正（v1.0 的错误）：`9531-9537` 与 `9611-9625` 是直接 `PopReplicasWithCacheTotalAccounting` + `FreeDfsReplicas` 的路径，**不经过 1753**，必须字面配对；不能只挂 1753 就认为覆盖全部。
+关键更正（v2.3）：`2110` 曾经是 ASU 入队挂点，这会让 plain `Remove` 误删 ASU，直接违反「删 memory 只删 memory」。v2.3 把它移出：只有 `BatchRemoveAsuObjects` 在捕获 descriptor 后入队。`9531-9537` 与 `9611-9625` 是直接 `PopReplicasWithCacheTotalAccounting` + `FreeDfsReplicas` 的路径，**不经过 1753**，仍需字面配对。
 
-#### 删 ASU：整对象删除 + memory→ASU 有序级联
+#### 删 ASU：新增 `BatchRemoveAsuObjects`（捕获→既有 Remove→入队）
 
-不新增 `RemoveAsu`。「删 ASU」= 现有 `Client::Remove` / `MasterService::RemoveObject`（`master_service.cpp:7175-7204`）的整对象删除，在同一 key 写锁事务内按「先 memory、后 ASU」移除。`EraseMetadata`（`master_service.cpp:2054-2116`）改为三段：
+「删 ASU」是新增的 `Client::BatchRemoveAsuObjects(keys, force)` 与 `MasterService::BatchRemoveAsuObjects(keys, tenants, force)`。既有 `Client::Remove` / `MasterService::RemoveObject`（`master_service.cpp:7175-7204`）**一行不改**，plain Remove 只删 memory 与元数据、不触达 ASU。
 
-1. `CollectAsuDescriptors(metadata)`（内部 `VisitReplicas(&Replica::fn_is_asu_replica)`）捕获 `vector<AsuDescriptor>`；
-2. `ReleaseLocalDiskUsage` / `FreeDfsReplicas` / `AccountCacheTotalRemoval` / 软 pin 索引清理；
-3. `hold.TearDown()`（memory buffer 在此释放）→ `EnqueueAsuDeletes(key, captured, nullopt)`。
+每个 key 三阶段：
 
-v1.0 在 2110 直接 `FreeDfsReplicas(key, metadata.GetAllReplicas())`，再 `TearDown`；照抄会让 ASU 入队早于 memory 释放，与要求 3 相反。捕获后延迟入队几行即可覆盖所有 `accessor.Erase()` 路径（Remove/RemoveAll/BatchRemove/RemoveByRegex/BatchReplicaClear(segment="")/PutStart 陈旧清理）。
+1. **Phase 1 捕获**：在 key 写锁内用只读访问器捕获 `is_asu_replica()` 的 `AsuDescriptor`（不授租约）。必须**先捕获**，因为 Phase 2 会把 descriptor 连同元数据一起删除。
+2. **Phase 2 调既有 Remove**：调用 `RemoveObject`（`master_service.cpp:7175-7204`，一行不改；`EraseMetadata` 不再捕获/入队 ASU）。
+3. **Phase 3 入队**：仅对 Remove 成功或返回 `OBJECT_NOT_FOUND` 的 key，把捕获的 descriptor 入 `AsuDeleteQueue`；`OBJECT_HAS_LEASE`/`REPLICA_IS_NOT_READY` 表示对象仍存活，跳过。
 
-不变量分层表述：**非 HA** 只有「物理删除的入队顺序 memory→ASU」——`TearDown` 一次性销毁元数据，不存在可观测的元数据移除顺序，且 `TearDown` 无返回码，失败时元数据已不可逆销毁，ASU 入队失败只记 metric；**HA** 才有真实的「元数据移除顺序 memory→ASU」；当前 HEAD 的 `FinalizeRemovedReplicasAfterDurable` 在 `master_service.cpp:1780-1795` 是一次 pop（`PopReplicasWithCacheTotalAccounting` 按 `status==REMOVED && ids.contains` 一次弹出全部 id），v2 必须改为两段 pop（§3.11.1 差异片段 6）。两种路径都不声称「析构时刻早于入队」。
+并发与顺序：捕获与 Remove 之间若发生并发 Upsert，捕获到的旧 `key_id` 属于旧世代，迟到的 `DeleteAsync` 只命中旧 key（epoch 派生隔离）。物理删除的入队顺序仍是「memory 先（Remove 内已完成）、ASU 后（Phase 3）」。
 
-#### 删 memory：新增 `RemoveReplicaTier`
+`EnqueueAsuDeletes` 只持 `AsuDeleteQueue` 自身的 mutex，绝不在 `master_state_mutex_` 或 key 锁下做网络 IO。
 
-新增 RPC `RemoveReplica(key, tenant_id, replica_type, force)` 与 `Client::RemoveMemoryReplica`，只接受 `ReplicaType::MEMORY`，其余 `INVALID_PARAMS`。Master 新增 `RemoveReplicaTier`：
-
-1. `shared_lock(master_state_mutex_)`（对齐 `RemoveObject:7179`）；
-2. `MetadataAccessorRW` 取 key 写锁；`!Exists` → `OBJECT_NOT_FOUND`；管理组成员 → `UNAVAILABLE_IN_CURRENT_STATUS`；
-3. `CheckRemovable`（`master_service.cpp:7236-7255`）：lease 未过且非 force → `OBJECT_HAS_LEASE`；任一副本非 COMPLETE → `REPLICA_IS_NOT_READY`；有 replication task → `OBJECT_HAS_REPLICATION_TASK`；
-4. `metadata.HasReplica(&Replica::fn_is_busy)` → `OBJECT_REPLICA_BUSY`（`-714`；`CheckRemovable` 不覆盖 offloading_task 持有的 source refcnt，而 pop 会当场析构 buffer，FMEA-47）；
-5. `!metadata.HasReplica(&Replica::fn_is_memory_replica)` → `REPLICA_NOT_FOUND`（`-710`），不触碰任何副本；
-6. `EraseReplicasWithCacheTotalAccounting(metadata, &Replica::fn_is_memory_replica)`：一次移除该对象的**全部** MEMORY 副本。`RemoveMemoryReplica(key, force)` 不带 `replica_id`，因此 `replica_num > 1` 时所有 MEMORY 副本一并弹出；对象仍有 ASU 时保留，不被 `accessor.Erase()`。若需要按副本粒度删除，参考 `EvictDiskReplicaIfCurrent` 增加可选 `expected_replica_id`，已登记在 §6.3 第 1 条；本期不实现；
-7. `CancelPromotionTaskForRemovedReplicas` → `SyncKvObjectState`（media 从 `{cpu,disk}` 变 `{disk}`）；
-8. 仅当 `!metadata.IsValid()` 才 `accessor.Erase()`；有 ASU 时 `IsValid` 为真，对象保留、ASU 仍 COMPLETE 可读；
-9. HA/oplog：镜像 `PutRevoke` 的「persist 剩余描述符 → 成功后标记 REMOVED → durable finalize 按 id pop」模式（`master_service.cpp:5660-5689`），不用 `EvictDiskReplicaImpl` 模板（它 persist 失败不回滚 mark）。
-
-`force` 只绕过 lease，不绕过 refcnt 与完成度。
+> **[v2.3 变更]** 删除 v2.0/v2.1 的 `RemoveReplica` RPC、`Client::RemoveMemoryReplica`、`MasterService::RemoveReplicaTier` 与约 130 行 RPC 样板；删除 `EraseMetadata` 的 ASU 捕获/入队；删 memory 完全复用既有 Remove。
 
 #### 为什么不用 `EvictDiskReplica`
 
@@ -5633,7 +5405,7 @@ ASU 没有 allocator 状态，所以不像 DFS 那样在 `enable_dfs_` 为 false
 
 先 `gc_->Stop()` 再 `delete_client_->Shutdown()` 再销毁 arena；避免 GC 线程访问已析构的 client。
 
-> **[v2.0 变更]** 与 v1.0 的差异汇总：(1) `AllocateReplicas` 增 `TenantId` 并在门槛之后铸造，撤销 v1.0「门槛之前 + allocated_asu 参数」；(2) `PrepareWriteStart` 六条白名单校验；(3) ALL 三处谓词加 ASU；(4) offload 排除 ASU 从设计意图变为必改代码点；(5) `FreeAsuReplicas` 全部挂点增加 `not_before`，并更正 9535/9623 是直接 pop 路径；(6) `EraseMetadata` 改三段式级联；(7) HA finalize 改两段 pop；(8) Upsert 强制 Case C + 租约闸门收窄；(9) 新增 `RemoveReplicaTier` 与 `RemoveReplica` RPC，明确不扩 `EvictDiskReplica`。
+> **[v2.3 变更]** 与 v1.0 的差异汇总：(1) `AllocateReplicas` 增 `TenantId` 并在门槛之后铸造，撤销 v1.0「门槛之前 + allocated_asu 参数」；(2) `PrepareWriteStart` 六条白名单校验；(3) ALL 三处谓词加 ASU；(4) offload 排除 ASU 从设计意图变为必改代码点；(5) `FreeAsuReplicas` 挂点保留 `not_before`，2110 移出（plain Remove 不触达 ASU），9535/9623 直接 pop 路径字面配对；(6) `EraseMetadata` 只删 memory 与元数据；(7) HA finalize 由 `enqueue_asu_deletes` 门控；(8) Upsert 强制 Case C + 租约闸门收窄；(9) 新增 `BatchRemoveAsuObjects`，删 memory 复用既有 `RemoveObject`，明确不扩 `EvictDiskReplica`。
 
 **必要代码**
 
@@ -5725,11 +5497,13 @@ AsuMasterRuntime::Create(const AsuConfig& config) {
         // proves view, router and transports are usable.
         AsuDescriptor probe{};
         probe.key_id = kAsuProbeKeyId;
-        auto probe_result =
-            runtime->delete_client_->QueryObject(probe, /*trace_id=*/0);
+        auto probe_result = runtime->delete_client_->BatchIsExist(
+            std::span<const AsuDescriptor>(&probe, 1), /*trace_id=*/0);
         LOG(INFO) << "action=asu_master_probe probe_key=" << kAsuProbeKeyId
                   << " probe_exists="
-                  << (probe_result.has_value() ? (*probe_result ? 1 : 0) : -1);
+                  << (probe_result.has_value() && !probe_result->empty()
+                          ? ((*probe_result)[0] ? 1 : 0)
+                          : -1);
         if (!probe_result.has_value()) {
             return tl::make_unexpected(ErrorCode::ASU_SERVICE_UNAVAILABLE);
         }
@@ -5895,68 +5669,46 @@ std::vector<AsuDescriptor> MasterService::CollectAsuDescriptors(
 ```
 
 ```cpp
-// mooncake-store/src/master_service.cpp（差异片段 5：EraseMetadata 三段式）
+// mooncake-store/src/master_service.cpp（差异片段 5：EraseMetadata 不触达 ASU）
 void MasterService::EraseMetadata(metadata::Namespace& ns,
                                   const route::WriteGuard& hold,
                                   EraseMode erase_mode,
                                   const std::vector<std::string>&
-                                      previous_media_hint) {
+                                      previous_media_hint,
+                                  bool enqueue_asu_deletes) {
     auto& metadata = hold.metadata();
     const std::string& key = hold.key();
     // ... BeforeTearDown / KvRemovalSnapshot / PublishKvRemoved（不变） ...
 
-    // v2 phase 1: capture ASU descriptors before anything is destroyed.
-    auto asu_descriptors = CollectAsuDescriptors(metadata);
-
+    // v2.3: plain Remove does NOT own ASU physical deletion. There is no
+    // CollectAsuDescriptors / EnqueueAsuDeletes on this path at all.
     // ... offloading_task / replication_task / promotion 清理（不变） ...
 
-    // v2 phase 2: release memory first.
     ReleaseLocalDiskUsage(metadata.GetAllReplicas());
     FreeDfsReplicas(key, metadata.GetAllReplicas());
     AccountCacheTotalRemoval(metadata);
     // ... soft pin index removal（不变） ...
     hold.TearDown();  // memory buffers are released here
-
-    // v2 phase 3: only now enqueue the physical ASU deletes.
-    EnqueueAsuDeletes(key, asu_descriptors, std::nullopt);
+    // ASU entries become enumerable-only orphans by design.
+    (void)enqueue_asu_deletes;  // always false on this path
 }
 ```
 
 ```cpp
-// mooncake-store/src/master_service.cpp（差异片段 6：HA finalize 两段 pop）
+// mooncake-store/src/master_service.cpp（差异片段 6：HA finalize 的 ASU 入队门控）
 void MasterService::FinalizeRemovedReplicasAfterDurable(
-    const OpLogEntry& durable_entry, const std::vector<ReplicaID>& replica_ids) {
+    const OpLogEntry& durable_entry, const std::vector<ReplicaID>& replica_ids,
+    bool enqueue_asu_deletes) {
     // ... accessor / ids（不变） ...
     auto& metadata = accessor.Get();
     const auto previous_media = KvRemovalSnapshot(metadata);
 
-    // v2: pop memory first, in its own scope, so buffers are released before
-    // any ASU descriptor is enqueued.
-    std::unordered_set<ReplicaID> memory_ids;
-    std::unordered_set<ReplicaID> other_ids;
-    for (const auto id : replica_ids) {
-        const auto* replica = metadata.GetReplicaByID(id);
-        if (replica != nullptr && replica->is_memory_replica()) {
-            memory_ids.insert(id);
-        } else {
-            other_ids.insert(id);
-        }
-    }
     std::vector<ReplicaID> erased_replica_ids;
-    {
-        auto memory_replicas = PopReplicasWithCacheTotalAccounting(
-            metadata, [&memory_ids](const Replica& replica) {
-                return replica.status() == ReplicaStatus::REMOVED &&
-                       memory_ids.contains(replica.id());
-            });
-        for (const auto& replica : memory_replicas) {
-            erased_replica_ids.push_back(replica.id());
-        }
-    }  // memory buffers released here
     auto rest = PopReplicasWithCacheTotalAccounting(
-        metadata, [&other_ids](const Replica& replica) {
+        metadata, [&replica_ids](const Replica& replica) {
             return replica.status() == ReplicaStatus::REMOVED &&
-                   other_ids.contains(replica.id());
+                   std::find(replica_ids.begin(), replica_ids.end(),
+                             replica.id()) != replica_ids.end();
         });
     if (rest.empty() && erased_replica_ids.empty()) return;
     for (const auto& replica : rest) {
@@ -5965,7 +5717,11 @@ void MasterService::FinalizeRemovedReplicasAfterDurable(
     dynamic_replication_.RecordReplicaRemoval(metadata, erased_replica_ids);
     ReleaseLocalDiskUsage(rest);
     FreeDfsReplicas(metadata.user_key, rest);
-    FreeAsuReplicas(metadata.user_key, rest, std::nullopt);
+    // v2.3: only the explicit delete-asu path enqueues ASU. Plain Remove
+    // passes false, so the ASU entries remain orphans.
+    if (enqueue_asu_deletes) {
+        FreeAsuReplicas(metadata.user_key, rest, std::nullopt);
+    }
     // ... CancelPromotionTask / Erase / SyncKvObjectState（不变） ...
 }
 ```
@@ -5998,81 +5754,41 @@ if (metadata.TotalLength() == slice_length && !has_read_lease &&
 ```
 
 ```cpp
-// mooncake-store/src/master_service.cpp（差异片段 8：RemoveReplicaTier）
-tl::expected<void, ErrorCode> MasterService::RemoveReplicaTier(
-    const std::string& key, const TenantId& tenant_id, ReplicaType replica_type,
-    bool force) {
-    if (replica_type != ReplicaType::MEMORY) {
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+// mooncake-store/src/master_service.cpp（差异片段 8：BatchRemoveAsuObjects）
+tl::expected<std::vector<ErrorCode>, ErrorCode>
+MasterService::BatchRemoveAsuObjects(
+    const std::vector<std::string>& keys,
+    const std::vector<TenantId>& tenant_ids, bool force) {
+    std::vector<ErrorCode> results(keys.size(), ErrorCode::OK);
+    for (size_t i = 0; i < keys.size(); ++i) {
+        const auto object_id =
+            MakeObjectIdentityForRequest(keys[i], tenant_ids[i]);
+        // Phase 1: capture ASU descriptors (read-only, no lease granted).
+        std::vector<AsuDescriptor> captured;
+        {
+            std::shared_lock<std::shared_mutex> shared(master_state_mutex_);
+            MetadataAccessorRW accessor(this, object_id);
+            if (accessor.Exists()) {
+                captured = CollectAsuDescriptors(accessor.Get());
+            }
+        }
+        // Phase 2: reuse the existing RemoveObject unchanged; it deletes
+        // memory + metadata only and never enqueues ASU.
+        auto removed = RemoveObject(keys[i], tenant_ids[i], force,
+                                    /*allow_managed_weight=*/false);
+        const bool gone = removed.has_value() ||
+                          removed.error() == ErrorCode::OBJECT_NOT_FOUND;
+        if (!gone) {
+            results[i] = removed.error();
+            continue;  // object still alive (lease / processing): keep ASU
+        }
+        // Phase 3: only now enqueue the captured physical ASU deletes.
+        EnqueueAsuDeletes(keys[i], captured, std::nullopt);
     }
-    std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
-    const auto object_id = MakeObjectIdentityForRequest(key, tenant_id);
-    MetadataAccessorRW accessor(this, object_id);
-    if (!accessor.Exists()) {
-        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
-    }
-    auto& metadata = accessor.Get();
-    if (weight_manager_.IsManagedGroup(metadata.group_id)) {
-        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
-    }
-    const auto now = std::chrono::system_clock::now();
-    auto removable = CheckRemovable(metadata, accessor.GetState(), force, now);
-    if (!removable) return removable;
-    if (metadata.HasReplica(&Replica::fn_is_busy)) {
-        return tl::make_unexpected(ErrorCode::OBJECT_REPLICA_BUSY);
-    }
-    if (!metadata.HasReplica(&Replica::fn_is_memory_replica)) {
-        return tl::make_unexpected(ErrorCode::REPLICA_NOT_FOUND);
-    }
-
-    if (enable_ha_ && enable_oplog_) {
-        // Mirror PutRevoke's persist-then-mark ordering for a replica subset.
-        auto remaining = BuildRemainingReplicaDescriptors(
-            metadata, [](const Replica& replica) {
-                return !replica.is_memory_replica();
-            });
-        std::vector<ReplicaID> removed_ids;
-        auto reservation = ReserveBatchOpLogSlot();
-        if (!reservation) return tl::make_unexpected(reservation.error());
-        metadata.VisitReplicas(
-            &Replica::fn_is_memory_replica,
-            [&removed_ids](Replica& replica) {
-                removed_ids.push_back(replica.id());
-                replica.mark_removed();
-            });
-        auto persist_result = AppendReservedOpLogWithDurableFinalize(
-            std::move(reservation.value()), OpType::PUT_END,
-            tenant_id.value(), key,
-            SerializeMetadataForOpLogFromReplicaDescriptors(metadata,
-                                                            remaining),
-            [this, removed_ids = std::move(removed_ids)](
-                const OpLogEntry& durable_entry) {
-                FinalizeRemovedReplicasAfterDurable(durable_entry,
-                                                    removed_ids);
-            });
-        if (!persist_result) return tl::make_unexpected(persist_result.error());
-        return {};
-    }
-
-    const auto previous_kv_media = KvMediaSnapshot(metadata);
-    std::vector<ReplicaID> removed_ids;
-    EraseReplicasWithCacheTotalAccounting(metadata,
-                                          &Replica::fn_is_memory_replica,
-                                          &removed_ids);
-    CancelPromotionTaskForRemovedReplicas(metadata, accessor.GetState(),
-                                          removed_ids);
-    if (!metadata.IsValid()) {
-        accessor.Erase();
-        return {};
-    }
-    SyncKvObjectState(key, metadata, object_id.tenant_id, previous_kv_media);
-    if (metadata.AllReplicas(&Replica::fn_is_completed) &&
-        accessor.InProcessing()) {
-        accessor.EraseFromProcessing();
-    }
-    return {};
+    return results;
 }
 ```
+
 
 ```cpp
 // mooncake-store/src/master_service.cpp（差异片段 9：KvMedia）
@@ -6093,26 +5809,26 @@ tl::expected<void, ErrorCode> MasterService::RemoveReplicaTier(
 
 | 文件 | 位置 | 改动 | kind |
 | --- | --- | --- | --- |
-| `mooncake-store/include/master_service.h` | 1449 附近 | `AllocateReplicas` 声明增加 `const TenantId&`；新增 `asu_runtime_`、`FreeAsuReplicas`、`EnqueueAsuDeletes`、`CollectAsuDescriptors`、`RemoveReplicaTier` 声明 | modify |
+| `mooncake-store/include/master_service.h` | 1449 附近 | `AllocateReplicas` 声明增加 `const TenantId&`；新增 `asu_runtime_`、`FreeAsuReplicas`、`EnqueueAsuDeletes`、`CollectAsuDescriptors`、`BatchRemoveAsuObjects` 声明 | modify |
 | `mooncake-store/src/master_service.cpp` | 4758-4948 | `AllocateReplicas` 增 `TenantId`，DFS 块后铸造 ASU（PROCESSING，排末尾）；`HasExpectedReplicaAllocation` 不变 | risky |
 | `mooncake-store/src/master_service.cpp` | 5016-5041 | `AllocateAndInsertMetadata` 透传 `accessor.GetTenantId()` | modify |
 | `mooncake-store/src/master_service.cpp` | 5047-5138 | `PrepareWriteStart` 新增六条 ASU 校验；`kMaxSliceSize` 检查不变 | modify |
 | `mooncake-store/src/master_service.cpp` | 5300-5307 | `PutEnd` 的 ALL 谓词加 `is_asu_replica` | risky |
 | `mooncake-store/src/master_service.cpp` | 5620-5628、5635-5644 | `PutRevoke` 两处 ALL 谓词加 `is_asu_replica` | risky |
 | `mooncake-store/src/master_service.cpp` | 5409-5412 | offload 触发条件排除 `fn_is_asu_replica` | risky |
-| `mooncake-store/src/master_service.cpp` | 1731-1755 | `EraseReplicasWithCacheTotalAccounting` 在 `erased_replica_ids` 之后新增第四个可选参数 `not_before` 并透传；1753 配 `FreeAsuReplicas` | risky |
-| `mooncake-store/src/master_service.cpp` | 1757-1807 | HA finalize 改 memory→其余 两段 pop；ASU 第二段后入队 | risky |
+| `mooncake-store/src/master_service.cpp` | 1731-1755 | `EraseReplicasWithCacheTotalAccounting` 在 `erased_replica_ids` 之后新增第四个可选参数 `not_before` 并透传；1753 保留 `FreeAsuReplicas`（只作用于传入集合） | risky |
+| `mooncake-store/src/master_service.cpp` | 1757-1807 | HA finalize 增加 `bool enqueue_asu_deletes` 参数；plain Remove 传 false，不捕获/不入队 ASU | risky |
 | `mooncake-store/src/master_service.cpp` | 1844、1907、5257、5897、6099、7080、9535、9623 | 每个 `FreeDfsReplicas` 旁配对 `FreeAsuReplicas` 并传对应 `not_before` | risky |
-| `mooncake-store/src/master_service.cpp` | 2054-2116 | `EraseMetadata` 改捕获→释放 memory→入队 三段 | risky |
+| `mooncake-store/src/master_service.cpp` | 2054-2116 | `EraseMetadata` **不捕获、不入队 ASU**；只删 memory 与元数据（plain Remove 保持原语义） | risky |
 | `mooncake-store/src/master_service.cpp` | 5999-6040 | `UpsertStart` 在 Case B 前短路强制 Case C | risky |
 | `mooncake-store/src/master_service.cpp` | 5986-5995 | 租约闸门从任意非 memory 收窄为 DISK/LOCAL_DISK/DFS | risky |
 | `mooncake-store/src/master_service.cpp` | 11151-11203 | `KvMediaForMetadata`/`KvMediaForRemoval` 加 `is_asu_replica` 归入 disk | modify |
 | `mooncake-store/src/master_service.cpp` | 7583 旁 | 新增 `FreeAsuReplicas`、`EnqueueAsuDeletes`、`CollectAsuDescriptors` | pure-additive |
-| `mooncake-store/src/master_service.cpp` | 7175-7204 旁 | 新增 `RemoveReplicaTier` | pure-additive |
+| `mooncake-store/src/master_service.cpp` | 7175-7204 旁 | 新增 `BatchRemoveAsuObjects`（捕获→既有 `RemoveObject`→入队） | pure-additive |
 | `mooncake-store/src/master_service.cpp` | 5035、6075 | `AllocateReplicas` 调用点透传 `object_id.tenant_id`（5035 经 `AllocateAndInsertMetadata`，tenant 取自 `accessor.GetTenantId()`） | modify |
 | `mooncake-store/src/master_admin_service.cpp` | 1144-1215 | `BatchQueryKeys` 增加 ASU 分支 | modify |
-| `mooncake-store/include/rpc_service.h` + `src/rpc_service.cpp` | `WrappedMasterService::RemoveReplica` | 新增转发与实现；`RegisterPooledHandlers` 实参列表（`rpc_service.cpp:2076-2144`）追加 `&WrappedMasterService::RemoveReplica`（漏这一行服务端不会注册） | pure-additive |
-| `mooncake-store/include/master_client.h` + `src/master_client.cpp` | `MasterClient::RemoveReplica` | 新增方法、`invoke_rpc` 封装与 `RpcNameTraits` 特化（`:353-364` 旁） | pure-additive |
+| `mooncake-store/include/rpc_service.h` + `src/rpc_service.cpp` | `WrappedMasterService::BatchRemoveAsuObjects` | 新增转发与实现；`RegisterPooledHandlers` 实参列表（`rpc_service.cpp:2076-2144`）追加 `&WrappedMasterService::BatchRemoveAsuObjects` | pure-additive |
+| `mooncake-store/include/master_client.h` + `src/master_client.cpp` | `MasterClient::BatchRemoveAsuObjects` | 新增方法、`invoke_rpc` 封装与 `RpcNameTraits` 特化（`:353-364` 旁） | pure-additive |
 | `mooncake-store/src/asu/asu_master_runtime.cpp` | `AsuMasterRuntime::EnqueueDelete` | `not_before`（system_clock）→ `release_at`（steady_clock）唯一一次换算；max(default_kv_lease_ttl_, grace) | pure-additive |
 | `mooncake-store/include/master_config.h` | builder | 新增 `asu_delete_grace_ms`、`asu_delete_max_attempts`、`asu_gc_idle_ms` 并接入 builder（见 3.12） | pure-additive |
 
@@ -6132,7 +5848,7 @@ tl::expected<void, ErrorCode> MasterService::RemoveReplicaTier(
 | `master_delete` | true | Master 是否自持 delete-only client；false 退化为逻辑删除并告警 |
 | `require_asu` | false | ASU 层严格性开关。false：主层成功而 ASU 失败只 revoke ASU，Put 仍成功并记 `asu_degraded_total`；true：ASU 失败使整个 Put 失败（`PutRevoke(ALL)`，错误码取 ASU 根因）。仅约束 `TIERED_MEMORY_THEN_ASU` 写，`asu_replica_num == 0` 的 Put 不受影响（v2.1 新增） |
 | `client_config_path` | 空 | `kv::KvClient::Init` 的配置文件路径 |
-| `max_object_bytes` | `kAsuMaxObjectBytes` | 单对象逻辑字节上限；`PrepareWriteStart` 用它前置拒绝 |
+| `max_object_bytes` | `kAsuMaxObjectBytes`（= 16,776,192） | 单对象逻辑字节上限；`PrepareWriteStart` 用它前置拒绝，含 1,008 B 窗口 |
 | `staging_slots` | 8 | Client staging slot 数；同时是单 task 的 entry 上限与跨对象在飞 slot 上限，一个 BatchGet 可以包含任意多对象（逐对象排空） |
 | `batch_max_entries` | 110 | 单 task 提交条数上限 |
 | `batch_max_bytes` | 64 MiB | 单 task 提交字节上限 |
@@ -6154,7 +5870,7 @@ tl::expected<void, ErrorCode> MasterService::RemoveReplicaTier(
 
 - `enable == true` 时 `client_config_path` 非空；
 - `require_asu == true` 时 `enable` 必须为 true；否则 `Validate()` 返回 false 并打 LOG(ERROR)（配置矛盾，不允许静默全成功）；
-- `1 <= max_object_bytes <= kAsuMaxObjectBytes`；
+- `1 <= max_object_bytes <= kAsuMaxObjectBytes == 16,776,192`；任何大于该值的配置在启动时被拒绝，运行期由 `PrepareWriteStart` 返回 `ASU_OBJECT_TOO_LARGE`；
 - `staging_slots >= 1`；
 - `1 <= batch_max_entries <= kBatchMaxEntries == 110`；
 - `0 < batch_max_bytes < (1ull << 32)`（即严格小于 4 GiB；`buffer.region.size` 在 SDK 内被 `static_cast<uint32_t>`，等于 4 GiB 会截断为 0，必须自己拦）；
@@ -6318,11 +6034,11 @@ bool AsuConfig::Validate() const {
 
 #### 3.12.2 本轮发现的前提性冲突与裁决归属
 
-以下五条是跨章节一致性说明；P-1 与 P-3 已于 v2.0/v2.1 裁决（见 §6.5），P-2/P-4/P-5 为已核实的实现约束，均不再提交 §6 裁决：
+以下五条是跨章节一致性说明；P-1 与 P-3 已于 v2.0/v2.1/v2.3 裁决（见 §6.5），P-2/P-4/P-5 为已核实的实现约束，均不再提交 §6 裁决：
 
-- **P-1 同步副本 vs 降级（已裁决）**：要求 1 把 ASU 放在 memory 之后，要求 3 又把 memory 当作必须先删的浅层，两者共同指向「memory 必需、ASU 可选」。v2 已定稿为**分层降级**（主层成功 + ASU 失败 → `PutEnd(MEMORY)` + `PutRevoke(ASU)`、Put 成功并记 `asu_degraded`），不再作为待裁决项；v2.1 把失败语义落为配置项 `require_asu`：默认 false 保持**分层降级**（主层成功 + ASU 失败 → `PutEnd(MEMORY)` + `PutRevoke(ASU)`、Put 成功并记 `asu_degraded`）；true 时 ASU 失败即整体失败（`PutRevoke(ALL)`，错误码取 ASU 根因），调用方通过既有错误码感知。两种模式均不再列为待裁决，见 §6.5。
-- **P-2 `IAsuKvClient` 形状**：3.5 新增 `SubmitLoad`/`WaitTask` 以支撑 3.6 的「多对象先提交再逐个等待」。早期草案只写了 `BatchLoad` 的同步修复；§2.1 的类图已同步补齐这两个方法。
-- **P-3 多 chunk 不可达与单 task 语义**：默认部署受 `kMaxSliceSize`（约 16 MiB）限制，`chunk_count == 1`，「每对象一个 task」与「同一对象不拆 task」同时成立。多 chunk 路径（对象 > 16 MiB）已裁决不豁免 `kMaxSliceSize`（v2.1，见 §6.5），默认部署不可达；3.6 允许按 `batch_max_bytes` 拆 task，文档不宣称多 chunk 单 task。
+- **P-1 同步副本 vs 降级（已裁决）**：要求 1 把 ASU 放在 memory 之后，要求 3 又把 memory 当作必须先删的浅层，两者共同指向「memory 必需、ASU 可选」。v2 已定稿为**分层降级**（主层成功 + ASU 失败 → `PutEnd(MEMORY)` + `PutRevoke(ASU)`、Put 成功并记 `asu_degraded`），不再作为待裁决项；v2.1 把失败语义落为配置项 `require_asu`：默认 false 保持**分层降级**；true 时 ASU 失败即整体失败（`PutRevoke(ALL)`，错误码取 ASU 根因）。两种模式均不再列为待裁决，见 §6.5。
+- **P-2 `AsuKvClientInterface` 形状**：3.5 新增 `SubmitLoad`/`WaitTask` 以支撑 3.6 的「多对象先提交再逐个等待」。它们是批量形态，不是单条 `StoreAsync`/`LoadAsync`；§2.1 的类图已同步补齐这两个方法。
+- **P-3 一个对象一条 entry 与跨对象合批**：一个对象只贡献一条 entry，`offset` 恒 0；`PlanBatches` 按对象边界把多个对象合并进同一 task，条数 ≤ 110 且字节 ≤ 64 MiB，绝不切开单个对象。对象上限 16,776,192 B，`(16,776,192, 16,777,200]` 窗口由 `PrepareWriteStart` 显式拒绝。v2.1 已裁决不豁免 `kMaxSliceSize`（见 §6.5）。
 - **P-4 range 入口清单**：早期草案列了 `client_service.cpp:1661` 与 `:4907` 两个 range 调用点必须传 `allow_asu=false`；实读发现 `real_client.cpp:5261`（get_into_ranges）是第三个同类入口，v2 一并纳入。
 - **P-5 restore 路径已核实存在**：v1.0 引用的 `master_service.cpp:3380-3395`、`:3955-3970` 对应 `ConstructLegacyStandbyReplicas`（3296 起）与 `RestoreFromStandbyStateCore`（3665 起）中的 descriptor→Replica 重建，未知副本类型分别在 3388-3393、3964-3969 的 `else` 以 `INVALID_PARAMS` 拒绝。v2.0 必须在这两处补 ASU 分支（详见 3.11「恢复」），否则含 ASU 的恢复会整体失败（FMEA-11）。
 
@@ -6339,7 +6055,7 @@ bool AsuConfig::Validate() const {
 | 要求 | 必须证明的事实 | 覆盖用例 |
 | --- | --- | --- |
 | 要求 1 写序 | memory 全部成功后才调用 `BatchStore`；主层失败时 ASU 零调用；ASU 失败走 degrade；BatchUpsert 降级子集正确 revoke ASU；两阶段之间崩溃可恢复 | TC-91、TC-92、TC-93、TC-94、TC-95、TC-106、TC-107、TC-108、TC-119、TC-126 |
-| 要求 2 读择优 | Master 返回全部可读副本；有 memory 时不选 ASU、只有 ASU 时选 ASU；选中 ASU 走 `BatchLoadAsync` 且 chunk 到 entry 映射正确；多对象批量读互不污染且可超过 staging_slots；ASU 读失败不回退 | TC-15、TC-96、TC-97、TC-98、TC-99、TC-100、TC-111、TC-122、TC-123、TC-125、TC-127 |
+| 要求 2 读择优 | Master 返回全部可读副本；有 memory 时不选 ASU、只有 ASU 时选 ASU；选中 ASU 走 `BatchLoadAsync` 且对象到 entry 映射正确；多对象批量读互不污染且可超过 staging_slots；ASU 读失败不回退 | TC-15、TC-96、TC-97、TC-98、TC-99、TC-100、TC-111、TC-122、TC-123、TC-125、TC-127 |
 | 要求 3 删除分层 | 删 memory 只删 memory 且 ASU 仍可读；删 ASU 先删 memory；删 memory 失败时 ASU 不动；删 ASU 失败时 memory 已删、重试幂等；并发新 epoch 不误删 | TC-101、TC-102、TC-103、TC-104、TC-105、TC-112、TC-113、TC-120、TC-121、TC-124 |
 | 交叉 | ASU 尚在写时不参与读、不允许删 | TC-104、TC-125 |
 | 内存注册与 entry 构建 | Init 注册一次成功且四条判据齐全；entry 字段全部来自 descriptor/arena，`mrKey` 恒空、`handle` 恒为 canonical handle | TC-01、TC-37、TC-63、TC-134、TC-135、TC-136、TC-137、TC-138、TC-139 |
@@ -6351,52 +6067,52 @@ bool AsuConfig::Validate() const {
 | --- | --- | --- | --- | --- | --- |
 | TC-01 / FMEA-01 | init | Client Init 视图为空时失败并可重试 | `FakeAsuKvClient` 首次 `Register` 返回空 handles 且 `IsReady` 为假，第二次返回非空 handles 且 `tokenId != 0` | 调用 `AsuClientRuntime::Create` | 首次退避重试，第二次成功；`registered handles` 非空且不等于 `kInvalidMRHandle`；`tokenId` 非 0 |
 | TC-02 | init | Master delete-only client 不注册数据 buffer | `master_delete=true` | 创建 `AsuMasterRuntime` 并统计 `Register` 调用次数 | `Register` 调用 0 次；`Query` 与 `Delete` 可用 |
-| TC-04 | boundary | chunk 常量与边界 | 无 | 对 `S` 取 1、511、512、513、16,776,192、16,776,193、`kMaxObjectBytes`、`kMaxObjectBytes+1`，调用 `ChunkCount`、`ChunkDataLen`、`ChunkWireLen`、`ChunkOffset` | `N` 与 `wire_len` 符合公式；超上限被拒绝；`sizeof(AsuRecordHeader)==512`；`kChunkStrideBytes==16,776,704` |
-| TC-05 / FMEA-02 | boundary | 16,776,704 单 entry 上限 | `S==kMaxObjectBytes` | 生成全部 chunk 并断言 `wire_len` | 全部 `wire_len<=16,776,704`；最大 `wire_len` 恰为 16,776,704 |
-| TC-06 / FMEA-03 | boundary | offset 32-bit 不溢出 | `S==kMaxObjectBytes` | 计算最后 chunk 的 `offset+wire_len` | 小于 `2^32`；`offset` 为 512 的倍数 |
-| TC-07 | write | 单 chunk 写读往返 | `FakeAsuKvClient` 内存 KV | `WriteObject` 写 `S=1MiB`，再 `ReadObject` | 字节完全一致；header 与 payload CRC 校验通过 |
-| TC-08 | write | 多 chunk 写读往返 | 直接单测，绕过 CACHELIB 的 `kMaxSliceSize` | `S=40MiB`，`WriteObject` 后 `ReadObject` | `N=3`；只调用 `BatchStoreAsync` 与 `BatchLoadAsync`；chunk0 最后写；读回完全一致 |
-| TC-09 | write | chunk0 最后写作为提交点 | `FakeAsuKvClient` 记录提交顺序与 task 分组 | `WriteObject` 写 `S=40MiB` | 恰好两次 `BatchStoreAsync`：第一次含 chunk1 与 chunk2，第二次只含 chunk0；两次均 `Wait` 后才进入下一步；提交序列为 chunk1、chunk2、chunk0 |
-| TC-10 / FMEA-17 | write | 部分失败先清理再降级 | Fake 让第 2 个 chunk 失败 | `WriteObject` | 返回错误；已成功 chunk 收到 best-effort `Delete`；调用方按 degrade 处理（TC-107），不按整 Put 失败处理 |
-| TC-16 / FMEA-21 | read | 请求长度小于 object_size 被拒绝 | 对象 1MiB | 直接调 `AsuStorageBackend::ReadObject`，slices 只有 512KiB | 入口返回 `INVALID_PARAMS`；不发起 `BatchLoad`；不产生截断读（v1.0 的前缀读路径已废弃） |
-| TC-17 / FMEA-21 | read | 截断读跳过 payload CRC（v2.0 废弃） | 多 chunk | 读前 1.5 个 chunk | v2.0 不再支持截断读；由 TC-16 覆盖。payload CRC-32C 在任何读路径都不跳过 |
-| TC-18 / FMEA-20 | read | header CRC 损坏 | 篡改 header 一字节 | `ReadObject` | 返回 `ASU_RECORD_CORRUPT`；不返回任何 payload |
-| TC-19 / FMEA-19 | read | payload CRC 损坏 | 篡改 payload 一字节 | `ReadObject` | 返回 `ASU_RECORD_CORRUPT`；不返回错误字节 |
-| TC-20 / FMEA-20 / FMEA-23 | read | key_fingerprint 不匹配 | Fake 返回另一对象的 header | `ReadObject` | 返回 `ASU_KEY_COLLISION` 或 `ASU_RECORD_CORRUPT` |
-| TC-22 | query | QueryAsync 物理探活 | Fake 提供 `exists` 位图 | `QueryObject` 查询存在与不存在的 `key_id` | 按位图返回 true 或 false；IO 错误返回 `unexpected` |
-| TC-24 / FMEA-18 | remove | 删除不存在 key 幂等 | Fake 返回 DELETE raw `0x00` | GC 执行 `DeleteObject` | 视为成功；不重试 |
+| TC-04 | boundary | 单 entry 常量与边界 | 无 | 对 `S` 取 1、511、512、513、16,776,191、16,776,192、16,776,193、16,777,200，调用 `WireLen`、`IsValidEntry`、`IsValidObjectSize`、`PlanBatches` | `wire_len = 512 + AlignUp(S,512)`；16,776,192 合法、16,776,193 与 16,777,200 被拒；`sizeof(AsuRecordHeader)==512`；`kEntryMaxBytes==16,776,704` |
+| TC-05 / FMEA-02 | boundary | 16,776,704 单 entry 上限 | `S==16,776,192` | 断言 `wire_len` | `wire_len == 16,776,704`；`offset == 0` |
+| TC-06 / FMEA-03 | boundary | offset 恒为 0 | 多个不同 `S` | 断言 `BuildEntry` 与 header 的 `data_offset` | entry `offset==0`；header `data_offset==0`；不存在多 offset 分片 |
+| TC-07 | write | 单 entry 写读往返 | `FakeAsuKvClient` 内存 KV | `BatchStoreObjects` 写一个 1MiB 对象，再 `BatchLoadObjects` | 字节完全一致；header 与 payload CRC 校验通过 |
+| TC-08 | write | 跨对象合批写读往返 | 直接单测，绕过 CACHELIB 的 `kMaxSliceSize` | 5 个 1MiB 对象一次 `BatchStoreObjects`，再一次 `BatchLoadObjects` | 只调用 `BatchStoreAsync` 与 `BatchLoadAsync`；`PlanBatches` 把它们合并进同一 task；每个对象恰好一条 entry、`offset=0`；读回完全一致 |
+| TC-09 | write | 任务级 CANCELED 使同 task 全部对象失败 | `FakeAsuKvClient` 让某 task 预发送失败，返回整批 CANCELED | `BatchStoreObjects` 提交多个对象 | 同 task 内全部对象的结果为失败；其它 task 的对象不受影响；不把部分 entry 当成功 |
+| TC-10 / FMEA-17 | write | 单 entry 失败逐对象归因 | Fake 让某对象的 entry 失败 | `BatchStoreObjects` | 只有该对象失败；同 task 其它对象按 `entryStatus` 成功；失败对象收到 best-effort `BatchRemoveObjects`；调用方按 degrade 处理（TC-107） |
+| TC-16 / FMEA-21 | read | 请求长度小于 object_size 被拒绝 | 对象 1MiB | 直接调 `AsuStorageBackend::BatchLoadObjects`，slices 只有 512KiB | 入口返回 `INVALID_PARAMS`；不发起 `BatchLoad`；不产生截断读 |
+| TC-17 / FMEA-21 | read | 截断读跳过 payload CRC（v2.0 废弃） | 对象 1MiB | 读前 512KiB | v2.0 不再支持截断读；由 TC-16 覆盖。payload CRC-32C 在任何读路径都不跳过 |
+| TC-18 / FMEA-20 | read | header CRC 损坏 | 篡改 header 一字节 | `BatchLoadObjects` | 返回 `ASU_RECORD_CORRUPT`；不返回任何 payload |
+| TC-19 / FMEA-19 | read | payload CRC 损坏 | 篡改 payload 一字节 | `BatchLoadObjects` | 返回 `ASU_RECORD_CORRUPT`；不返回错误字节 |
+| TC-20 / FMEA-20 / FMEA-23 | read | key_fingerprint 不匹配 | Fake 返回另一对象的 header | `BatchLoadObjects` | 返回 `ASU_KEY_COLLISION` 或 `ASU_RECORD_CORRUPT` |
+| TC-22 | query | QueryAsync 物理探活 | Fake 提供 `exists` 位图 | `BatchIsExist` 查询存在与不存在的 `key_id` | 按位图返回 true 或 false；IO 错误返回 `unexpected` |
+| TC-24 / FMEA-18 | remove | 删除不存在 key 幂等 | Fake 返回 DELETE raw `0x00` | GC 执行 `BatchRemoveObjects` | 视为成功；不重试 |
 | TC-25 / FMEA-18 | remove | 删除失败重试与丢弃 | Fake 连续返回 `IO_ERROR` | GC 执行 | 指数退避至 `asu_delete_max_attempts` 后打 WARN；`master_asu_delete_dropped_total` 加 1 |
 | TC-26 | remove | 删除去重 | 同一 `key_id` 两次入队 | 检查 `AsuDeleteQueue::Size` 与内部表 | 只保留一项；`release_at` 取最早值 |
-| TC-28 / FMEA-02 / FMEA-38 | fault-injection | 预发送失败整批 CANCELED | Fake 按 SDK 预发送失败语义返回整批 `CANCELED` 的 `entryStatus`，并绕过本层预检 | `BatchStore` 多 chunk | `AsuStorageBackend` 把整批映射为 `TRANSFER_FAIL`；不把部分 entry 当成功；不重试脏数据 |
-| TC-29 / FMEA-05 / FMEA-06 | fault-injection | Wait 超时隔离 slot | Fake 在 `wait_base_ms` 之后返回 `TIMEOUT` | `WriteObject` | 该 staging slot 进入 quarantine；后续 `Acquire` 不复用；返回 `TRANSFER_FAIL`；`FreeSlots()` 减 1 |
-| TC-30 / FMEA-07 | fault-injection | CQE_OUT_OF_CREATE_SIZE | Fake 返回 `CQE_OUT_OF_CREATE_SIZE（0x712）` | `WriteObject` | 映射 `ASU_OBJECT_TOO_LARGE`；清理已写 chunk；删除半成品 |
+| TC-28 / FMEA-02 / FMEA-38 | fault-injection | 预发送失败整批 CANCELED | Fake 按 SDK 预发送失败语义返回整批 `CANCELED` 的 `entryStatus`，并绕过本层预检 | `BatchStoreObjects` 多对象 | 同 task 内全部对象映射为失败；不把部分 entry 当成功；不重试脏数据 |
+| TC-29 / FMEA-05 / FMEA-06 | fault-injection | Wait 超时隔离 slot | Fake 在 `wait_base_ms` 之后返回 `TIMEOUT` | `BatchStoreObjects` | 该 staging slot 进入 quarantine；后续 `Acquire` 不复用；返回 `TRANSFER_FAIL`；`FreeSlots()` 减 1 |
+| TC-30 / FMEA-07 | fault-injection | CQE_OUT_OF_CREATE_SIZE | Fake 返回 `CQE_OUT_OF_CREATE_SIZE（0x712）` | `BatchStoreObjects` | 映射 `ASU_OBJECT_TOO_LARGE`；清理该对象 entry |
 | TC-32 / FMEA-26 | compatibility | ReplicateConfig compatible 字段 | 无 | 对比 `get_type_code<ReplicateConfig>`；旧 reader 解析新配置 | 类型码不变；旧 reader 忽略 `asu_replica_num`，读取用 `value_or(0)` |
 | TC-36 | init | Init 配置路径或连接失败时明确失败 | Fake `Init` 返回 `CONNECTION_ERROR`；或配置路径不存在 | 调用 `AsuClientRuntime::Create` | 返回明确错误；`IsReady()==false`；进程不进入可服务状态；不静默降级 |
 | TC-37 / FMEA-04 / FMEA-62 / FMEA-65 | init | 内存注册失败时 Init 失败 | Fake `Register` 分别返回 `BUFFER_NOT_SUPPORTED`、空 handles、条数不符、`tokenId=0`；另用缺 `asuSharedProvider` 的真实配置文件 | 创建 `AsuClientRuntime` | 四种返回都按失败处理；退避重试后仍失败则 Init 失败；不创建 `AsuStagingArena`；不继续服务 |
 | TC-38 | init | 能力协商不可用时 Init 失败 | Fake `Init` 或探测 `Query` 返回 `NOT_INITIALIZED` 或 `UNSUPPORTED` | 创建 `AsuClientRuntime` 与 `AsuMasterRuntime` | 返回 `ASU_SERVICE_UNAVAILABLE`；打 ERROR；不把 `IsReady` 置真；真实 `ServerKvCapabilities` 不足由 H1 与 H9 真机验证 |
-| TC-39 / FMEA-02 | boundary | 超过单 entry 上限 1B 被预检拦截 | 构造 `wire_len=16,776,705` 的 entry | 调用 `WriteObject` | 返回 `ASU_OBJECT_TOO_LARGE`；`BatchStore` 调用次数为 0 |
+| TC-39 / FMEA-02 | boundary | 超过单 entry 上限 1B 被预检拦截 | 构造 `wire_len=16,776,705` 的 entry | 调用 `BatchStoreObjects` | 返回 `ASU_OBJECT_TOO_LARGE`；`BatchStore` 调用次数为 0 |
 | TC-40 | boundary | 恰好 512B 对齐的尺寸 | 无 | 取 payload 512、1024、16,776,192 | `wire_len` 分别为 1024、1536、16,776,704；全部为 512 的倍数 |
-| TC-41 / FMEA-02 / FMEA-29 | boundary | 未对齐 payload 与未对齐地址 | payload 513；另构造 `buffer.region.addr` 非 512 倍数 | 调用 `WriteObject` | payload 513 补齐到 1024，`wire_len=1536`，填充不参与 CRC；未对齐 addr 在提交前被拒绝 |
-| TC-42 | boundary | 0 长度对象被拒绝 | 无 | `S=0`，调用 `ChunkCount(0)` 与 `WriteObject` | `ChunkCount(0)==0`；`WriteObject` 返回 `INVALID_PARAMS`；不产生空 entry |
-| TC-43 / FMEA-03 | boundary | 单 key 逼近 4GiB offset 上限 | `S=kMaxObjectBytes` | 计算最后一个 chunk 的 `offset`、`wire_len`、`region.size` | `offset+wire_len<2^32`；`region.size<4GiB`；`stored_total=512+align_up(S)<2^32` |
-| TC-44 / FMEA-02 | fault-injection | 逐 entry 预检确实拦住整批 CANCELED | 同一批含一个超限 entry 与一个合法 entry | 调用 `AsuStorageBackend::WriteObject` | 在提交前拒绝；`FakeAsuKvClient` 捕获 0 次 `BatchStore`；不出现 `CANCELED` |
-| TC-45 / FMEA-21 | read | 请求长度大于对象长度时 R 取 object_size | 对象 1MiB | 传入 2MiB 的 slices | 入口合法；`R=min(SliceBytes, object_size)=1MiB`；只读 1MiB 对应 chunk；1MiB 之后的目标缓冲保持原值；不越界写 |
-| TC-46 / FMEA-07 / FMEA-18 / FMEA-37 | fault-injection | ASU 错误码映射矩阵 | 参数化 Fake 返回不同 `StatusCode` | 逐项调用 `WriteObject`、`ReadObject`、`DeleteObject` | `NOT_INITIALIZED→ASU_SERVICE_UNAVAILABLE`；`CONNECTION_ERROR`、`IO_ERROR→TRANSFER_FAIL`；`RESOURCE_BUSY→TRANSFER_FAIL`（不重试）；`BUFFER_NOT_REGISTERED→TRANSFER_FAIL`；`TIMEOUT` 归不确定；`PARTIAL_FAILED` 进入逐 entry 归因而不整体失败；`ENTRY_KEY_NOT_FOUND`、`ENTRY_DATA_NOT_EXIST→REPLICA_IS_GONE`；`ENTRY_DELETE_FAILED` 可重试；`CQE_OUT_OF_CREATE_SIZE→ASU_OBJECT_TOO_LARGE`；`CQE_KEY_ALREADY_EXISTED` 按 H3 结论处理 |
+| TC-41 / FMEA-02 / FMEA-29 | boundary | 未对齐 payload 与未对齐地址 | payload 513；另构造 `buffer.region.addr` 非 512 倍数 | 调用 `BatchStoreObjects` | payload 513 补齐到 1024，`wire_len=1536`，填充不参与 CRC；未对齐 addr 在提交前被拒绝 |
+| TC-42 | boundary | 0 长度对象被拒绝 | 无 | `S=0`，调用 `IsValidObjectSize(0)` 与 `BatchStoreObjects` | `IsValidObjectSize(0)==false`；返回 `INVALID_PARAMS`；不产生空 entry |
+| TC-43 / FMEA-03 | boundary | 最大对象不触碰 4GiB | `S=16,776,192` | 计算 `wire_len`、`region.size` | `wire_len=16,776,704<4GiB`；`region.size<4GiB`；`offset==0` |
+| TC-44 / FMEA-02 | fault-injection | 逐 entry 预检确实拦住整批 CANCELED | 同一批含一个超限 entry 与一个合法 entry | 调用 `AsuStorageBackend::BatchStoreObjects` | 超限对象在提交前被拒绝；`FakeAsuKvClient` 捕获 0 次 `BatchStore`；不出现 `CANCELED` |
+| TC-45 / FMEA-21 | read | 请求长度大于对象长度时只读 object_size | 对象 1MiB | 传入 2MiB 的 slices | 入口合法；只读 1MiB；1MiB 之后的目标缓冲保持原值；不越界写 |
+| TC-46 / FMEA-07 / FMEA-18 / FMEA-37 | fault-injection | ASU 错误码映射矩阵 | 参数化 Fake 返回不同 `StatusCode` | 逐项调用 `BatchStoreObjects`、`BatchLoadObjects`、`BatchRemoveObjects` | `NOT_INITIALIZED→ASU_SERVICE_UNAVAILABLE`；`CONNECTION_ERROR`、`IO_ERROR→TRANSFER_FAIL`；`RESOURCE_BUSY→TRANSFER_FAIL`；`BUFFER_NOT_REGISTERED→TRANSFER_FAIL`；`TIMEOUT` 归不确定；`PARTIAL_FAILED` 进入逐 entry 归因；`ENTRY_KEY_NOT_FOUND`、`ENTRY_DATA_NOT_EXIST→REPLICA_IS_GONE`；`ENTRY_DELETE_FAILED` 可重试；`CQE_OUT_OF_CREATE_SIZE→ASU_OBJECT_TOO_LARGE`；`CQE_KEY_ALREADY_EXISTED` 按 H3 结论处理 |
 | TC-54 / FMEA-03 | boundary | region.size 大于等于 4GiB 被拒绝 | Fake 记录 `KVBuffer` | 构造 `region.size=4GiB` 与 `4GiB+1` | 在 `static_cast<uint32>` 之前拒绝；`BatchStore` 调用次数为 0 |
-| TC-55 / FMEA-04 / FMEA-61 | fault-injection | 未注册 MRHandle 被预检拦截 | 传入随机 `MRHandle` | 调用 `WriteObject` | 提交前返回 `ASU_DESCRIPTOR_INVALID`（与 `AsuEntryPrecheck` 及 TC-134 一致）；不进入 SDK 等待阶段，不出现 `BUFFER_NOT_REGISTERED` |
-| TC-56 / FMEA-08 | fault-injection | 0x723 key 已存在 | Fake 对同一 `key_id`、同一 `offset` 返回 `0x723` | 连续两次 `WriteObject` | 按 H3 结论选择覆盖或先 `Delete` 再 `Store`；不得静默丢数据；错误可归因 |
+| TC-55 / FMEA-04 / FMEA-61 | fault-injection | 未注册 MRHandle 被预检拦截 | 传入随机 `MRHandle` | 调用 `BatchStoreObjects` | 提交前返回 `ASU_DESCRIPTOR_INVALID`（与 `AsuEntryPrecheck` 及 TC-134 一致）；不进入 SDK 等待阶段，不出现 `BUFFER_NOT_REGISTERED` |
+| TC-56 / FMEA-08 | fault-injection | 0x723 key 已存在 | Fake 对同一 `key_id`、同一 `offset=0` 返回 `0x723` | 连续两次 `BatchStoreObjects` | 按 H3 结论选择覆盖或先 `BatchRemoveObjects` 再 `Store`；不得静默丢数据；错误可归因 |
 | TC-63 / FMEA-29 / FMEA-63 | boundary | staging arena 地址与 entry 字段对齐 | 无 | 创建 `AsuStagingArena`，检查每个 slot 的 `addr`、`capacity`、`handle`，并抓取提交的 `KVBuffer` | `addr%512==0`；`capacity>=slot_bytes`；每个 slot 的 `handle == arena.Handle()`；每次提交的 `buffer.region.size` 精确等于 `read_len` 或 `wire_len` 而不是 slot 容量；`buffer.handle == arena.Handle()`；`!mrKey.has_value()`；`FreeSlots()` 初值等于 `staging_slots` |
 | TC-64 / FMEA-30 | boundary | key_id 为零时置 1 | 构造 XXH64 结果为 0 的输入 | 先 `tenant.MakeScopedKey(user_key)`，再调用 `AsuKeyCodec::Derive(scoped_key, epoch)` | `key_id` 被置 1；同一 `scoped_key+epoch` 结果确定；不同 `epoch` 得到不同 `key_id`；不同 tenant 得到不同 `key_id` |
 | TC-65 / FMEA-31 | key-codec | descriptor 是 key 的唯一权威 | 同一 `user_key`，客户端 tenant 配置与 Master 不同 | 客户端只读 `descriptor.key_id`，不自行重算；对比 `AsuKeyCodec::Derive` | 读路径始终使用 descriptor；客户端重算只用于测试对照；不同 tenant 的 `scoped_key` 产生不同 `key_id` |
-| TC-66 / FMEA-34 | recovery | 只写 chunk1、缺 chunk0 时不可读 | Fake 中只保留 chunk1 | `ReadObject` | 返回 `REPLICA_IS_GONE` 或 `ASU_RECORD_CORRUPT`；不返回部分数据；Master 元数据仍可为 COMPLETE |
+| TC-66 / FMEA-34 | recovery | 单 entry 残缺时不可读 | Fake 中把对象 entry 的 header 或 payload 截断 | `BatchLoadObjects` | 返回 `REPLICA_IS_GONE` 或 `ASU_RECORD_CORRUPT`；不返回部分数据；Master 元数据仍可为 COMPLETE |
 | TC-67 / FMEA-35 | remove | 删除宽限期不小于读租约 TTL | 配置 `asu_delete_grace_ms` 与 `default_kv_lease_ttl_` | 计算 `release_at`；构造 grace 小于 lease 的配置 | `release_at=max(now, not_before)+max(DEFAULT_DEFAULT_KV_LEASE_TTL, asu_delete_grace_ms)`；grace 小于 lease 时归一化或拒绝启动 |
-| TC-69 / FMEA-37 | fault-injection | RESOURCE_BUSY 归入降级 | Fake 返回 `RESOURCE_BUSY` | `WriteObject` 后走 finalize | `WriteObject` 记录 `TRANSFER_FAIL` 归因；`require_asu=false` 时 `DetermineFinalizeDecision` 返回 degrade 而不是整 Put 失败、记 `asu_write_failures_total{code=RESOURCE_BUSY}` 与 `asu_degraded_total`；`require_asu=true` 时返回严格失败（`{nullopt, ALL, false}`），Put 失败且记 `asu_required_failures_total`（v1.0 的「直接失败」语义已由 FMEA-37 修订） |
+| TC-69 / FMEA-37 | fault-injection | RESOURCE_BUSY 归入降级 | Fake 返回 `RESOURCE_BUSY` | `BatchStoreObjects` 后走 finalize | 该对象记录 `TRANSFER_FAIL` 归因；`require_asu=false` 时 `DetermineFinalizeDecision` 返回 degrade 而不是整 Put 失败、记 `asu_write_failures_total{code=RESOURCE_BUSY}` 与 `asu_degraded_total`；`require_asu=true` 时返回严格失败（`{nullopt, ALL, false}`），Put 失败且记 `asu_required_failures_total` |
 | TC-70 / FMEA-38 | read | ASU 不进入 TransferEngine | 只含 `AsuDescriptor` 的 `Replica::Descriptor` | 调用 `TransferRead` 与 `transfer_task` 的读写入口 | 显式返回 `NOT_SUPPORTED` 或 `INVALID_REPLICA`；不调用 `get_disk_descriptor`；不抛 `std::runtime_error` |
-| TC-71 / FMEA-20 | read | header 逐字段篡改 | 参数化篡改 `magic`、`version`、`header_bytes`、`header_crc32c`、`key_id`、`key_fingerprint`、`object_epoch`、`object_size`、`chunk_index`、`chunk_count`、`data_offset`、`chunk_payload` | 逐个字段调用 `DecodeAndValidate` | `key_id` 或 `key_fingerprint` 不一致返回 `ASU_KEY_COLLISION`；其余字段不一致返回 `ASU_RECORD_CORRUPT`；两者都不返回 payload |
-| TC-72 | write | CRC 按地址序计算 | Fake 乱序完成多 chunk | 写入后读取并校验 | 写端与读端均按地址序计算 `data_crc32c`；不按完成顺序增量拼接；多 chunk 读回一致 |
+| TC-71 / FMEA-20 | read | header 逐字段篡改 | 参数化篡改 `magic`、`version`、`header_bytes`、`header_crc32c`、`key_id`、`key_fingerprint`、`object_epoch`、`object_size`、`data_offset`、`data_len`、`data_crc32c` | 逐个字段调用 `DecodeAndValidate` | `key_id` 或 `key_fingerprint` 不一致返回 `ASU_KEY_COLLISION`；其余字段不一致（含 `data_offset!=0`）返回 `ASU_RECORD_CORRUPT`；两者都不返回 payload |
+| TC-72 | write | CRC 按地址序计算 | Fake 乱序完成多个对象的 entry | 写入后读取并校验 | 写端与读端均按地址序计算 `data_crc32c`；读回一致 |
 | TC-73 | boundary | AsuRecordHeader 512B 布局 | 无 | 检查 `sizeof`、`reserved` 清零、字段偏移 | `sizeof(AsuRecordHeader)==512`；`reserved` 全 0；字段偏移与规范一致 |
 | TC-74 / FMEA-12 | remove | TakeDue 只取到期项 | 队列含 `release_at` 在未来与已到期的两项 | 调用 `TakeDue(now, max_items)` | 只返回已到期项；未来项保持 pending；按 `key_id` 去重 |
-| TC-89 | compatibility | AsuDescriptor 线格式与 Replica 构造 | 无 | `sizeof(AsuDescriptor)`；`struct_pack` 往返；`Replica(AsuDescriptor, PROCESSING)` 后取 `get_descriptor()` | 大小为 48B；往返字段一致；`is_asu_replica()==true`；`is_available()==true`；`transport_endpoint()==nullopt`；`get_segment_names()` 为空 |
+| TC-89 | compatibility | AsuDescriptor 线格式与 Replica 构造 | 无 | `sizeof(AsuDescriptor)`；`struct_pack` 往返；`Replica(AsuDescriptor, PROCESSING)` 后取 `get_descriptor()` | 大小为 40B；往返字段一致；`is_asu_replica()==true`；`is_available()==true`；`transport_endpoint()==nullopt`；`get_segment_names()` 为空 |
 | TC-91 | write-order | DetermineReplicaWriteMode 新增 TIERED 判定 | 纯函数测试 | `{replica_num=1,nof=1,dfs=0,asu=1}`、`{1,0,0,asu=1}`、`{1,0,0,asu=0}`、`{2,0,0,asu=1}` | 前两者返回 `TIERED_MEMORY_THEN_ASU`（不被 FLEXIBLE/RELIABLE/SINGLE 吃掉）；第三者返回 `SINGLE_REPLICA`；第四者返回 `TIERED_MEMORY_THEN_ASU` |
 | TC-92 | write-order | 非法 ASU 配置被 PrepareWriteStart 拒绝 | Master 起服，ASU runtime 就绪 | 分别以 `asu=2`、`asu=1+nof=1`、`asu=1+dfs=1`、`asu=1+replica_num=0` 调 `PutStart` | 全部 `INVALID_PARAMS`；不产生任何副本与元数据；`AllocateReplicas` 调用次数为 0 |
 | TC-93 | write-order | DetermineFinalizeDecision 四分支 | 构造 `ReplicaTransferSummary`，调用显式传 `require_asu` | ① primary ok / asu ok ② primary ok / asu fail / require_asu=false ③ primary ok / asu fail / require_asu=true ④ primary fail | ① `{end_type=ALL, revoke_type=nullopt, success=true}` ② `{end_type=MEMORY, revoke_type=ASU, success=true}` ③ `{end_type=nullopt, revoke_type=ALL, success=false, error=first_asu_error}` ④ `{end_type=nullopt, revoke_type=ALL, success=false}`；四种情况都不得退化为 `AllAllocatedTransfersSucceeded` 的整体判定 |
@@ -6404,15 +6120,19 @@ bool AsuConfig::Validate() const {
 | TC-95 | write-order | ASU 计数与 Record 分支 | unit | 对 ASU 调 `RecordAllocatedReplica` / `RecordSuccess` / `RecordFailure` | 三个 ASU 计数各自正确；ASU 失败只写 `first_asu_error`，不污染 `first_error`（v2.1）；`AllAllocatedTransfersSucceeded` 完全不受 ASU 计数影响（ASU 不参与该判据） |
 | TC-96 | read-select | 档位与 last-wins tie-break | 构造 memory / nof / local_disk / asu / dfs / disk 的 COMPLETE 列表 | `SelectBestReplica` 分别传 `asu_available=true` 与 `false` | 档位顺序为 local MEMORY 0、local NOF 1、remote MEMORY 2、remote NOF 3、LOCAL_DISK 4、ASU 5、DFS 6、DISK 7；`asu_available=false` 时永不选 ASU；两个 LOCAL_DISK 并列时仍取列表中最后一个（`tests/pybind_client_test.cpp:188-262` 不回归） |
 | TC-97 | read-select | NoReplicaError 映射 | 列表只有 COMPLETE ASU 且 `asu_available=false`；另一组列表无 ASU | 调 `NoReplicaError` / `ReadReplicaSelector` | 前者 `ASU_SERVICE_UNAVAILABLE`；后者 `INVALID_REPLICA`；错误码与 `real_client` 四个调用点一致 |
-| TC-98 | read-select | ReadObjects 逐对象打包与 entry 回填 | Fake 记录每次 `BatchLoadAsync` 的 entries | 两个对象各 1 chunk 的批量读；再构造一个 3 chunk 对象 | 默认每对象一个 task（不跨对象）；同对象的多 chunk 在同一 task 内；`entryStatus` 按输入下标回填到各自 `AsuReadOutcome`，不串对象 |
-| TC-99 | read-select | PARTIAL_FAILED 逐 entry 归因 | Fake 返回 task `PARTIAL_FAILED` 且部分 entry 为 `IO_ERROR` | `ReadObjects` | 成功 entry 正常回填并通过 CRC；失败对象返回对应错误；其余对象不受影响；适配层不得因 `Status::ok()` 只对 OK 为真而早退丢掉 per-entry 结果 |
+| TC-98 | read-select | BatchLoadObjects 跨对象合批与 entry 回填 | Fake 记录每次 `BatchLoadAsync` 的 entries | 两个对象各 1 entry 的批量读；再构造 120 个对象 | 默认按对象边界合并进同一 task（条数 ≤ 110）；超 110 时切成多个 task 且绝不切开单个对象；`entryStatus` 按输入下标回填到各自 `AsuReadResult`，不串对象 |
+| TC-99 | read-select | PARTIAL_FAILED 逐 entry 归因 | Fake 返回 task `PARTIAL_FAILED` 且部分 entry 为 `IO_ERROR` | `BatchLoadObjects` | 成功 entry 正常回填并通过 CRC；失败对象返回对应错误；其余对象不受影响；适配层不得因 `Status::ok()` 只对 OK 为真而早退丢掉 per-entry 结果 |
 | TC-100 | read-select | arena 永久隔离耗尽 | `staging_slots=2`，制造两次 `Wait` 超时使两个 slot 都 quarantine | 再发起一次 ASU 读 | `Acquire`/`AcquireBatch` 立即返回 `ASU_SERVICE_UNAVAILABLE`；`FreeSlots()==0`；`AsuClientRuntime::IsReady()==false`；`AsuReadAvailable()==false`；有 memory 副本时选择器改选 memory |
+| TC-140 | boundary | 1,008 B 窗口被显式拒绝 | 默认 CACHELIB | 对 `S=16,776,191 / 16,776,192 / 16,776,193 / 16,777,200 / 16,777,201` 调 `PutStart(asu=1)` | 前两者成功；16,776,193 与 16,777,200 返回 `ASU_OBJECT_TOO_LARGE`；16,777,201 由 CACHELIB 检查先返回 `INVALID_PARAMS`；`kMaxObjectBytes==16,776,192` |
+| TC-141 | remove | BatchRemoveAsuObjects 的捕获→Remove→入队顺序 | 对象有 memory+ASU | 调 `BatchRemoveAsuObjects`，用钩子观察阶段 | 先捕获 descriptor；随后既有 Remove 删除 memory 与元数据；最后才入队；`release_at=max(now, not_before)+max(lease, grace)`；Remove 返回 `OBJECT_HAS_LEASE` 时该 key 不入队 |
+| TC-142 | remove | plain Remove 不误删 ASU | 对象有 memory+ASU 且均 COMPLETE | 调 `Client::Remove` | 对象元数据与 memory 消失；`AsuDeleteQueue.Size()==0`；ASU 仍 COMPLETE，`Get` 仍成功（孤儿可诊断） |
+| TC-143 | write | 空批与重复 key | 空 `BatchStoreObjects`；同一批含两个相同 `key_id` | 调 `BatchStoreObjects` / `BatchLoadObjects` | 空批返回空结果且 0 次 SDK 调用；重复 key 逐对象返回结果，不崩溃；同一次 `DeleteAsync` 的重复 key 去重 |
 | TC-119 | recovery | 两阶段之间进程崩溃的恢复 | 两种崩溃点：(a) memory 已 COMPLETE、ASU 尚未写；(b) ASU 已物理提交、finalize 前崩溃 | `PutStart` 后 kill -9 client，等 `DiscardExpiredProcessingReplicas` 到期，再重试 Put | 两种情形下 ASU 副本均为 PROCESSING 并在过期后被丢弃；`FreeAsuReplicas` 入队且 `not_before=put_start_time+put_start_release_timeout_sec_`；重试 Put 使用新 `object_epoch` 得到新 `key_id`；旧 `key_id` 的迟到 Delete 不命中新世代（H16） |
 | TC-124 | remove | 重复删除幂等 | 对象有 memory+ASU，第一次 Remove 成功 | 立即再次 `Remove(key)` | 第二次返回 `OBJECT_NOT_FOUND`；`AsuDeleteQueue` 无重复条目；不重复调用 `DeleteAsync` |
 | TC-125 | read-select | PROCESSING 的 ASU 不参与读 | 列表含 PROCESSING 的 `AsuDescriptor` + COMPLETE DFS；另一组只有 PROCESSING ASU | 调 `SelectBestReplica` 与 `NoReplicaError` | 第一组选 DFS（PROCESSING ASU 被跳过）；第二组返回 `INVALID_REPLICA` 而不是 `ASU_SERVICE_UNAVAILABLE`（无 COMPLETE ASU）；Master 侧 `GetReadableReplicaDescriptors` 也不返回 PROCESSING ASU |
-| TC-127 | read-select | 批量读超过 staging_slots 不失败 | `staging_slots=2`，4 个各 1 chunk 的 ASU 对象 | 一次 `BatchGet` 4 个对象 | 4 个对象全部成功；任一时刻在飞 slot 数不超过 2；`AcquireBatch` 原子预留；不出现 `ASU_SERVICE_UNAVAILABLE`/`BUFFER_OVERFLOW`；逐对象结果与 CRC 正确 |
-| TC-134 / FMEA-61 / FMEA-65 | init / entry | entry 的 handle 必须是注册返回的 canonical handle | `FakeAsuKvClient` 返回 handle=`0x1234`、tokenId=`0x99` | 分别构造 `buffer.handle=0x1234`、`buffer.handle=0x99`（tokenId）、`buffer.handle=0`、`buffer.handle=0x9999`（未注册）四种 entry 调 `WriteObject` | 仅 `0x1234` 通过预检；其余返回 `ASU_DESCRIPTOR_INVALID`；`BatchStore` 调用次数为 0（错误在提交前暴露，不落到 `BUFFER_NOT_REGISTERED`） |
-| TC-135 / FMEA-63 | entry | entry 字段与 `BuildEntry` 公式一致 | 1MiB 对象，`slot.addr` 已 512B 对齐 | 调 `BuildEntry(descriptor, slot.addr, slot.handle, wire_len, 0)` | `buffer.region.addr==slot.addr`；`buffer.region.size==wire_len`（不是 slot 容量）；`buffer.region.memoryType==HOST_PINNED`；`buffer.handle==slot.handle`；`offset==0`；`!mrKey.has_value()`；`key==AsuKeyCodec::ToCacheKey(key_id)` |
+| TC-127 | read-select | 批量读超过 staging_slots 不失败 | `staging_slots=2`，4 个各 1 entry 的 ASU 对象 | 一次 `BatchGet` 4 个对象 | 4 个对象全部成功；任一 task 的 entry 数不超过 2；`AcquireBatch` 原子预留；不出现 `ASU_SERVICE_UNAVAILABLE`/`BUFFER_OVERFLOW`；逐对象结果与 CRC 正确 |
+| TC-134 / FMEA-61 / FMEA-65 | init / entry | entry 的 handle 必须是注册返回的 canonical handle | `FakeAsuKvClient` 返回 handle=`0x1234`、tokenId=`0x99` | 分别构造 `buffer.handle=0x1234`、`buffer.handle=0x99`（tokenId）、`buffer.handle=0`、`buffer.handle=0x9999`（未注册）四种 entry 调 `BatchStoreObjects` | 仅 `0x1234` 通过预检；其余返回 `ASU_DESCRIPTOR_INVALID`；`BatchStore` 调用次数为 0（错误在提交前暴露，不落到 `BUFFER_NOT_REGISTERED`） |
+| TC-135 / FMEA-63 | entry | entry 字段与 `BuildEntry` 公式一致 | 1MiB 对象，`slot.addr` 已 512B 对齐 | 调 `BuildEntry(descriptor, slot.addr, slot.handle, wire_len)` | `buffer.region.addr==slot.addr`；`buffer.region.size==wire_len`（不是 slot 容量）；`buffer.region.memoryType==HOST_PINNED`；`buffer.handle==slot.handle`；`offset==0`；`!mrKey.has_value()`；`key==AsuKeyCodec::ToCacheKey(key_id)` |
 | TC-136 / FMEA-65 | entry | 调用方填写 mrKey 会被丢弃、SDK 按 handle 重新解析 | `ResolvingFakeAsuKvClient` 模拟 `SubmitAsync` 的 reset+查表语义 | 手工构造 `mrKey=tokenId` 的 `KVBuffer` 提交；再用 `BuildEntry` 产出的 entry 提交 | 前者预检直接拒绝（`ASU_DESCRIPTOR_INVALID`）；后者 fake 解析出的 `mrKey` 等于该 handle 注册的 `tokenId`，且不等于调用方传入值 |
 | TC-137 / FMEA-62 | init | 缺 asuSharedProvider 时 Init 失败 | client 配置文件不含 `asuSharedProvider` 或值为 0；view 含至少一个 ASU 节点 | 调用 `AsuClientRuntime::Create`；再把配置改为 `asuSharedProvider=1` 重试 | 第一次 `PreflightSharedProvider` 返回失败、Init 不进入可服务状态、`RegisterRegions` 不被调用；第二次成功 |
 | TC-138 / FMEA-64 | lifecycle | Shutdown 与 in-flight 的边界 | 一个 `BatchStore` 被 `GateNextBatchStore` 挂起 | 调用 `AsuStorageBackend::Shutdown`，再 `ReleaseGate` 并 `Wait` 后重试 | 第一次 `arena_->InUseSlots() != 0`，打 ERROR 且不释放 arena；第二次成功且 `InUseSlots()==0` |
@@ -6431,7 +6151,7 @@ bool AsuConfig::Validate() const {
 | TC-14 / FMEA-13 | write | Upsert 接入 ASU 并强制 Case C | 已有对象 | 分别做同尺寸与不同尺寸的 `Upsert`（`asu=1`） | 两种尺寸都走 Case C；新 `object_epoch` 与新 `key_id`；旧副本延迟释放并入删除队列；不原地覆盖 |
 | TC-15 | read | 单 key Get 只有 ASU 副本 | 只含 COMPLETE ASU 副本 | `Get` | `SelectBestReplica` 选中 ASU（档位 5）；`ReadAsuReplica` 走 `BatchLoadAsync`；`VerifyObjectChecksum` 通过；不经过 `TransferRead` |
 | TC-21 | query | IsExist 只查元数据 | Fake 统计 `Query` 次数 | `IsExist` | `Query` 次数 0；返回 Master 元数据结果；零额外 RTT；只剩 ASU 的对象仍返回存在 |
-| TC-23 | remove | Remove 入队并在宽限期后删除 | Master GC 启用，`asu_delete_grace_ms=0` | `Remove(key)` 后推进时钟或调用 `TakeDue` | 元数据先删；到期后 `DeleteAsync` 被调用；`master_asu_delete_requests_total` 加 1 |
+| TC-23 | remove | BatchRemoveAsuObjects 入队并在宽限期后删除 | Master GC 启用，`asu_delete_grace_ms=0` | `BatchRemoveAsuObjects(keys)` 后推进时钟或调用 `TakeDue` | 先调既有 Remove 删 memory 与元数据；到期后 `DeleteAsync` 被调用 |
 | TC-27 | remove | Remove 后立即 Put 不被误删 | 手动触发 GC | `Remove` 后 `Put` 同 key，再执行 GC | 新 `key_id` 未被删除；读成功；迟到 Delete 只作用于旧 `key_id` |
 | TC-31 / FMEA-25 | compatibility | Descriptor variant old/new round-trip | 旧 reader 结构 | 序列化含 `AsuDescriptor` 的 `GetReplicaListResponse`，用旧 reader 解析 | 按 H11 结论：旧 reader 对旧类型成功；对 ASU 明确失败而非误解析；不满足则阻塞发布 |
 | TC-47 / FMEA-22 | concurrency | 同 key 并发写 | 两个 Client、同一 segment 与 ASU | 用 latch 同时 `Put` 同一 key | 只有一个进入可写状态；后到者按既有语义拒绝或等待；不产生撕裂数据；ASU 上最终只有一个可读世代 |
@@ -6439,35 +6159,35 @@ bool AsuConfig::Validate() const {
 | TC-49 / FMEA-12 / FMEA-24 | concurrency | 并发删与读 | 对象持读租约 | 一个线程 `Remove`，一个线程 `Get` | 持租约读者在 TTL 内成功；其他读者得到 `REPLICA_IS_GONE`；不出现 use-after-free；删除等待租约 |
 | TC-50 / FMEA-11 | recovery | HA 或 oplog restore 恢复 AsuDescriptor | 含 ASU key 的 snapshot 与 oplog | 构造 `StandbyObjectEntry` 后 restore | ASU 副本重建成功；`object_size` 与 standby 元数据一致；`AsuAllocator` epoch 推进；restore 期间不访问 ASU |
 | TC-51 / FMEA-10 | recovery | 无 HA 或 oplog 时 Master 重启语义 | `enable_ha=false` 或 `enable_oplog=false`，ASU 启用 | 重启 Master 后检查 ASU 模式与元数据 | 按 §6.3 第 4 条的裁决执行：启动失败、告警降级或明确文档化孤儿；不得静默产生不可枚举条目 |
-| TC-52 / FMEA-16 / FMEA-18 | delete-reachability | 按 key 删除每一跳可达 | Master 与 Fake ASU 均启用 | `Remove(key)` 后检查 `AsuDeleteQueue`，到期后执行 GC | 元数据擦除；`EnqueueAsuDeletes` 入队 `key_id` 与 `object_epoch`；`DeleteAsync` 收到恰好一个对应 `CacheKey`；不调用 `RequestRemoveAll`、`FileStorage::RemoveAll`、`PollRemoveAll`；`EvictDiskReplica` 调用 0 次 |
-| TC-53 / FMEA-16 | delete-reachability | 11 个 FreeAsuReplicas 调用点逐点配对 | 可驱动 11 个资源回收场景 | 按 `1753`、`1795`、`1844`、`1907`、`2110`、`5257`、`5897`、`6099`、`7080`、`9535`、`9623` 逐点构造场景 | 每个 ASU 副本被回收时恰好入队一次；`FreeAsuReplicas` 调用点数与 `FreeDfsReplicas` 一致；`2110` 走「捕获→TearDown→入队」三段；CI 加 grep 守卫防止漂移 |
-| TC-57 / FMEA-09 | fault-injection | 视图刷新导致旧节点孤儿 | 写多 chunk 期间替换 view 文件 | 触发 view 刷新后重试写 | 旧节点条目记录为 `asu_orphan_suspect_total`；新写使用新视图；`object_epoch` 防止读到旧记录 |
+| TC-52 / FMEA-16 / FMEA-18 | delete-reachability | 按 key 删除每一跳可达 | Master 与 Fake ASU 均启用 | `BatchRemoveAsuObjects({key})` 后检查 `AsuDeleteQueue`，到期后执行 GC | 先经既有 Remove 擦除元数据；`EnqueueAsuDeletes` 入队 `key_id` 与 `object_epoch`；`DeleteAsync` 收到恰好一个对应 `CacheKey`；不调用 `RequestRemoveAll`、`FileStorage::RemoveAll`、`PollRemoveAll`；`EvictDiskReplica` 调用 0 次 |
+| TC-53 / FMEA-16 | delete-reachability | FreeAsuReplicas 挂点逐点裁决 | 可驱动各资源回收场景 | 按 `1753`、`1795`、`1844`、`1907`、`2110`、`5257`、`5897`、`6099`、`7080`、`9535`、`9623` 逐点构造场景 | `2110`（EraseMetadata）**不入队**；`1795` 仅在 `enqueue_asu_deletes=true` 时入队；其余真实丢弃路径恰好入队一次；CI 加 grep 守卫防止把 ASU 入队接回 plain Remove |
+| TC-57 / FMEA-09 | fault-injection | 视图刷新导致旧节点孤儿 | 写对象期间替换 view 文件 | 触发 view 刷新后重试写 | 旧节点条目记录为 `asu_orphan_suspect_total`；新写使用新视图；`object_epoch` 防止读到旧记录 |
 | TC-58 | write | 同尺寸 Upsert 且存在读租约 | 对象有 `has_read_lease`，且含 ASU | 同尺寸 `Upsert`（`asu=1`） | 不再返回 `OBJECT_HAS_LEASE`（ASU 读走 descriptor 的 `key_id` 与 `object_epoch`，替换后旧 descriptor 仍有效）；强制 Case C；旧副本延迟释放。v1.0 的「返回 OBJECT_HAS_LEASE」已被 FMEA-14 修订 |
 | TC-59 / FMEA-15 | fault-injection | Client 写完前崩溃 | 分别在 memory 阶段与 ASU 阶段 kill -9 client | 等 `DiscardExpiredProcessingReplicas` 过期 | PROCESSING 副本被丢弃；`FreeAsuReplicas` 入队；key 可被删除；读选择器只认 COMPLETE；与 TC-119 互为补充 |
 | TC-60 / FMEA-24 | concurrency | 多客户端并发读同一 ASU 副本 | 两个 Client、同一 descriptor | 同时 `Get` 同一 key | 两者均成功；各自使用独立 `AsuStagingArena`；无共享状态竞争；字节一致 |
-| TC-61 / FMEA-27 | boundary | CACHELIB 默认大对象被拒 | 默认 `CACHELIB`，`kMaxSliceSize` 约 16,777,200 | `Put` 20MiB 对象（`asu=0` 与 `asu=1` 各一次） | 两种情况都返回 `INVALID_PARAMS`；`kMaxSliceSize` 检查（`master_service.cpp:5111-5117`）对 ASU 同样生效；默认部署对象上限约 16MiB、多 chunk 路径不可达 |
+| TC-61 / FMEA-27 | boundary | CACHELIB 与 ASU 上限的 1,008 B 窗口 | 默认 `CACHELIB`，`kMaxSliceSize = 16,777,200` | `Put` 16,776,192 / 16,776,193 / 16,777,200 / 20MiB 对象（`asu=1`） | 16,776,192 成功；16,776,193 与 16,777,200 返回 `ASU_OBJECT_TOO_LARGE`；20MiB 返回 `INVALID_PARAMS`；不得写成「约 16 MiB」 |
 | TC-62 / FMEA-28 | write | memory 加 ASU 不额外 offload 到 LOCAL_DISK | `enable_offload=true` | `Put` memory 加 ASU 副本 | offload 触发条件排除 `HasReplica(fn_is_asu_replica)`（`master_service.cpp:5409-5412`）；不新增 LOCAL_DISK 副本；ASU 只写一次 |
 | TC-68 / FMEA-36 | init | Client 未启用 ASU 却收到 AsuDescriptor | Master 启用 ASU，Client 关闭 ASU | 分别 `Get` 一个 memory+ASU 对象与一个只有 ASU 的对象 | 前者选中 memory 并成功（不因 ASU 失败）；后者返回 `ASU_SERVICE_UNAVAILABLE` 并打 ERROR；不崩溃；部署配置不一致可定位 |
-| TC-75 / FMEA-16 | delete-reachability | BatchRemove 多 key 含 ASU | 多个含 ASU 的对象 | `BatchRemove` 多个 key | 每个 key 的元数据先删；每个 ASU 副本逐 key 入队；GC 逐 key 删除；无跨 key 误删 |
-| TC-80 / FMEA-17 | fault-injection | BatchPut 中单个 ASU 写失败 | 多 op，其中一个 ASU 写失败 | `BatchPut` | 失败 op 按 `require_asu` 决定终态：false 走 degrade（`PutEnd(MEMORY)+PutRevoke(ASU)`，该 op 对调用方返回成功但记 `asu_degraded_total`）；true 走 `PutRevoke(ALL)`，该 op 对调用方返回失败并记 `asu_required_failures_total`；两种模式下其他 op 均正常 `PutEnd(ALL)`；不整批回滚；失败 op 已写 chunk 被清理 |
+| TC-75 / FMEA-16 | delete-reachability | BatchRemoveAsuObjects 多 key 含 ASU | 多个含 ASU 的对象 | `BatchRemoveAsuObjects` 多个 key | 每个 key 先经既有 Remove 删 memory 与元数据；捕获到的 ASU descriptor 逐 key 入队；GC 逐 key 删除；无跨 key 误删；plain `BatchRemove` 不产生任何 ASU 入队 |
+| TC-80 / FMEA-17 | fault-injection | BatchPut 中单个 ASU 写失败 | 多 op，其中一个 ASU 写失败 | `BatchPut` | 失败 op 按 `require_asu` 决定终态：false 走 degrade；true 走 `PutRevoke(ALL)`；两种模式下其他 op 均正常 `PutEnd(ALL)`；不整批回滚；失败对象的 entry 被 best-effort 清理 |
 | TC-83 | init | Client 与 Master ASU runtime 初始化成功路径 | view、transport、arena 全部就绪 | 创建 `AsuClientRuntime` 与 `AsuMasterRuntime` | `IsReady()==true`；Client handles 非空；Master delete-only 不注册数据 buffer；`Query` 与 `Delete` 冒烟通过 |
-| TC-84 / FMEA-18 | delete-reachability | Master delete client 命名空间不一致 | Master 与数据 client 的 `kv_ns_id` 或 view 不同 | 启动并执行 `Remove` 后 GC | 启动时 fail-fast，或删除 miss 被 `master_asu_delete_dropped_total` 与 ERROR 捕获；不得把 raw `0x00` 静默当成功 |
-| TC-90 | remove | asu_master_delete=false 退化为逻辑删除 | `master_delete=false`，Master 启用 ASU（H5 为假时的降级形态） | `Remove(key)` 后检查 `AsuDeleteQueue` 与 `DeleteAsync` | 元数据删除；不创建 delete client；`FreeAsuReplicas` 只打 WARN 与 metric；ASU 条目成为文档化的不可枚举孤儿 |
-| TC-101 / FMEA-46 | remove | 删 memory 只删 memory | 对象有 memory+ASU 且均 COMPLETE | `RemoveMemoryReplica(key)` | memory 副本消失；ASU 仍在且 COMPLETE；对象仍 `IsValid()`；随后 `Get` 成功并选中 ASU；KvMedia 从 `{cpu,disk}` 变 `{disk}`；`AsuDeleteQueue` 无新条目 |
-| TC-102 / FMEA-47 | remove | 删 memory 的保护条件不触碰 ASU | 三种前置：offload task 持有 source refcnt；对象持未过期 lease 且 `force=false`；对象只有 ASU | 分别 `RemoveMemoryReplica` | 分别返回 `OBJECT_REPLICA_BUSY`、`OBJECT_HAS_LEASE`、`REPLICA_NOT_FOUND`；三种情况下 ASU 副本与对象均未被 pop、未被入队 |
-| TC-103 / FMEA-46 | remove | 删 ASU 的顺序与入队 | 对象有 memory+ASU | `Remove(key)` 并用 erase 钩子观察顺序 | 先移除 memory 元数据并调用 `hold.TearDown()` 释放 buffer，随后才把 ASU descriptor 入队；`release_at=max(now, not_before)+max(lease, grace)`；若物理删除失败，元数据已不可逆移除，重试 `Remove` 返回 `OBJECT_NOT_FOUND` 且不产生第二条队列项 |
-| TC-104 | remove | PROCESSING ASU 写删互斥 | 对象处于 Put 调用内部（ASU PROCESSING） | 并发 `RemoveMemoryReplica` 与 `Remove` | 两者均返回 `REPLICA_IS_NOT_READY`（`CheckRemovable` 的 `AllReplicas(fn_is_completed)`，`master_service.cpp:7248`）；写完成后重试成功 |
-| TC-105 | remove | 对象无 ASU 时 Remove 仍正常 | `asu=0` 的普通对象 | `Remove(key)` | 行为与 v1.0 完全一致；无 ASU 入队；`FreeAsuReplicas` 为 no-op；`RemoveReplicaTier` 未被调用 |
+| TC-84 / FMEA-18 | delete-reachability | Master delete client 命名空间不一致 | Master 与数据 client 的 `kv_ns_id` 或 view 不同 | 启动并执行 `BatchRemoveAsuObjects` 后 GC | 启动时 fail-fast，或删除 miss 被 `master_asu_delete_dropped_total` 与 ERROR 捕获；不得把 raw `0x00` 静默当成功 |
+| TC-90 | remove | asu_master_delete=false 退化为逻辑删除 | `master_delete=false`，Master 启用 ASU（H5 为假时的降级形态） | `BatchRemoveAsuObjects(keys)` 后检查 `AsuDeleteQueue` 与 `DeleteAsync` | 既有 Remove 正常删除 memory 与元数据；不创建 delete client；`FreeAsuReplicas` 只打 WARN 与 metric；ASU 条目成为文档化的不可枚举孤儿 |
+| TC-101 / FMEA-46 | remove | 删 memory 只删 memory | 对象有 memory+ASU 且均 COMPLETE | `Client::Remove(key)` | 对象元数据与 memory 消失；`AsuDeleteQueue` 无新条目；ASU 仍 COMPLETE（孤儿），`Get` 不再命中（对象已删） |
+| TC-102 / FMEA-47 | remove | 删除入队的保护条件 | 三种前置：offload task 持有 source refcnt；对象持未过期 lease 且 `force=false`；对象只有 ASU | 分别 `BatchRemoveAsuObjects` | 前两者返回 `OBJECT_REPLICA_BUSY`/`OBJECT_HAS_LEASE` 且该 key 不入队；只有 ASU 的对象也能被删 ASU（Phase 1 捕获后 Remove 删元数据）；三种情况下不产生第二条队列项 |
+| TC-103 / FMEA-46 | remove | 删 ASU 的顺序与入队 | 对象有 memory+ASU | `BatchRemoveAsuObjects` 并用钩子观察阶段 | 先捕获 descriptor，再既有 Remove 删除 memory 与元数据，最后入队；`release_at=max(now, not_before)+max(lease, grace)`；若物理删除失败，重试 `BatchRemoveAsuObjects` 对已删对象返回 `OBJECT_NOT_FOUND` 且不产生第二条队列项 |
+| TC-104 | remove | PROCESSING ASU 写删互斥 | 对象处于 Put 调用内部（ASU PROCESSING） | 并发 `Client::Remove` 与 `BatchRemoveAsuObjects` | 两者均返回 `REPLICA_IS_NOT_READY`（`CheckRemovable` 的 `AllReplicas(fn_is_completed)`，`master_service.cpp:7248`）；写完成后重试成功 |
+| TC-105 | remove | 对象无 ASU 时 Remove 仍正常 | `asu=0` 的普通对象 | `Remove(key)` 与 `BatchRemoveAsuObjects({key})` | plain Remove 行为与 v1.0 完全一致；`BatchRemoveAsuObjects` 捕获为空、Remove 成功、入队 0 条；不调用 `RemoveReplicaTier`（该符号不存在） |
 | TC-106 / FMEA-42 | write | happy Put 的顺序与读可见性 | `asu=1`，ASU Fake 正常 | Put 后 `GetReplicaList` 并 `Get` | 顺序断言：最后一个 memory 传输成功早于首个 ASU `BatchStore`；`PutEnd` 使用 `ALL` 且同时命中 memory 与 ASU；两副本均 COMPLETE；读选中 memory |
-| TC-107 / FMEA-40 | write | degrade Put 后读可见性 | ASU Fake 返回 `IO_ERROR`，`require_asu=false` | Put 后 `GetReplicaList` 并 `Get` | Put 返回成功；`DetermineFinalizeDecision` 为 `{MEMORY,ASU,true}`；只有 memory COMPLETE，无 ASU 描述符；`asu_degraded_total=1`；后续 Remove 的级联中 ASU 入队次数为 0（物理数据已在写失败时清理） |
+| TC-107 / FMEA-40 | write | degrade Put 后读可见性 | ASU Fake 返回 `IO_ERROR`，`require_asu=false` | Put 后 `GetReplicaList` 并 `Get` | Put 返回成功；`DetermineFinalizeDecision` 为 `{MEMORY,ASU,true}`；只有 memory COMPLETE，无 ASU 描述符；`asu_degraded_total=1`；后续 `BatchRemoveAsuObjects` 的入队次数为 0（物理数据已在写失败时清理） |
 | TC-108 / FMEA-41 | write | 主层失败后无残留 ASU | memory 传输失败（例如 segment 已释放） | Put；检查 ASU Fake 的 `BatchStore` 次数与元数据 | 0 次 `BatchStore`；`asu_write_skipped_total{primary_tier_failed}=1`；对象不存在；无 `AsuDeleteQueue` 条目 |
 | TC-109 / FMEA-43 | write | ASU Upsert 强制 Case C | 已有 asu=1 对象 | 同尺寸 `Upsert`（`asu=1`） | Case C：新 epoch / 新 key_id；旧 descriptor 入队；`UpsertEnd(ALL)` 后新副本 COMPLETE；不得出现「请求 ASU 但 allocated_asu=0」 |
 | TC-110 / FMEA-14 | write | ASU 在租约下也可 Upsert | 对象持未过期读租约 | `Upsert`（`asu=1`） | 不返回 `OBJECT_HAS_LEASE`；走 Case C；旧副本延迟释放；新 key 的读在租约期内仍指向旧 descriptor 且不撕裂 |
-| TC-111 | read-select | 批量读混合 memory 与 ASU | 两个 key，一个有 memory+ASU、一个只有 ASU | `BatchGet` | 前者从 memory 读；后者走 `ReadObjects`（`BatchLoadAsync`）；两者都成功；对象级 checksum 均通过；不出现把 ASU key 混入 RDMA 批的错误 |
-| TC-112 | remove | HA 删除顺序 | `enable_ha`+oplog，对象有 memory+ASU | `Remove` 并等待 durable finalize | `FinalizeRemovedReplicasAfterDurable` 先 pop memory 子集、再 pop 其余并 `FreeAsuReplicas`；对象最终消失；无遗留队列条目 |
+| TC-111 | read-select | 批量读混合 memory 与 ASU | 两个 key，一个有 memory+ASU、一个只有 ASU | `BatchGet` | 前者从 memory 读；后者走 `BatchLoadObjects`（`BatchLoadAsync`）；两者都成功；对象级 checksum 均通过；不出现把 ASU key 混入 RDMA 批的错误 |
+| TC-112 | remove | HA 删除顺序 | `enable_ha`+oplog，对象有 memory+ASU | `BatchRemoveAsuObjects` 并等待 durable finalize | `FinalizeRemovedReplicasAfterDurable` 收到 `enqueue_asu_deletes=true` 后入队；对象最终消失；无遗留队列条目；plain `Remove` 同路径传 false，不入队 |
 | TC-113 | remove | 删除失败重试与丢弃 | Fake 连续返回 `IO_ERROR` | GC 执行 `DeleteAsync` | 指数退避至 `asu_delete_max_attempts`；`master_asu_delete_dropped_total` 加 1；不向上层报错；队列深度回落到 0 |
-| TC-120 / FMEA-45 | remove | 删 ASU 与并发新 epoch Put 交织 | 对象有 memory+ASU | ① 先 `Remove` 再并发 `Put` 新值 ② 先 `PutStart` 再并发 `Remove` | ① 旧世代被删、新世代用新 epoch 写入，迟到 Delete 只命中旧 key_id；② `Remove` 在 ASU PROCESSING 期间返回 `REPLICA_IS_NOT_READY`，写完成后再删只命中新世代；两种顺序都不误删 |
-| TC-121 | remove | 无 memory 副本时 RemoveMemoryReplica | 对象只含 ASU（先执行过 TC-101） | `RemoveMemoryReplica(key)` | 返回 `REPLICA_NOT_FOUND`；ASU 副本与对象元数据不变；不产生任何入队；随后 `Get` 仍成功 |
+| TC-120 / FMEA-45 | remove | 删 ASU 与并发新 epoch Put 交织 | 对象有 memory+ASU | ① 先 `BatchRemoveAsuObjects` 再并发 `Put` 新值 ② 先 `PutStart` 再并发 `BatchRemoveAsuObjects` | ① 旧世代被删、新世代用新 epoch 写入，迟到 Delete 只命中旧 key_id；② `BatchRemoveAsuObjects` 在 ASU PROCESSING 期间返回 `REPLICA_IS_NOT_READY`，写完成后再删只命中新世代；两种顺序都不误删 |
+| TC-121 | remove | 无 memory 副本时 plain Remove | 对象只含 ASU（plain Remove 已使 ASU 成为孤儿） | `Client::Remove(key)` | 返回 `OBJECT_NOT_FOUND`（元数据已不存在）；ASU 孤儿不变；`BatchRemoveAsuObjects({key})` 对 stale key 返回 `OBJECT_NOT_FOUND` 但捕获为空、不入队；随后 `BatchIsExist` 仍显示物理存在 |
 | TC-122 | read-select | ASU 读失败不回退 | 对象有 ASU(5) 与 DFS(6)，无 memory/nof/local_disk；Fake 让 `BatchLoadAsync` 返回 `IO_ERROR` | `Get` | ASU 被选中后读失败即返回错误；不尝试 DFS；不返回部分数据；记 `asu_read_objects_total{result=error}` |
 | TC-123 | read-select | Master 返回全部可读副本 | 对象有 memory+ASU 均 COMPLETE；另一对象 ASU 为 PROCESSING | `GetReplicaList` / `BatchGetReplicaList` | 前者返回 2 个 descriptor（含 ASU），顺序不作保证；后者不返回 PROCESSING ASU；`IsReplicaReadable` 仍要求 completed && available && !AwaitingRemount（`master_service.cpp:4502-4505`） |
 | TC-126 | write | BatchUpsert 降级子集必须 revoke ASU | 多 op 的 `BatchUpsert`，其中一个 op 主层成功、ASU 失败 | 走 `FinalizeBatchUpsert` 的降级分支 | `degraded_keys` 含该 op 的 key；`BatchPutEnd(degraded_object_metas, MEMORY)` 与 `BatchPutRevoke(degraded_keys, ASU)` 使用同一批 key；该 op 的 ASU 副本被移除而非残留 PROCESSING；对象可被 Remove（`CheckRemovable` 的 `AllReplicas(fn_is_completed)` 为真）；`asu_degraded_total` 加 1 |
@@ -6480,22 +6200,22 @@ bool AsuConfig::Validate() const {
 
 | 用例编号 | 分类 | 用例名 | 前置条件 | 步骤 | 预期结果 |
 | --- | --- | --- | --- | --- | --- |
-| TC-33 | real-hardware | 真机单 entry 16,776,704B Store 与 Load | ASU 设备与 view 配置 | 写满一个 chunk 并读回 | 成功；记录 Init 日志中的 `singleValueMaxBytes`；与 `kChunkPayloadBytes` 对比（H1） |
-| TC-34 | real-hardware | 真机单 key 累计 create size | ASU 设备 | 从 `offset=0` 顺序写多个 chunk 至 `max_object_bytes` | 确认设备自动扩展还是返回 `CQE_OUT_OF_CREATE_SIZE（0x712）`；冻结 `max_object_bytes`；不引入多 key 分片（H2） |
+| TC-33 | real-hardware | 真机单 entry 16,776,704B Store 与 Load | ASU 设备与 view 配置 | 写满一条 entry 并读回 | 成功；记录 Init 日志中的 `singleValueMaxBytes`；与 `kEntryMaxBytes` 对比（H1） |
+| TC-34 | real-hardware | 真机单 entry 对象上限 | ASU 设备 | 依次写 16,776,192B 与 16,776,193B 对象 | 前者成功；后者被 `PrepareWriteStart` 拒绝为 `ASU_OBJECT_TOO_LARGE`；不引入多 key 分片（H2 退役） |
 | TC-35 | real-hardware | 真机 Delete 不存在 key | ASU 设备 | `DeleteAsync` 一个从未写过的 key | 确认 rawResult 形态；锁定幂等映射；不误判为 `ENTRY_DELETE_FAILED`（H4） |
 | TC-76 | real-hardware | QueryAsync 存在性语义 | ASU 设备 | 查询存在与不存在的 key | `exists` 位图按调用方 key 顺序回填；`TaskResult.status` 为 OK 或 PARTIAL_FAILED；不升级为整任务错误（H7） |
 | TC-77 / FMEA-62 / FMEA-64 | real-hardware | 8 乘 16MB 的 512B 对齐 pinned arena 注册与 entry 解析 | ASU 设备，client 配置含 `asuSharedProvider=1` | `RegisterRegions` 注册 arena，断言 `handle != kInvalidMRHandle` 且 `tokenId != 0`；再写读一次；另用不含 `asuSharedProvider` 的配置重复注册 | 前者注册成功、写读正确、设备接受该 addr；后者 `RegisterRegions` 返回 `PARTIAL_FAILED`、Init 失败（H8/§6.4 第 6 条） |
-| TC-78 | real-hardware | BatchStore 4 个 16MiB entry | ASU 设备 | 一次 `BatchStoreAsync` 提交 4 个满 chunk | 全部 `entryStatus==OK`；确认 `batchValueMaxBytes` 与子批切分行为（H9） |
+| TC-78 | real-hardware | BatchStore 4 个 16MiB entry | ASU 设备 | 一次 `BatchStoreAsync` 提交 4 条满 entry（4 个对象） | 全部 `entryStatus==OK`；确认 `batchValueMaxBytes` 与子批切分行为（H9） |
 | TC-79 | real-hardware | 真机删除已存在 key 的 raw 结果 | ASU 设备 | `DeleteAsync` 已存在 key，再重复删除一次 | 第一次成功；第二次幂等；记录 raw `0x00` 与 `ENTRY_DELETE_FAILED` 的实际形态（H4/H19） |
-| TC-81 | real-hardware | 整对象读回不 over-read | ASU 设备 | 存 1MiB 后按 object_size 读回 | 设备按请求长度返回；不 over-read 到下一个 chunk；不产生截断读（v1.0 的 512KiB 前缀读已废弃） |
-| TC-82 | real-hardware | 多 chunk 写期间视图稳定 | ASU 设备 | 写多 chunk 期间不刷新 view；再刷新后重试 | 同一对象 chunk 不跨节点；旧条目按 `asu_orphan_suspect_total` 诊断；`object_epoch` 防串读（H10/H22） |
+| TC-81 | real-hardware | 整对象读回不 over-read | ASU 设备 | 存 1MiB 后按 object_size 读回 | 设备按请求长度返回；不 over-read；不产生截断读 |
+| TC-82 | real-hardware | 单 entry 写期间视图稳定 | ASU 设备 | 写对象期间不刷新 view；再刷新后重试 | 同一对象只有一条 entry，不存在跨节点分片；旧条目按 `asu_orphan_suspect_total` 诊断；`object_epoch` 防串读（H10/H22） |
 | TC-85 | real-hardware | Init 能力日志采集 | ASU 设备 | 启动 Client 与 Master，抓取 Init 日志 | 记录 `ServerKvCapabilities.singleValueMaxBytes` 与 `batchValueMaxBytes`；与设计常量对比；不依赖公有 API（H1/H9） |
-| TC-86 | real-hardware | 同 key 同 offset 重复 Store | ASU 设备 | 对同一 key、同一 offset 连续 Store 两次 | 确认覆盖语义或 `0x723`；按 H3 结论落地；每 epoch 新 key 正常不触发 |
+| TC-86 | real-hardware | 同 key 同 offset 重复 Store | ASU 设备 | 对同一 key、`offset=0` 连续 Store 两次 | 确认覆盖语义或 `0x723`；按 H3 结论落地；每 epoch 新 key 正常不触发 |
 | TC-87 | real-hardware | Master delete-only 跨进程 Delete 与 Query | Master 节点可访问 ASU，view 与数据 client 一致 | Master 启动 delete-only client，执行 Query 与 Delete 冒烟 | Query 与 Delete 可用；不注册数据 buffer；确认 `kv_ns_id` 与 view 一致（H5/H12） |
 | TC-88 | real-hardware | Master 重启后 epoch 不重叠 | ASU 设备 | 重启 Master，写入新对象，检查新旧 `object_epoch` 与 `key_id` | 新旧 epoch 不重叠；新 key 不与旧 key 冲突；若重叠则改为持久化 epoch 计数器（H13） |
 | TC-114 / FMEA-40 / FMEA-50 | real-hardware | 16MiB 写读往返与 Put 延迟回归 | 真机 ASU，默认 CACHELIB | 分别测 memory-only Put 与 memory+ASU Put，再各读 1000 次；统计 staging slot 瞬时占满与永久隔离 | 写入可读回、CRC 通过；给出 Put P50/P99 增量（H21）与 ASU 读 P50/P99；瞬时占满时读仍成功，永久隔离时才改选其它副本 |
-| TC-115 / FMEA-46 | real-hardware | DeleteAsync 对多 offset key 的语义 | 同一 key 写多个 offset chunk | `DeleteAsync({key})` 后按各 offset `Load` 与 `Query` | 若全部 offset 被删则确认 O(1) 删除；否则记录需按 chunk 展开（H15）；未确认前文档不得写 O(1) |
-| TC-116 | real-hardware | 同 key 多 offset 的 BatchLoad | 对象拆多 chunk | 一次 `BatchLoadAsync` 提交全部 chunk | 设备接受并按 offset 正确返回（H23）；否则退化为每 chunk 一 task（受 `staging_slots` 限制） |
+| TC-115 / FMEA-46 | real-hardware | DeleteAsync 的 key 级语义 | 对象一条 entry、`offset=0` | `DeleteAsync({key})` 后 `BatchIsExist` 与 `BatchLoadObjects` | 仅该 key 被删；相邻 key 不受影响；H15 退役为「key 级删除」的确认项 |
+| TC-116 | real-hardware | 批量读多对象单 task | 多个对象各一条 entry | 一次 `BatchLoadAsync` 提交多个对象 | 设备接受并按 entry 正确返回；`entryStatus` 逐条对应；H23 退役 |
 | TC-117 / FMEA-45 | real-hardware | 在飞 Store 与 Delete 竞争 | 大块写超时后仍可能落盘 | `Wait` 超时后立刻触发删除，再观察 key | 不出现「删完又出现」；若出现则 H16 为假，需要写屏障；`not_before` 只是概率缓解 |
 | TC-118 | real-hardware | 设备 create-size 耗尽时按 entry 报错 | 接近满的设备 | 多对象批量写，其中一个超 create size | `entryStatus` 精确定位失败对象；不整批 `CANCELED`（H2） |
 
@@ -6503,7 +6223,7 @@ bool AsuConfig::Validate() const {
 
 #### 4.4.1 注入缝
 
-主注入缝是 §3.5 的 `IAsuKvClient`，不是 `kv::KvClient` 本身。这样 `unit` 用例不需要 SDK、不需要 view 文件、不需要设备。`FakeAsuKvClient` 放在 `mooncake-store/tests/support/fake_asu_kv_client.h`（当前仓库没有 `tests/support/` 目录，需要新建并加入测试 include 路径），实现 `Init`、`Shutdown`、`Register`、`SubmitLoad`、`WaitTask`、`BatchStore`、`BatchLoad`、`Query`、`Delete` 九个虚函数，内部用 `(key_id, offset)` 到字节数组的映射模拟 ASU。
+主注入缝是 §3.5 的 `AsuKvClientInterface`，不是 `kv::KvClient` 本身。这样 `unit` 用例不需要 SDK、不需要 view 文件、不需要设备。`FakeAsuKvClient` 放在 `mooncake-store/tests/support/fake_asu_kv_client.h`（当前仓库没有 `tests/support/` 目录，需要新建并加入测试 include 路径），实现 `Init`、`Shutdown`、`Register`、`SubmitLoad`、`WaitTask`、`BatchStore`、`BatchLoad`、`Query`、`Delete` 九个虚函数，内部用 `(key_id, offset)` 到字节数组的映射模拟 ASU。
 
 v1.0 的注入面全部保留：
 
@@ -6533,7 +6253,7 @@ flowchart LR
     B --> E[AsuStorageBackend]
     C --> E
     D --> E
-    E --> F[IAsuKvClient]
+    E --> F[AsuKvClientInterface]
     F --> G[FakeAsuKvClient]
     F --> H[AsuKvClientAdapter]
     H --> I[kv KvClient]
@@ -6570,7 +6290,7 @@ target_link_libraries(asu_replica_integration_test PRIVATE kv_client kv_transpor
 
 #### 4.4.3 不接真机运行 unit 与 integration
 
-全部 `unit` 用例直接构造 `AsuStorageBackend` 或纯函数；全部 `integration` 用例默认也使用 `FakeAsuKvClient`。`AsuStorageBackend::Create(const AsuConfig&, std::unique_ptr<IAsuKvClient>, bool register_staging)` 允许注入客户端。Master 与 Client 两侧还需要 `AsuMasterRuntime::CreateForTest(const AsuConfig&, std::unique_ptr<IAsuKvClient>)` 与 `AsuClientRuntime::CreateForTest(const AsuConfig&, std::unique_ptr<IAsuKvClient>)`，或允许 `MasterServiceTestPeer` 与 `Client::SetAsuClientRuntime` 在初始化后替换 runtime；否则集成测试无法把 fake 放进 Master 与 Client。这两个注入点是测试可执行性的前置条件。
+全部 `unit` 用例直接构造 `AsuStorageBackend` 或纯函数；全部 `integration` 用例默认也使用 `FakeAsuKvClient`。`AsuStorageBackend::Create(const AsuConfig&, std::unique_ptr<AsuKvClientInterface>, bool register_staging)` 允许注入客户端。Master 与 Client 两侧还需要 `AsuMasterRuntime::CreateForTest(const AsuConfig&, std::unique_ptr<AsuKvClientInterface>)` 与 `AsuClientRuntime::CreateForTest(const AsuConfig&, std::unique_ptr<AsuKvClientInterface>)`，或允许 `MasterServiceTestPeer` 与 `Client::SetAsuClientRuntime` 在初始化后替换 runtime；否则集成测试无法把 fake 放进 Master 与 Client。这两个注入点是测试可执行性的前置条件。
 
 可选的 SDK 适配层集成用 `AsuKvClientAdapter(CreateKvClient())`（`kv_client.h:64`），配置 `transport.provider_type=FAKE`。SDK 的 FAKE provider 默认开启（`BUILD_KV_CLIENT_PROVIDER_FAKE=ON`）。两个坑必须注意：
 
@@ -6589,10 +6309,10 @@ ctest -R "asu_" --output-on-failure
 
 #### 4.4.4 阶段顺序的断言方法
 
-> **[v2.0 变更]** v1.0 只需断言单次写内部 chunk0 最后写；v2.0 要断言跨阶段顺序（memory 全部成功 → ASU 写 → finalize）。禁止用 sleep 或墙钟时间推断顺序，统一用可观测的序列号。
+> **[v2.3 变更]** v1.0 只需断言单次写内部 chunk0 最后写；v2.3 要断言跨阶段顺序（memory 全部成功 → ASU 写 → finalize）以及单 entry、offset=0。禁止用 sleep 或墙钟时间推断顺序，统一用可观测的序列号。
 
 - **写序**：`FakeAsuKvClient::CallLog()` 提供 `seq`；memory 传输侧用 `ClientTestPeer` 暴露的 `ReplicaTransferSummary` 或测试注入的 `RecordSuccess` 计数作为「memory 完成」标记。断言 `first_batch_store_seq > last_memory_success_seq`。反向断言（主层失败）只需 `BatchStore` 计数为 0。
-- **读择优**：断言走 `SelectBestReplica` 返回的 descriptor 类型，不靠日志；选中 ASU 后断言 `FakeAsuKvClient` 收到 `BatchLoad` 且 `Capture()` 的 `offset`/`region.size` 与 `AsuChunkPlanner` 公式一致。
+- **读择优**：断言走 `SelectBestReplica` 返回的 descriptor 类型，不靠日志；选中 ASU 后断言 `FakeAsuKvClient` 收到 `BatchLoad` 且 `Capture()` 的 `offset==0`/`region.size == WireLen(object_size)`。
 - **删除分层**：用 `MasterServiceTestPeer` 在 `EraseMetadata` 前后抓取副本快照；断言「快照中 memory 消失时 ASU 仍在」且「`AsuDeleteQueue::Size()` 增加发生在 memory 快照消失之后」。同时断言 `EvictDiskReplica` 调用计数为 0。
 - **并发**：用 `std::barrier` 或 latch 对齐起跑，`FakeAsuKvClient::GateNextBatchStore` 把 ASU 阶段挂起，再发起删除/读，最后 `ReleaseGate`。失败用例必须同时断言「没有发生」，例如 TC-108 除了错误码还要断言 `BatchStore` 调用次数为 0。
 
@@ -6610,12 +6330,12 @@ ctest -R "asu_" --output-on-failure
 
 > 本节是「假设到测试用例」的映射视图；规范化的假设清单、验证方法与退化方案以第 5 章为准。
 
-这些假设未验证前不应进入实现；v2.0 的阻塞级为 H1、H2、H5、H11，加上因三条新要求而升级为阻塞的 H15、H16、H21；v2.1 新增阻塞项 H24。
+这些假设未验证前不应进入实现；v2.3 的阻塞级为 H1、H5、H11、H16、H21、H24（H2/H15/H23 已因「一个对象一条 entry」退役）。
 
 | 编号 | 假设 | 验证方法 | 若为假的退化方案 |
 | --- | --- | --- | --- |
-| H1（v2 不变，阻塞） | 设备 `singleValueMaxBytes` 不小于 16,776,704B | TC-33 真机写满一个 chunk 并读回；TC-85 采集 Init 日志 | 把 `kChunkPayloadBytes` 从编译期常量改为 `AsuConfig` 字段（记录头的 `chunk_payload` 用于识别旧记录），并修改 §3.1/§3.3/§3.6/§3.12；不改 key 布局 |
-| H2（v2 不变，阻塞） | 单 key 累计写满 `max_object_bytes` 时设备自动扩展 create size，而非返回 `CQE_OUT_OF_CREATE_SIZE（0x712）` | TC-34 单 key 顺序写多个 16MiB chunk 至配置上限 | 把 `max_object_bytes` 降到设备实测 create size；超过上限在 `PutStart` 返回 `ASU_OBJECT_TOO_LARGE` |
+| H1（v2.3，阻塞） | 设备 `singleValueMaxBytes` 不小于 16,776,704B | TC-33 真机写满一条 entry 并读回；TC-85 采集 Init 日志 | 把 `kEntryMaxBytes`/`kMaxObjectBytes` 改为 `AsuConfig` 字段；不改 key 布局 |
+| H2（v2.3 退役，单 entry 无累计写） | 单对象一条 entry，不再有「单 key 累计写满 create size」路径 | TC-34 验证 16,776,192B 单 entry | 无；上限由 `PrepareWriteStart` 保证 |
 | H3（v2 不变） | 对已存在 key 再 Store（同 offset）是覆盖语义，而非 `0x723` | TC-86 对同一 key 与 offset 连续 Store 两次 | 写前先 Delete 再 Store；每 epoch 新 key 时通常不会触发 |
 | H4（v2 不变） | `DeleteAsync` 删除不存在 key 返回 raw `0x00` | TC-79 删除一个从未写过的 key 并读 `entryStatus` | 把 `ENTRY_DELETE_FAILED` 也视为幂等成功，或先 Query 再删除 |
 | H5（v2 不变，阻塞） | Master 能访问 ASU 网络与 view，delete-only client 可不 `RegisterRegions` 执行 Query 与 Delete | TC-87 在 Master 节点跑 Init 加 Delete 与 Query 冒烟 | `asu_master_delete=false` 退化为逻辑删除（TC-90）；不新增 TaskType/RPC |
@@ -6623,20 +6343,20 @@ ctest -R "asu_" --output-on-failure
 | H7（v2 不变） | `QueryAsync` 对不存在 key 返回 `exists=0`，`TaskResult.status` 可为 OK 或 PARTIAL_FAILED | TC-76 查询存在与不存在的 key | 改用 header-only Load 探测；Query 只用于诊断 |
 | H8（v2 强化） | 512B 对齐的大块 pinned arena 可被 `RegisterRegions` 接受，且 `tokenId` 非 0；宿主 region 可被 provider 复用（`asuSharedProvider=1`） | TC-77 注册 8 乘 16MB arena、断言 `handle` 与 `tokenId` 非 0，并做一次写读；TC-137 验证缺少 `asuSharedProvider` 时 Init 失败 | 拆成多个较小 region；或走 device-direct 加 `deviceId` 注册；若 `BindMemory` 限制无法绕过，改 DEVICE 内存（§6.4 第 6 条） |
 | H9（v2 不变） | `batchValueMaxBytes` 不小于 64MiB，且 SDK 内部按 110 条切子批 | TC-78 一次 BatchStore 4 个 16MiB entry | 下调 `batch_max_bytes` 与 `batch_max_entries`，只影响延迟 |
-| H10（v2 不变） | 每个 task 内的 chunk 共享同一 `viewSnapshot`，不会被路由到不同节点 | TC-82 多 chunk 写期间不刷新 view；再刷新 view 重试观察 | 按 epoch 重写全部 chunk，或失败重建 |
+| H10（v2.3） | 同一 task 内的 entry 共享同一 `viewSnapshot`，不会被路由到不同节点 | TC-82 写对象期间不刷新 view；再刷新 view 重试观察 | 按 epoch 重写单 entry，或失败重建 |
 | H11（v2 不变，阻塞） | Descriptor variant 追加 alternative 后旧 reader 对旧类型仍可解析、对 ASU 明确失败 | TC-31 做 RPC 与 oplog 两条 old/new round-trip | 发布顺序改为先全量升级所有 reader 再开 `enable_asu`；不支持滚动混跑 |
 | H12（v2 不变） | Master delete-only client 与所有数据 client 使用同一 `kv_ns_id`、同一 view、同一 `transportConfigs` | TC-84 对比两端配置并做跨进程 Delete 冒烟 | 删除打到别的 ns，全部 raw `0x00` 被当成功，孤儿无法回收；需部署门禁 |
 | H13（v2 强化） | `object_epoch` 的随机种子加全局单调能在 Master 重启后避免与上一世代 key 冲突 | TC-88 重启 Master 后检查新 epoch 与旧日志不重叠 | 持久化 epoch 计数器（引入小状态，但仍不需要 allocator 状态恢复） |
-| H14（v2 不变） | CACHELIB 是默认分配器，且 `kMaxSliceSize` 约 16,777,200 对 ASU 对象同样生效 | TC-61 默认配置 Put 20MiB 对象（`asu=0` 与 `asu=1`） | 已裁决不豁免（v2.1，见 §6.5）；约 16MiB 是正确上限，多 chunk 路径在默认部署不可达 |
-| H15（v2 新增，阻塞） | `DeleteAsync({key})` 删除该 key 下全部 offset 分片，而非只删 offset0 | TC-115 同一 key 写多 offset chunk 后 Delete，再 Query/Load 各 offset | `AsuDeleteItem` 携带 `chunk_count` 并逐 offset 删除；删除成本与失败面放大，不得写成 O(1) |
+| H14（v2.3） | CACHELIB 是默认分配器，且 `kMaxSliceSize = 16,777,200` 对 ASU 对象同样生效 | TC-61 默认配置 Put 16,776,192 / 16,776,193 / 16,777,200 对象 | 已裁决不豁免（v2.1，见 §6.5）；ASU 有效上限 16,776,192，1,008 B 窗口显式拒绝 |
+| H15（v2.3 退役） | 单 entry、`offset=0` 后不存在「同 key 多 offset 分片」；Delete 的 key 级语义由 H4/H17 覆盖 | TC-115 验证 key 级删除 | 无；`DeleteAsync` 以 key 为单位 |
 | H16（v2 新增，阻塞） | Delete 之后到达的 Store 不被设备接受，或 Delete 与 Store 并发无害 | TC-117 `Wait` 超时后立刻删除，再观察 key 是否复活 | `not_before` 只是概率缓解，需要写屏障（client 确认取消或世代 tombstone） |
 | H17（v2 新增） | 删除后同 key 同 epoch 重建可成功，且 Delete 按键精确匹配而非前缀/范围 | 删除后立即用同 key 写；再检查相邻 key 是否被误删 | epoch 派生不足以隔离，需要 tombstone 或代际校验 |
 | H18（v2 新增） | `DeleteAsync` 的吞吐/延迟上界可被单线程 GC 覆盖，宽限期能覆盖排队延迟 | 在 TC-113 的 GC 路径上扩大到 10k 条目的压测，记录 Delete P99 与队列积压；TC-118 只覆盖 create-size 耗尽，不覆盖吞吐 | 多线程 worker 或按字节/条数限流；加大 `asu_delete_grace_ms` |
 | H19（v2 新增） | Delete 的 `Wait` 超时后 task 不继续执行，或重试与在飞删除无害 | TC-79 超时后重复删除并观察 `entryStatus` | 加大 settle 窗口，或要求设备侧取消语义 |
 | H20（v2 新增） | `staging_slots=8` 在并发批读下不触发 RESOURCE_BUSY，`AcquireBatch` 等待可接受 | TC-114 16 线程并发读 16MiB 对象 10 分钟，统计 BUFFER_OVERFLOW 与 P99（TC-127 覆盖单次超量批读） | 调大 `staging_slots` 或每 task 缩小 entry 数；瞬时占满已改为等待、永久隔离才 fail-fast（TC-100） |
 | H21（v2 新增，阻塞） | 16MiB 对象 memory+ASU 串行写的 Put 延迟回归可接受 | TC-114 对比 memory-only 与 memory+ASU 的 Put P50/P99 | 切 `require_asu=true` 让失败更早暴露，或下调 `max_object_bytes`；回退并行将推翻要求 1，须用户确认 |
-| H22（v2 新增） | 同一 Put 跨 memory/ASU 两阶段时 view 刷新可恢复 | TC-82 两阶段之间替换 view 文件并观察 ASU 写 | 按 epoch 重写全部 chunk 或失败重建 |
-| H23（v2 新增） | 同一次 `BatchLoadAsync` 接受同一 key 的多条不同 offset entry | TC-116 多 chunk 对象一次 BatchLoad 读回并校验 | 退化为每 chunk 一个 task（受 `staging_slots` 限制） |
+| H22（v2.3） | 同一 Put 跨 memory/ASU 两阶段时 view 刷新可恢复 | TC-82 两阶段之间替换 view 文件并观察 ASU 写 | 按 epoch 重写单 entry 或失败重建 |
+| H23（v2.3 退役） | 单 entry、`offset=0` 后不存在「同 key 多 offset entry」；跨对象合批由 `PlanBatches` 覆盖 | TC-116 多对象一次 BatchLoad 读回并校验 | 无；一个对象只贡献一条 entry |
 | H24（v2.1 新增，阻塞） | SHARED 模式下 view 运行中新增 ASU 节点后无需重新 `BindMemory` 即可继续写读 | TC-139 真机替换 view 增加节点并写读 | 退化为按节点重建 provider / `INDEPENDENT`，或要求滚动重启 |
 
 ### 4.6 测试维度发现的前提性冲突
@@ -6647,7 +6367,7 @@ ctest -R "asu_" --output-on-failure
 2. 降级是否需要被调用方感知：已由 `require_asu` 配置项解决（§6.5）。默认降级只记 metric，TC-107 覆盖；需要 API 感知的部署设 `require_asu=true`，由 TC-131/TC-133 覆盖。
 3. `SubmitAsuWrites` 与 `ReplicaTransferSummary` 的测试缝（把纯函数上提、增加 `ClientTestPeer`）会改动 `client_service.cpp` 的可见性与文件结构，属 §3.10.1 范围，需要与那一节同步（§4.4.1 已说明）。
 4. `real_client.cpp` 的 `SelectBestReplica` 调用点比 §3.10.1 列出的四个多两个（`real_client.cpp:5635` 的 ranged read metadata 与 `real_client.cpp:8333` 的 SSD prefetch kick）。若第 4 个参数带默认值 `asu_available=false`，这两处保持默认即可；若实现改为必填参数，两处必须显式传 `false`，否则 range 读与 prefetch 会尝试选 ASU。
-5. 批量读是否跨对象合并进同一 `BatchLoadAsync`（已裁决为不合并，不在 §6 保留）。
+5. 批量读是否跨对象合并进同一 `BatchLoadAsync`：**已裁决为必须合并**（按对象边界、条数 ≤ 110、字节 ≤ 64 MiB），不在 §6 保留。
 6. ASU 与 LOCAL_DISK 的读延迟排序（§6.2 第 1 条）。TC-96 目前按 LOCAL_DISK 4、ASU 5 编写；实测后若调整档位，只需改枚举值，用例断言同步。
 7. `asu_master_delete=false` 的降级形态（§6.3/§6.4）是否保留。TC-90 按保留编写；若 H5 为真且不保留该开关，TC-90 删除。
 8. 无 HA/oplog 时的启动语义（§6.3 第 4 条）。TC-51 目前不断言具体行为，只要求「不静默产生不可枚举条目」；裁决后需把预期结果写死。
@@ -6655,35 +6375,35 @@ ctest -R "asu_" --output-on-failure
 
 ## 5. 真机 go/no-go 假设
 
-以下假设未经真机验证前不应进入实现。v2.0 的阻塞级为 H1、H2、H5、H11，叠加因三条新要求新增的 H15、H16、H21。每条假设的验证细节与对应用例见 §4.3 与 §4.5。
+以下假设未经真机验证前不应进入实现。v2.3 的阻塞级为 H1、H5、H11、H16、H21、H24（H2/H15/H23 已因「一个对象一条 entry」退役；H24 见 §4.5 表）。每条假设的验证细节与对应用例见 §4.3 与 §4.5。
 
 > **[v2.0 变更]** v1.0 的 H1-H14 全部保留，其中 H6 因「v2.0 不再支持前缀读」而降级为不依赖假设，H13 因 `object_epoch` 改为「随机种子 + 全局单调 + 恢复推进」而强化。新增 H15-H23，覆盖删除的物理语义（多 offset、并发删除/写）、删除吞吐、staging 容量与串行写的延迟回归——这三类正是 v2.0 三条要求引入的新风险面；v2.1 新增 H24（SHARED 模式下视图动态扩容）。
 
 | 编号 | 假设 | 验证方法 | 若为假的退化方案 |
 | --- | --- | --- | --- |
-| H1（阻塞） | 设备 `singleValueMaxBytes` 不小于 16,776,704B；公有 API 不暴露，只在 Init 日志 | 真机单 entry 写满 16,776,704B 再读回；记录 Init 日志中的 `ServerKvCapabilities`（TC-33/TC-85） | 把 `kChunkPayloadBytes` 改为 `AsuConfig` 字段并修改记录头识别旧记录；不改 key 布局 |
-| H2（阻塞） | 单 key 累计写满 `max_object_bytes` 时设备自动扩展 create size，而非返回 `CQE_OUT_OF_CREATE_SIZE（0x712）` | 单 key 从 offset0 顺序写多个 16MiB chunk 至配置上限（TC-34） | 把 `max_object_bytes` 降到实测 create size；超限在 `PutStart` 返回 `ASU_OBJECT_TOO_LARGE`；不引入多 key 分片 |
-| H3 | 对已存在 key 再 Store（同 offset）是覆盖语义，而非 `0x723` | 对同一 key 与 offset 连续 Store 两次（TC-86） | 写前先 Delete 再 Store；每 epoch 新 key 时通常不触发 |
+| H1（阻塞） | 设备 `singleValueMaxBytes` 不小于 16,776,704B；公有 API 不暴露，只在 Init 日志 | 真机单 entry 写满 16,776,704B 再读回；记录 Init 日志中的 `ServerKvCapabilities`（TC-33/TC-85） | 把 `kEntryMaxBytes`/`kMaxObjectBytes` 改为 `AsuConfig` 字段；不改 key 布局 |
+| H2（v2.3 退役，单 entry 无累计写） | 单对象一条 entry，不再有「单 key 累计写满 create size」路径 | TC-34 验证 16,776,192B 单 entry | 无；上限由 `PrepareWriteStart` 的 16,776,192 保证 |
+| H3 | 对已存在 key 再 Store（同 `offset=0`）是覆盖语义，而非 `0x723` | 对同一 key 与 offset 连续 Store 两次（TC-86） | 写前先 Delete 再 Store；每 epoch 新 key 时通常不触发 |
 | H4 | `DeleteAsync` 删除不存在 key 返回 rawResult `0x00`（视为成功） | Delete 一个从未写过的 key，读 `entryStatus`（TC-79） | 把 `ENTRY_DELETE_FAILED` 也视为幂等成功，或先 Query 再删除 |
 | H5（阻塞） | Master 能访问 ASU 网络与 view，delete-only `KvClient`（不 `RegisterRegions`）可执行 Query 与 Delete | 部署 Master 节点跑 Init 加 Delete 与 Query 冒烟（TC-87） | `asu_master_delete=false` 退化为逻辑删除（TC-90）；不新增 TaskType/RPC |
 | H6（v2.0 不再依赖） | Load 请求长度不超过已存长度是合法前缀读 | 仅作 SDK 行为观察；v2.0 公开读路径要求 slices 不小于 object_size | 无影响；前缀读能力只保留为后端内部不变量 |
 | H7 | `QueryAsync` 对不存在的 key 返回 `exists=0`，`TaskResult.status` 可为 OK 或 PARTIAL_FAILED | Query 一个不存在的 key，读 `queryResult.exists`（TC-76） | 改用 header-only Load 探测（多一次 512B RTT）；Query 只用于诊断 |
 | H8 | 512B 对齐的大块 pinned arena 可被 `RegisterRegions` 接受且 `tokenId` 非 0；宿主 region 可被 provider 复用（`asuSharedProvider=1`） | 注册 8 乘 16MB arena，断言 handle/tokenId 非 0 并做一次写读（TC-77）；缺 `asuSharedProvider` 的配置断言 Init 失败（TC-137） | 拆成多个较小 region；或走 device-direct 加 `deviceId`；或改 DEVICE 内存（§6.4 第 6 条） |
 | H9 | `batchValueMaxBytes` 不小于 64MiB（单 task 字节预算），且 SDK 内部按 110 条切子批 | 一次 `BatchStore` 4 个 16MiB entry（TC-78） | 下调 `batch_max_bytes` 与 `batch_max_entries`（可到 1 条每 task），只影响延迟 |
-| H10 | 每个 task 内的 chunk 共享同一 `viewSnapshot`，不会被路由到不同节点 | 多 chunk 写期间不刷新 view；再刷新重试观察（TC-82） | 写放大为每对象一个 task 加失败重建；视图变更时按 epoch 重写全部 chunk |
+| H10 | 同一 task 内的 entry 共享同一 `viewSnapshot`，不会被路由到不同节点 | 写对象期间不刷新 view；再刷新重试观察（TC-82） | 视图变更时按 epoch 重写单 entry；孤儿按 `asu_orphan_suspect_total` 诊断 |
 | H11（阻塞） | Descriptor variant 追加 alternative 后旧 reader 对旧类型仍可解析、对 ASU 明确失败 | `struct_pack` old/new round-trip（RPC 与 oplog 两条，TC-31） | 发布顺序改为先全量升级所有 reader 再开 `enable_asu`；不支持滚动混跑 |
 | H12 | Master delete-only client 与所有数据 client 使用同一 `kv_ns_id`、同一 view、同一 `transportConfigs` | 对比两端配置并做跨进程 Delete 冒烟（TC-84） | 删除打到别的 ns，全部 raw `0x00` 被当成功，孤儿无法回收；需部署门禁 |
 | H13 | `object_epoch` 的随机种子加全局单调能在 Master 重启后避免与旧世代 key 冲突 | 重启 Master 后检查新 epoch 与旧日志不重叠（TC-88） | 持久化 epoch 计数器（引入小状态，但仍不需要 allocator 状态恢复） |
-| H14 | CACHELIB 是默认分配器且 `kMaxSliceSize` 约 16,777,200 对 ASU 对象生效 | 默认配置 Put 20MiB 对象（`asu=0` 与 `asu=1`，TC-61） | 已裁决不豁免（v2.1，见 §6.5）；约 16MiB 是正确上限，多 chunk 路径标注不可达 |
-| H15（v2 新增，阻塞） | `DeleteAsync({key})` 删除该 key 下全部 offset 分片，而非只删 offset0 | 同一 key 写多 offset chunk 后 Delete，再 Query/Load 各 offset（TC-115） | `AsuDeleteItem` 携带 `chunk_count` 并逐 offset 删除；删除成本与失败面放大，不得写成 O(1) |
+| H14 | CACHELIB 是默认分配器且 `kMaxSliceSize = 16,777,200` 对 ASU 对象生效 | 默认配置 Put 16,776,192 / 16,776,193 / 16,777,200 / 20MiB 对象（`asu=1`，TC-61） | 已裁决不豁免（v2.1，见 §6.5）；ASU 有效上限 16,776,192，1,008 B 窗口显式拒绝 |
+| H15（v2.3 退役） | 单 entry、`offset=0` 后不存在「同 key 多 offset 分片」；Delete 的 key 级语义由 H4/H17 覆盖 | TC-115 验证 key 级删除 | 无；`DeleteAsync` 以 key 为单位 |
 | H16（v2 新增，阻塞） | Delete 之后到达的 Store 不被设备接受，或 Delete 与 Store 并发无害 | `Wait` 超时后立刻删除，再观察 key 是否复活（TC-117） | `not_before` 只是概率缓解，需要写屏障（client 确认取消或世代 tombstone） |
 | H17（v2 新增） | 删除后同 key 同 epoch 重建可成功，且 Delete 按键精确匹配而非前缀/范围 | 删除后立即用同 key 写；再检查相邻 key 是否被误删 | epoch 派生不足以隔离，需要 tombstone 或代际校验 |
 | H18（v2 新增） | `DeleteAsync` 的吞吐/延迟上界可被单线程 GC 覆盖，宽限期能覆盖排队延迟 | 在 TC-113 的 GC 路径上扩大到 10k 条目的压测，记录 Delete P99 与队列积压（TC-118 只覆盖 create-size 耗尽） | 多线程 worker 或按字节/条数限流；加大 `asu_delete_grace_ms` |
 | H19（v2 新增） | Delete 的 `Wait` 超时后 task 不继续执行，或重试与在飞删除无害 | 超时后重复删除并观察 `entryStatus`（TC-79） | 加大 settle 窗口，或要求设备侧取消语义 |
 | H20（v2 新增） | `staging_slots=8` 在并发批读下不触发 RESOURCE_BUSY，`AcquireBatch` 等待非常态 | 16 线程并发读 16MiB 对象 10 分钟，统计 BUFFER_OVERFLOW 与 P99（TC-114） | 调大 `staging_slots` 或每 task 缩小 entry 数；瞬时占满已改为等待（TC-127），永久隔离才 fail-fast |
 | H21（v2 新增，阻塞） | 16MiB 对象 memory+ASU 串行写的 Put 延迟回归可接受 | 对比 memory-only 与 memory+ASU 的 Put P50/P99（TC-114） | 切 `require_asu=true` 让失败更早暴露，或下调 `max_object_bytes`；回退并行将推翻要求 1，须用户确认 |
-| H22（v2 新增） | 同一 Put 跨 memory/ASU 两阶段时 view 刷新可恢复 | 两阶段之间替换 view 文件并观察 ASU 写（TC-82） | 按 epoch 重写全部 chunk 或失败重建 |
-| H23（v2 新增） | 同一次 `BatchLoadAsync` 接受同一 key 的多条不同 offset entry | 多 chunk 对象一次 BatchLoad 读回并校验（TC-116） | 退化为每 chunk 一个 task（受 `staging_slots` 限制） |
+| H22（v2 新增） | 同一 Put 跨 memory/ASU 两阶段时 view 刷新可恢复 | 两阶段之间替换 view 文件并观察 ASU 写（TC-82） | 按 epoch 重写单 entry 或失败重建 |
+| H23（v2.3 退役） | 单 entry、`offset=0` 后不存在「同 key 多 offset entry」；批量读的跨对象合批由 `PlanBatches` 与 TC-98/TC-116 覆盖 | TC-116 多对象一次 BatchLoad | 无；一个对象只贡献一条 entry |
 | H24（v2.1 新增，阻塞） | SHARED 模式下 view 运行中新增 ASU 节点后无需重新 `BindMemory` 即可继续写读 | 真机替换 view 增加节点并写读（TC-139） | 退化为按节点重建 provider / `INDEPENDENT`，或要求滚动重启 |
 
 ## 6. 待用户裁决的前提性冲突
@@ -6709,15 +6429,15 @@ ctest -R "asu_" --output-on-failure
 
 3. **range/session 读是否支持 ASU**
    - **选项 A（v2 默认）**：显式 `NOT_SUPPORTED`；`SelectSessionReplica` 不纳入 ASU。
-   - **选项 B**：支持单 chunk 内偏移读。
+   - **选项 B**：支持对象内偏移读（与「一个对象一条 entry」冲突，不推荐）。
    - **推荐 A**。B 会产生无法校验 payload CRC 的字节区间，破坏与 memory 的尺寸契约，且 session 只服务 range 读。
 
 ### 6.3 删除路径
 
-1. **`RemoveMemoryReplica` 的可见性与归属校验**
-   - **选项 A（v2 默认）**：仅 C++ API，任意 client 可调，保留基于 `metadata.client_id` 的归属校验钩子；一次移除该对象的全部 MEMORY 副本。
-   - **选项 B**：只允许对象写入者调用。**选项 C**：暴露到 Python。**选项 D**：增加可选 `expected_replica_id`，按副本粒度删除单个 MEMORY 副本（参考 `EvictDiskReplicaIfCurrent`）。
-   - **推荐 A 先落地**（钩子留空）；B 的 5 行校验可随时加；D 在出现多 memory 副本的按副本回收需求时再加；Python 暴露等要求 2 稳定后另评。
+1. **既有 `Remove`（删 memory）与新增 `BatchRemoveAsuObjects`（删 ASU）的可见性与归属校验**
+   - **选项 A（v2 默认）**：删 memory 完全复用既有 `Client::Remove` / `BatchRemove`，一行不改；删 ASU 仅 `BatchRemoveAsuObjects`，其 Phase 2 也调用既有 Remove，force 语义沿用既有路径。
+   - **选项 B**：只允许对象写入者调用 `BatchRemoveAsuObjects`。**选项 C**：暴露到 Python。**选项 D**：为 `BatchRemoveAsuObjects` 增加可选 `expected_replica_id`。
+   - **推荐 A 先落地**（钩子留空）；B 的 5 行校验可随时加；D 在出现按副本回收需求时再加；Python 暴露等要求 2 稳定后另评。
 
 2. **`force` 对 MEMORY 的语义**
    - **选项 A（v2 默认）**：只绕过 lease，不绕过 refcnt 与完成度。
@@ -6781,7 +6501,7 @@ ctest -R "asu_" --output-on-failure
 | 前缀读/截断读是否跳过 payload CRC | 不跳过。v2.0 只做整对象读，入口要求 slices 不小于 object_size；payload CRC-32C 永远全量校验 |
 | 容量与配额是否可见 | 不在本期范围（见 §1.1.4）；ASU 字节不参与 `allocated_file_size` 与 tenant `Grow` |
 | 物理存在性是否暴露到公开 API | 不暴露。SDK 无 Stat/长度 API，`QueryResult` 只有 `exists` 位图；Master 元数据是唯一权威 |
-| 是否扩展 `EvictDiskReplica` 承载 ASU/MEMORY 删除 | 不扩展，一行不改。删除走 `RemoveObject` 级联与新增的 `RemoveReplicaTier` |
+| 是否扩展 `EvictDiskReplica` 承载 ASU/MEMORY 删除 | 不扩展，一行不改。删 memory 复用既有 `Remove`；删 ASU 走新增 `BatchRemoveAsuObjects`（捕获→现有 Remove→入队） |
 | ASU 写失败是否导致整体失败 | 由 `AsuConfig::require_asu`（env `MOONCAKE_ASU_REQUIRED`，默认 false）选择：false 为分层降级（Put 成功 + `asu_degraded_total`），true 为整体失败（`PutRevoke(ALL)`，错误码取 `first_asu_error`）。仅 Client 生效，Master 与线格式零改动（v2.1） |
 | 降级是否需要在公开 API 可感知 | 不新增 `asu_status` 字段。默认 false 时只记 metric/WARN；需要感知的部署设 `require_asu=true`，用既有错误码表达（v2.1） |
-| `kMaxSliceSize` 是否对 ASU 豁免 | 不豁免。对象上限约 16 MiB，多 chunk 路径在默认部署不可达，作为已知约束保留；豁免需另立评审（v2.1 确认） |
+| `kMaxSliceSize` 是否对 ASU 豁免 | 不豁免。ASU 有效对象上限 16,776,192 B，CACHELIB 名义上限 16,777,200 B，二者相差 1,008 B；`(16,776,192, 16,777,200]` 窗口由 `PrepareWriteStart` 返回 `ASU_OBJECT_TOO_LARGE`，不得写成「约 16 MiB」（v2.3 精确化） |
