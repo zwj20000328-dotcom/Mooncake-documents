@@ -31,8 +31,8 @@ flowchart TB
 
     subgraph FSA["FileSystemAdapter（Client 与 Master 各自实例化）"]
         direction LR
-        PFA["PosixFsAdapter<br/>pwritev / preadv / ftruncate / unlink"]
-        HFA["Hf3fsAdapter<br/>hf3fs_reg_fd / hf3fs_prep_io<br/>hf3fs_submit_ios / hf3fs_wait_for_ios"]
+        PFA["PosixFsAdapter<br/>OpenFile / OpenExistingFile / CloseFile<br/>WriteAt / ReadAt / PreallocateFile<br/>DeleteFile / FileExists / ListFiles / Init<br/>SupportsFdReopen · SupportsArbitraryHostReadBuffers"]
+        HFA["Hf3fsAdapter<br/>OpenFile / OpenExistingFile / CloseFile<br/>WriteAt / ReadAt / PreallocateFile<br/>DeleteFile / FileExists / ListFiles / Init<br/>SupportsBatchIo"]
     end
 
     subgraph MOUNT["MOONCAKE_DFS_ROOT_DIR 共享挂载点"]
