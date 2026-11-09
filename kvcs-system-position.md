@@ -1,10 +1,10 @@
 ```mermaid
 flowchart TB
-    PY["Python / C API"] --> RC["RealClient"]
+     RC["RealClient"]
 
-    subgraph CP["Client 进程 —— 数据面"]
+    subgraph CP["Client"]
         direction TB
-        CL["Client<br/>副本选择 / 最终化"]
+        CL["Client<br/>副本选择"]
         TE["Transfer Engine<br/>MEMORY / NOF 副本"]
         FS["FileStorage<br/>装配期注入 backend"]
         DSB["DistributedStorageBackend"]
@@ -19,9 +19,9 @@ flowchart TB
         KOA --> KLD
     end
 
-    subgraph MP["Master 进程 —— 控制面"]
+    subgraph MP["Master"]
         direction TB
-        MS["MasterService<br/>对象元数据唯一权威"]
+        MS["MasterService"]
         KCP["KvcsCapacityProvider"]
         KLD2["KvcsLowLevelDriver<br/>独立 SDK 实例"]
 
@@ -38,4 +38,5 @@ flowchart TB
 
     classDef kvcs fill:#e8f0fe,stroke:#1a73e8,stroke-width:2px;
     class KOA,KLD,KLD2,KCP,STORE kvcs;
+
 ```
