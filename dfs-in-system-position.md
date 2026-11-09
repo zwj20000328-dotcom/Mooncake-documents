@@ -1,5 +1,5 @@
 ```mermaid
-flowchart LR
+flowchart TB
     CALLER["RealClient<br/>store_py.cpp"]
 
     subgraph CLIENT["Client 进程 · 数据面"]
@@ -8,6 +8,10 @@ flowchart LR
         CL["Client"]
         MC["MasterClient"]
         DSB["DistributedStorageBackend<br/>BatchWrite / BatchRead"]
+        FST --> DSB
+        FST -->|SetDfsStorageBackend| CL
+        CL -->|BatchWrite / BatchRead| DSB
+        CL --> MC
     end
 
     subgraph MASTER["Master 进程 · 控制面"]
@@ -19,36 +23,31 @@ flowchart LR
             SA["ShardAllocator"]
             BA["ImmutableBucketAllocator"]
         end
+        WMS --> MS
+        MS -->|Allocate / Free / UpdateAccess| DAI
     end
 
+    SBI["StorageBackendInterface"]
+
     subgraph FSA["FileSystemAdapter（Client 与 Master 各自实例化）"]
-        direction TB
+        direction LR
         PFA["PosixFsAdapter<br/>pwritev / preadv / ftruncate / unlink"]
         HFA["Hf3fsAdapter<br/>hf3fs_reg_fd / hf3fs_prep_io<br/>hf3fs_submit_ios / hf3fs_wait_for_ios"]
     end
 
     subgraph MOUNT["MOONCAKE_DFS_ROOT_DIR 共享挂载点"]
-        direction TB
+        direction LR
         SHARD["dfs_shard_XX.data"]
         BUCKET["bucket_NNNNNN.data"]
     end
 
-    SBI["StorageBackendInterface"]
-
-    CALLER --> CL
     CALLER --> FST
-    FST --> DSB
-    FST -->|SetDfsStorageBackend| CL
-    CL -->|BatchWrite / BatchRead| DSB
-    CL --> MC
+    CALLER --> CL
 
     MC <-->|PutStart / GetReplicaList<br/>DistributedFSDescriptor| WMS
-    WMS --> MS
-    MS -->|Allocate / Free / UpdateAccess| DAI
 
     DSB --> FSA
     DAI -->|ListFiles / PreallocateFile / DeleteFile| FSA
-    FSA --> MOUNT
-
     DSB -.->|实现| SBI
+    FSA --> MOUNT
 ```
