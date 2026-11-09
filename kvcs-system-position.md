@@ -8,7 +8,7 @@ flowchart TB
     subgraph CP["Mooncake Client 进程"]
         CL["Client<br/>副本选择 / 最终化"]
         TE["Transfer Engine<br/>RDMA 读写"]
-        FS["FileStorage<br/>CPU 注册内存 / GC"]
+        FS["FileStorage<br/>装配期：注入 backend 给 Client"]
         DSB["DistributedStorageBackend"]
         KOA["KvcsObjectStorageAdapter"]
         KLD["KvcsLowLevelDriver<br/>KVCS SDK"]
@@ -25,17 +25,11 @@ flowchart TB
         DISK["本地 SSD / NVMe<br/>EFC mountpoint"]
     end
 
-    subgraph ALT["同一层其他后端（五选一）"]
-        PFS["POSIX / 3FS<br/>FileSystemAdapter"]
-        OBJ["OSS / S3<br/>异步 offload 控制面"]
-        SSD["本地 SSD offload<br/>MountLocalDiskSegment / heartbeat"]
-    end
-
     PY --> RC --> CL
 
+    FS -. 装配期 SetDfsStorageBackend .-> CL
     CL -->|MEMORY / NOF 副本| TE
-    CL -->|DFS 副本| DSB
-    CL --> FS
+    CL -->|DFS 副本：BatchWrite / BatchRead / BatchDeleteObjects| DSB
 
     DSB -->|PutBatch / GetBatch / DeleteBatch| KOA
     KOA --> KLD
@@ -46,10 +40,6 @@ flowchart TB
     MS -->|GetCapacity / DeleteObject| KCP
     KCP --> KLD2
     KLD2 -->|kvcs_ll_mp_stat / batch_delete| EFC
-
-    PFS -. 注入适配器 .-> DSB
-    OBJ -. 注入适配器 .-> DSB
-    FS -. enable_dfs 提前 return .-> SSD
 
     classDef kvcs fill:#e8f0fe,stroke:#1a73e8,stroke-width:2px;
     class KOA,KLD,KLD2,KCP,EFC kvcs;
