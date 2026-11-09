@@ -83,8 +83,10 @@
             <mxPoint x="-12" y="0" as="offset" />
           </mxGeometry>
         </mxCell>
-        <mxCell id="E_KOA_KLD" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#1A1A1A;strokeWidth=1;endArrow=block;endFill=0;endSize=8;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;fontFamily=Helvetica;fontSize=10;labelBackgroundColor=#FFFFFF;" edge="1" parent="1" source="N_KOA" target="N_KLD">
-          <mxGeometry relative="1" as="geometry" />
+        <mxCell id="E_KOA_KLD" value="BatchPut / BatchGet&lt;br&gt;BatchDelete" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#1A1A1A;strokeWidth=1;endArrow=block;endFill=0;endSize=8;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;align=left;fontFamily=Courier New;fontSize=9;fontColor=#000000;labelBackgroundColor=#FFFFFF;" edge="1" parent="1" source="N_KOA" target="N_KLD">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="-12" y="0" as="offset" />
+          </mxGeometry>
         </mxCell>
 
         <mxCell id="E_CL_MS" value="PutStart / PutEnd&lt;br&gt;GetReplicaList / BatchRemove" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#1A1A1A;strokeWidth=1;startArrow=block;startFill=0;startSize=8;endArrow=block;endFill=0;endSize=8;exitX=1;exitY=0.25;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;align=center;fontFamily=Helvetica;fontSize=10;fontColor=#000000;labelBackgroundColor=#FFFFFF;" edge="1" parent="1" source="N_CL" target="N_MS">
