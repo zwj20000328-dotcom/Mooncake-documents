@@ -1,46 +1,41 @@
 ```mermaid
 flowchart TB
-    subgraph APP["应用"]
-        PY["Python / C API"]
-        RC["RealClient"]
-    end
+    PY["Python / C API"] --> RC["RealClient"]
 
-    subgraph CP["Mooncake Client 进程"]
+    subgraph CP["Client 进程 —— 数据面"]
+        direction TB
         CL["Client<br/>副本选择 / 最终化"]
-        TE["Transfer Engine<br/>RDMA 读写"]
-        FS["FileStorage<br/>装配期：注入 backend 给 Client"]
+        TE["Transfer Engine<br/>MEMORY / NOF 副本"]
+        FS["FileStorage<br/>装配期注入 backend"]
         DSB["DistributedStorageBackend"]
         KOA["KvcsObjectStorageAdapter"]
         KLD["KvcsLowLevelDriver<br/>KVCS SDK"]
+
+        CL --> TE
+        CL -->|DFS 副本| DSB
+        FS -.->|创建并持有| DSB
+        FS -.->|SetDfsStorageBackend| CL
+        DSB -->|PutBatch / GetBatch<br/>DeleteBatch| KOA
+        KOA --> KLD
     end
 
-    subgraph MP["Mooncake Master 进程"]
-        MS["MasterService<br/>元数据唯一权威"]
+    subgraph MP["Master 进程 —— 控制面"]
+        direction TB
+        MS["MasterService<br/>对象元数据唯一权威"]
         KCP["KvcsCapacityProvider"]
         KLD2["KvcsLowLevelDriver<br/>独立 SDK 实例"]
+
+        MS -->|GetCapacity<br/>DeleteObject| KCP
+        KCP --> KLD2
     end
 
-    subgraph SN["存储节点（本地）"]
-        EFC["EFC 守护进程<br/>gRPC over Unix socket"]
-        DISK["本地 SSD / NVMe<br/>EFC mountpoint"]
-    end
+    STORE["KVCS Store"]
 
-    PY --> RC --> CL
-
-    FS -. 装配期 SetDfsStorageBackend .-> CL
-    CL -->|MEMORY / NOF 副本| TE
-    CL -->|DFS 副本：BatchWrite / BatchRead / BatchDeleteObjects| DSB
-
-    DSB -->|PutBatch / GetBatch / DeleteBatch| KOA
-    KOA --> KLD
-    KLD -->|kvcs_ll_*| EFC
-    EFC --> DISK
-
-    CL <-->|PutStart / PutEnd / GetReplicaList / BatchRemove| MS
-    MS -->|GetCapacity / DeleteObject| KCP
-    KCP --> KLD2
-    KLD2 -->|kvcs_ll_mp_stat / batch_delete| EFC
+    RC --> CL
+    CL <-->|PutStart / PutEnd<br/>GetReplicaList / BatchRemove| MS
+    KLD -->|kvcs_ll_batch_put<br/>kvcs_ll_batch_get_into<br/>kvcs_ll_batch_delete| STORE
+    KLD2 -->|kvcs_ll_mp_stat<br/>kvcs_ll_batch_delete| STORE
 
     classDef kvcs fill:#e8f0fe,stroke:#1a73e8,stroke-width:2px;
-    class KOA,KLD,KLD2,KCP,EFC kvcs;
+    class KOA,KLD,KLD2,KCP,STORE kvcs;
 ```
