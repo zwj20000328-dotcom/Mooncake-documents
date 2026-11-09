@@ -1,57 +1,54 @@
 ```mermaid
-flowchart TB
-    subgraph APP["应用层"]
-        PY["Python: mooncake.store<br/>mooncake-integration/store/store_py.cpp"]
-        CPP["C++ / PyClient 调用方"]
+flowchart LR
+    CALLER["RealClient<br/>store_py.cpp"]
+
+    subgraph CLIENT["Client 进程 · 数据面"]
+        direction TB
+        FST["FileStorage<br/>CreateStorageBackend"]
+        CL["Client"]
+        MC["MasterClient"]
+        DSB["DistributedStorageBackend<br/>BatchWrite / BatchRead"]
     end
 
-    subgraph CLIENT["Client 进程（每个需要访问 DFS 的客户端）"]
-        RC["RealClient : PyClient<br/>real_client.cpp"]
-        CL["Client<br/>client_service.cpp"]
-        FST["FileStorage（offload 引擎）<br/>file_storage.cpp"]
-        DSB["DistributedStorageBackend<br/>storage_backend_type = kDistributed"]
-        FSA["FileSystemAdapter<br/>PosixFsAdapter / Hf3fsAdapter<br/>← DFS 数据面"]
-        OSA["ObjectStorageAdapter<br/>oss / s3 / kvcs"]
+    subgraph MASTER["Master 进程 · 控制面"]
+        direction TB
+        WMS["WrappedMasterService"]
+        MS["MasterService<br/>PutStart / PutEnd<br/>GetReplicaList / RemoveObject"]
+        subgraph DAI["DfsAllocatorInterface"]
+            direction LR
+            SA["ShardAllocator"]
+            BA["ImmutableBucketAllocator"]
+        end
     end
 
-    subgraph MASTER["Master 进程"]
-        RPC["coro_rpc 服务<br/>rpc_service.cpp"]
-        MS["MasterService<br/>master_service.cpp"]
-        AL["DfsAllocator<br/>ShardAllocator 或<br/>ImmutableBucketAllocator"]
-        MADP["PosixFsAdapter / Hf3fsAdapter<br/>Master 侧独立实例"]
+    subgraph FSA["FileSystemAdapter（Client 与 Master 各自实例化）"]
+        direction TB
+        PFA["PosixFsAdapter<br/>pwritev / preadv / ftruncate / unlink"]
+        HFA["Hf3fsAdapter<br/>hf3fs_reg_fd / hf3fs_prep_io<br/>hf3fs_submit_ios / hf3fs_wait_for_ios"]
     end
 
-    subgraph DFS["共享 DFS 挂载点 MOONCAKE_DFS_ROOT_DIR<br/>数据面由 Client 直接读写，不经过 Master"]
+    subgraph MOUNT["MOONCAKE_DFS_ROOT_DIR 共享挂载点"]
+        direction TB
         SHARD["dfs_shard_XX.data"]
         BUCKET["bucket_NNNNNN.data"]
     end
 
     SBI["StorageBackendInterface"]
-    OTHER["其他后端<br/>kFilePerKey / kBucket /<br/>kOffsetAllocator / kNvmeKv"]
-    OBJ["对象存储服务<br/>OSS / S3 / KVCS"]
-    CFG["启用条件（两端配置必须一致）<br/>Master: MOONCAKE_ENABLE_DFS=1<br/>Client: enable_ssd_offload 且<br/>MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR=distributed_storage_backend<br/>共用: MOONCAKE_DFS_ROOT_DIR / MOONCAKE_DFS_FS_ADAPTER / MOONCAKE_DFS_ALLOCATOR"]
 
-    PY --> RC
-    CPP --> RC
-    RC -->|持有 client_<br/>PutStart / PutEnd / Get / Remove| CL
-    RC -->|enable_ssd_offload 或 enable_kvcs 时构造| FST
-    FST -->|CreateStorageBackend 构造| DSB
-    FST -->|SetDfsStorageBackend 注入| CL
-    FST -. 其他 storage_backend_type .-> OTHER
-    CL <-->|PutStart / PutEnd / GetReplicaList / RemoveObject<br/>响应携带 DistributedFSDescriptor| RPC
-    RPC --> MS
-    MS -->|Allocate / Free / UpdateAccess| AL
-    AL --> MADP
-    MADP -->|ListFiles / PreallocateFile / DeleteFile| SHARD
-    MADP --> BUCKET
-    CL -->|BatchWrite / BatchRead<br/>请求自带 descriptor| DSB
+    CALLER --> CL
+    CALLER --> FST
+    FST --> DSB
+    FST -->|SetDfsStorageBackend| CL
+    CL -->|BatchWrite / BatchRead| DSB
+    CL --> MC
+
+    MC <-->|PutStart / GetReplicaList<br/>DistributedFSDescriptor| WMS
+    WMS --> MS
+    MS -->|Allocate / Free / UpdateAccess| DAI
+
     DSB --> FSA
-    DSB --> OSA
-    FSA -->|POSIX pwritev / preadv<br/>或 3FS USRBIO| SHARD
-    FSA --> BUCKET
-    OSA --> OBJ
-    DSB -. 实现 .-> SBI
-    OTHER -. 实现 .-> SBI
-    CFG -. 启用 .-> MS
-    CFG -. 启用 .-> DSB
+    DAI -->|ListFiles / PreallocateFile / DeleteFile| FSA
+    FSA --> MOUNT
+
+    DSB -.->|实现| SBI
 ```
