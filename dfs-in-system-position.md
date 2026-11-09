@@ -1,8 +1,8 @@
 ```mermaid
 flowchart TB
-    CALLER["RealClient<br/>store_py.cpp"]
+    CALLER["RealClient"]
 
-    subgraph CLIENT["Client 进程 · 数据面"]
+    subgraph CLIENT["Client"]
         direction TB
         FST["FileStorage<br/>CreateStorageBackend"]
         CL["Client"]
@@ -14,7 +14,7 @@ flowchart TB
         CL --> MC
     end
 
-    subgraph MASTER["Master 进程 · 控制面"]
+    subgraph MASTER["Master"]
         direction TB
         WMS["WrappedMasterService"]
         MS["MasterService<br/>PutStart / PutEnd<br/>GetReplicaList / RemoveObject"]
