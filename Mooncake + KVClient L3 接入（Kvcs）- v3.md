@@ -107,49 +107,51 @@ KVClient 与 KVCS 同为「网络可寻址 KV」，但底层能力差异决定�
 
 KVClient 后端位于 Mooncake 数据面的最南端，替换 KVCS 的 EFC 通道，**不改变其上方任何一层的职责**。
 
+实线表示应用调用与存储 I/O，虚线表示元数据交互。灰色模块沿用现有职责，黄色模块需要调整，绿色模块为新增。
+
 ```mermaid
 flowchart TB
-    subgraph App["应用层"]
+    subgraph Request["请求端进程"]
         A["应用<br/>已聚合 CPU buffer / 连续 CPU slices"]
-    end
-
-    subgraph ClientProc["请求端进程（Client）"]
         R["RealClient<br/>应用 API、buffer 组织"]
         C["Client<br/>副本读写、逐 key 收尾<br/>value-first 删除、miss 清理"]
         RPC["MasterClient<br/>元数据 RPC"]
-        TE["TransferWrite / TransferRead<br/>Transfer Engine"]
-        B["DistributedStorageBackend<br/>BatchWrite / BatchRead / BatchDeleteObjects"]
-        O["KvcsObjectStorageAdapter<br/>按逻辑 key 读写（复用，不改）"]
-        D["KvClientDriver（新增）<br/>key 编码、staging、提交与等待、quarantine"]
-        SDK["kv::KvClient（SDK，不改）<br/>路由、Host RDMA"]
+        TE["TransferWrite / TransferRead<br/>Transfer Engine / memcpy"]
+        B["DistributedStorageBackend<br/>BatchWrite / BatchRead / BatchDeleteObjects<br/>长度校验"]
+        O["KvcsObjectStorageAdapter<br/>按逻辑 key 读写、批量结果映射"]
+        D["KvClientDriver<br/>key 编码、staging、提交与等待、quarantine"]
+        SDK["kv::KvClient（SDK）<br/>CacheKey 路由、Host RDMA"]
+
+        A <-->|"Put / Get / Remove"| R
+        R <--> C
+        C -.-> RPC
+        C <-->|"MEMORY 副本"| TE
+        C <-->|"读写：key + 描述符 + CPU slices<br/>删除：key"| B
+        B <-->|"PutBatch / GetBatch / DeleteBatch"| O
+        O <-->|"EncodeKey / BatchPut / BatchGet / BatchDelete"| D
+        D <-->|"内存注册<br/>BatchStore / BatchLoad / Delete 与 Wait"| SDK
     end
 
-    subgraph MasterProc["Master 进程（不接 SDK）"]
+    subgraph Master["Master 进程（不接 SDK）"]
         M["MasterService<br/>申请、发布、查询、元数据删除<br/>use_kvclient_ 分支"]
         META["对象目录<br/>key、长度、ReplicaID、状态、读取租约"]
+
+        M -.->|"查询与更新"| META
     end
 
-    RAM["Mooncake 内存池<br/>L1：本机或远端"]
-    S["远端 KV 存储<br/>L3：CacheKey → value"]
+    RAM["Mooncake 内存池<br/>L1：可位于本机或远端"]
+    S["远端 KV 存储<br/>L3：CacheKey 到 value 的定位、物理空间、内部冗余"]
 
-    A <-->|"Put / Get / Remove"| R
-    R <--> C
-    C -.->|"PutStart/PutEnd/PutRevoke<br/>GetReplicaList/Remove<br/>EvictDiskReplicaIfCurrent"| RPC
-    RPC -.-> M
-    M -.-> META
-    C <-->|"MEMORY 副本"| TE
+    RPC -.->|"PutStart / PutEnd / PutRevoke<br/>GetReplicaList / Remove<br/>EvictDiskReplicaIfCurrent"| M
+    M -.->|"副本描述符、租约、操作结果"| RPC
     TE <-->|"数据传输"| RAM
-    C <-->|"key + descriptor + slices"| B
-    B <--> O
-    O <--> D
-    D <-->|"RegisterRegions<br/>BatchStore/Load/Delete + Wait"| SDK
-    SDK <-->|"KV 协议与 value 数据<br/>Host RDMA"| S
+    SDK <-->|"KV 协议与 value 数据"| S
 
     classDef existing fill:#f3f4f6,stroke:#6b7280,color:#111827;
     classDef changed fill:#fff4cc,stroke:#b58105,color:#111827;
     classDef added fill:#e3f5e8,stroke:#28864b,color:#111827;
-    class A,R,RPC,TE,O,META,RAM,S existing;
-    class C,B,M,SDK changed;
+    class A,R,RPC,TE,B,META,RAM,S,SDK existing;
+    class C,O,M changed;
     class D added;
 ```
 
@@ -163,118 +165,252 @@ flowchart TB
 | `KvcsDriver`（接口） | SDK 边界抽象 | 新增 `EncodeKey` 虚函数，其余零改动 |
 | `KvClientDriver` | key 编码、staging、提交/等待/quarantine | **新增** |
 
-### 2.1.2 类图
+### 2.1.2 Client 侧类图
+
+黄色表示修改现有类，绿色表示新增类，灰色表示复用接口或数据结构。类图列出相关成员，参数和返回类型作了简化；新增方法使用设计名称。
 
 ```mermaid
 classDiagram
     direction TB
 
-    class ObjectStorageAdapter {
-        <<interface>>
-        +Put(key, data)
+    class DistributedStorageConfig["DistributedStorageConfig（修改）"] {
+        +fs_adapter_type
+        +object_storage_config_path
+        +UsesObjectStorage()
+        +UsesKvcs()
+        +UsesKvClient()
+        +Validate()
+    }
+    class FileStorage["FileStorage（修改）"] {
+        -storage_backend_
+        -client_
+        +FileStorage(config, client)
+        +Init()
+    }
+    class Client["Client（修改）"] {
+        -dfs_storage_backend_
+        +SetDfsStorageBackend(backend)
+        +Put(key, slices, config)
+        +Get(key, slices)
+        +Remove(key)
+        +BatchRemove(keys, force)
+        -ReconcileMissingKvReplica(key, query, replica)
+    }
+    class DistributedStorageBackend["DistributedStorageBackend（复用）"] {
+        -object_storage_adapter_
+        -distributed_config_
+        +BatchWrite(requests)
+        +BatchRead(requests)
+        +BatchDeleteObjects(keys)
+        +UsesObjectStorage()
+        +UsesKvcs()
+        +UsesKvClient()
+    }
+    class ObjectStorageAdapter["ObjectStorageAdapter（复用）"] {
         +PutV(key, iov, iovcnt)
         +PutBatch(requests)
         +GetBatch(requests)
-        +Exists(key)
-        +Delete(key)
         +DeleteBatch(keys)
+        +Exists(key)
         +ListKeys()
-        +GetRange(key, buf, len, offset)
-        +Init()
+        +GetRange(key, buffer, len, offset)
         +GetName()
     }
-
-    class KvcsObjectStorageAdapter {
-        -driver_ : unique_ptr~KvcsDriver~
-        -name_ : string
-        -initialized_ : bool
+    class KvcsObjectStorageAdapter["KvcsObjectStorageAdapter（修改）"] {
+        -driver_
+        -name_
+        -initialized_
         +Init()
         +PutBatch(requests)
         +GetBatch(requests)
         +DeleteBatch(keys)
-        +Exists(key) NOT_SUPPORTED
-        +ListKeys() NOT_SUPPORTED
         +GetName()
     }
-
-    class KvcsDriver {
-        <<interface>>
+    class KvcsDriver["KvcsDriver（修改）"] {
         +Init()
-        +MaxValueSize() uint64
-        +MaxKeySize() uint32
+        +MaxValueSize()
+        +MaxKeySize()
         +GetMountpointStats()
-        +EncodeKey(logical_key) ObjectKey
-        +BatchPut(requests) KvcsIoResults
-        +BatchGet(requests) KvcsIoResults
-        +BatchDelete(keys) KvcsIoResults
+        +EncodeKey(logical_key)
+        +BatchPut(requests)
+        +BatchGet(requests)
+        +BatchDelete(keys)
     }
-
-    class KvcsLowLevelDriver {
-        -client_ : kvcs_ll_client_t*
-        +EncodeKey() hex
-        +BatchPut() Delete-then-Put
+    class KvcsLowLevelDriver["KvcsLowLevelDriver（修改）"] {
+        -client_
+        +EncodeKey(logical_key)
+        +BatchPut(requests)
+        +GetMountpointStats()
     }
-
-    class KvClientDriver {
-        -kv_client_ : unique_ptr~kv::KvClient~
-        -arena_ : StagingArena
-        -config_ : KvClientDriverConfig
+    class KvClientDriver["KvClientDriver（新增）"] {
+        -kv_client_
+        -arena_
+        -config_
+        -initialized_
         +Init()
-        +MaxValueSize() 16776704
-        +EncodeKey() XXH64
+        +MaxValueSize()
+        +EncodeKey(logical_key)
         +BatchPut(requests)
         +BatchGet(requests)
         +BatchDelete(keys)
         +GetStats()
-        +Shutdown()
         -SubmitAndWait(op, entries, indices, slots, results)
-        -MapEntryStatus(status) ErrorCode
-        -PreflightSharedProvider() bool
+        -MapEntryStatus(status)
+        -PreflightSharedProvider()
+        -Shutdown()
     }
-
-    class StagingArena {
-        -base_ : void*
-        -canonical_handle_ : MRHandle
-        -slot_stride_ : size_t
-        -states_ : vector~SlotState~
-        -free_list_ : vector~size_t~
+    class StagingArena["StagingArena（新增）"] {
+        -base_
+        -canonical_handle_
+        -slot_stride_
+        -states_
+        -free_list_
         +Init(client, region_bytes, max_slot_bytes)
         +Shutdown(client)
-        +Acquire(bytes) Slot
+        +Acquire(bytes)
         +Release(slot)
         +Quarantine(slot)
-        +InUseSlots() size_t
-        +QuarantinedBytes() uint64
-        +CanonicalHandle() MRHandle
+        +InUseSlots()
+        +QuarantinedBytes()
+        +CanonicalHandle()
+    }
+    class SdkKvClient["kv::KvClient（复用，SDK 不改）"] {
+        +Init(configPath)
+        +Shutdown()
+        +RegisterRegions(regions, registered)
+        +UnregisterRegions(handles)
+        +BatchStoreAsync(entries, task_id)
+        +BatchLoadAsync(entries, task_id)
+        +DeleteAsync(keys, task_id)
+        +QueryAsync(keys, task_id)
+        +Wait(task_id, timeout, result)
     }
 
-    class DistributedStorageConfig {
-        +fs_adapter_type : string
-        +UsesObjectStorage()
-        +UsesKvcs()
-        +UsesKvClient() 新增
-        +Validate()
-    }
-
+    FileStorage o-- DistributedStorageBackend : "共享持有后端"
+    FileStorage --> Client : "注入 DFS 后端"
+    Client o-- DistributedStorageBackend : "共享持有"
+    DistributedStorageBackend *-- DistributedStorageConfig : "保存配置"
+    DistributedStorageBackend *-- ObjectStorageAdapter : "持有对象适配器"
     ObjectStorageAdapter <|-- KvcsObjectStorageAdapter
-    KvcsObjectStorageAdapter o-- KvcsDriver : "持有（注入）"
-    KvcsDriver <|.. KvcsLowLevelDriver : "既有"
-    KvcsDriver <|.. KvClientDriver : "新增"
+    KvcsObjectStorageAdapter *-- KvcsDriver : "持有（注入）"
+    KvcsDriver <|-- KvcsLowLevelDriver
+    KvcsDriver <|-- KvClientDriver
     KvClientDriver *-- StagingArena : "自持注册内存"
+    KvClientDriver *-- SdkKvClient : "持有 SDK 实例"
     DistributedStorageConfig ..> KvClientDriver : "工厂按配置创建"
 
-    style ObjectStorageAdapter fill:#f3f4f6,stroke:#6b7280,color:#111827
+    style DistributedStorageConfig fill:#fff4cc,stroke:#b58105,color:#111827
+    style FileStorage fill:#fff4cc,stroke:#b58105,color:#111827
+    style Client fill:#fff4cc,stroke:#b58105,color:#111827
     style KvcsObjectStorageAdapter fill:#fff4cc,stroke:#b58105,color:#111827
     style KvcsDriver fill:#fff4cc,stroke:#b58105,color:#111827
     style KvcsLowLevelDriver fill:#fff4cc,stroke:#b58105,color:#111827
     style KvClientDriver fill:#e3f5e8,stroke:#28864b,color:#111827
     style StagingArena fill:#e3f5e8,stroke:#28864b,color:#111827
-    style DistributedStorageConfig fill:#fff4cc,stroke:#b58105,color:#111827
+    style DistributedStorageBackend fill:#f3f4f6,stroke:#6b7280,color:#111827
+    style ObjectStorageAdapter fill:#f3f4f6,stroke:#6b7280,color:#111827
+    style SdkKvClient fill:#f3f4f6,stroke:#6b7280,color:#111827
 ```
+
+继承线表示接口实现，实心菱形表示对象内持有，空心菱形表示共享持有，虚线箭头表示创建依赖。`FileStorage` 与 `Client` 使用同一份 `DistributedStorageBackend`；后端持有的对象适配器恒为 `KvcsObjectStorageAdapter`，其内部 driver 在配置为 `kvclient` 时取 `KvClientDriver`，配置为 `kvcs-lowlevel` 时取 `KvcsLowLevelDriver`。
+
+| 类或函数 | 接口与改动说明 |
+| --- | --- |
+| `DistributedStorageConfig` | `UsesObjectStorage()` 列表加入 `"kvclient"`；新增 `UsesKvClient()`，与 `UsesKvcs()` 平级；`Validate()` 增加 KVClient 专属分支（不要求 `eviction_check_interval`） |
+| `CreateStorageBackend(config)` | 修改现有工厂函数，在 distributed 分支按配置创建 driver 并注入适配器；该入口是自由函数，列在图外 |
+| `FileStorage` | 修改构造时的 DFS 启用判断，将 KVClient 后端注入 Client；沿用现有初始化入口 |
+| `Client` | `BatchRemove` 的 KVClient 分支改为 value-first；`Remove` / `RemoveAll` / `RemoveByRegex` 门控放宽；`ReconcileMissingKvcsReplica()` 推广为图中的 `ReconcileMissingKvReplica()` |
+| `DistributedStorageBackend` | **零改动**。读写路径已由 `UsesObjectStorage()` 抽象化，仅新增 `UsesKvClient()` 组合判断供 Client 侧门控使用 |
+| `ObjectStorageAdapter` | **零改动**。同步契约（payload 须在返回前保持有效）是 §2.3.2 staging 设计的来源 |
+| `KvcsObjectStorageAdapter` | 2 处 KVCS 专属逻辑下推为 driver 职责（`EncodeKey`、Delete-before-Put）；`GetName()` 改为可配置，工厂传入 `"kvclient"` |
+| `KvcsDriver` | 新增 `EncodeKey(logical_key)` 纯虚函数；其余接口零改动。`GetMountpointStats()` 基类默认 `NOT_SUPPORTED` 正好匹配 KVClient 无容量接口 |
+| `KvcsLowLevelDriver` | 接收下推的 hex 编码与 Delete-before-Put（源于 KVCS Put 是 insert-only） |
+| `KvClientDriver` | 新增 `KvcsDriver` 实现。图中 `SubmitAndWait` / `MapEntryStatus` / `PreflightSharedProvider` 为新增私有辅助方法，具体流程见 §2.3.2 |
+| `StagingArena` | 新增。一个已注册 region + 512B 对齐变长子分配 + quarantine；承重组件，理由见 §2.3.2 与 SFMEA-12 |
+| `kv::KvClient` | **SDK 不改**。只用批量接口 `BatchStoreAsync` / `BatchLoadAsync` / `DeleteAsync` / `QueryAsync`，单条 `StoreAsync` / `LoadAsync` 在线格式层无批量能力（`io_scheduler.cc:82`） |
+
+### 2.1.3 Master 侧类图
+
+Master 在现有 `ObjectMetadata` 和 `Replica` 上管理 KVClient 的逻辑 DFS 副本。`PutStart` 创建描述符，`PutEnd` 发布副本，查询返回可读副本，Remove 和明确 miss 清理更新对象目录。Master **不接 SDK**，不创建 driver，也不建 capacity provider。
+
+```mermaid
+classDiagram
+    direction TB
+
+    class MasterService["MasterService（修改）"] {
+        -use_kvcs_
+        -use_kvclient_
+        -enable_dfs_
+        +PutStart(...)
+        +PutEnd(...)
+        +PutRevoke(...)
+        +GetReplicaList(...)
+        +Remove(...)
+        +BatchRemove(...)
+        +EvictDiskReplicaIfCurrent(...)
+        -InitDfsAllocatorFromEnvironment(config)
+        -PrepareWriteStart(...)
+        -AllocateReplicas(...)
+        -EvictDiskReplicaImpl(...)
+    }
+    class DistributedStorageConfig["DistributedStorageConfig（修改）"] {
+        +UsesKvcs()
+        +UsesKvClient()
+        +FromEnvironment()
+    }
+    class ObjectMetadata["ObjectMetadata（复用）"] {
+        +user_key
+        +client_id
+        +VisitReplicas(...)
+        +GrantReadLease(...)
+        +IsLeaseExpired(now)
+    }
+    class Replica["Replica（复用）"] {
+        +id()
+        +status()
+        +is_dfs_replica()
+        +get_dfs_descriptor()
+    }
+    class ReplicaDescriptor["Replica::Descriptor（复用）"] {
+        +id
+        +status
+        +get_dfs_descriptor()
+    }
+    class DistributedFSDescriptor["DistributedFSDescriptor（复用）"] {
+        +file_path
+        +offset
+        +object_size
+        +aligned_size
+        +shard_idx
+    }
+
+    MasterService ..> DistributedStorageConfig : "配置与后端选择"
+    MasterService --> ObjectMetadata : "查询与更新对象目录"
+    ObjectMetadata *-- Replica : "保存各类副本"
+    MasterService ..> ReplicaDescriptor : "返回副本描述符"
+    Replica ..> ReplicaDescriptor : "生成描述符"
+    ReplicaDescriptor *-- DistributedFSDescriptor : "DFS 类型的描述信息"
+
+    style MasterService fill:#fff4cc,stroke:#b58105,color:#111827
+    style DistributedStorageConfig fill:#fff4cc,stroke:#b58105,color:#111827
+    style ObjectMetadata fill:#f3f4f6,stroke:#6b7280,color:#111827
+    style Replica fill:#f3f4f6,stroke:#6b7280,color:#111827
+    style ReplicaDescriptor fill:#f3f4f6,stroke:#6b7280,color:#111827
+    style DistributedFSDescriptor fill:#f3f4f6,stroke:#6b7280,color:#111827
+```
+
+Master 查询自身对象目录，Client 根据返回的描述符调用 driver。存储返回明确 miss 时，由 Client 请求 `EvictDiskReplicaIfCurrent` 条件清理。
+
+| 类 | 改动与职责 |
+| --- | --- |
+| `MasterService` | 新增私有 `use_kvclient_`（与 `use_kvcs_` 平级，不合并——决策 6 要求恢复门保持 KVCS-only）。改动 6 处：`enable_dfs_` 判定（`:847`）、初始化新增分支（`:872` 前）、descriptor 铸造（`:5090`）、`PrepareWriteStart` 门与 512 对齐校验（`:5248-5249`）、`EvictDiskReplicaImpl` 白名单（`:6440`、`:6457`）。**恢复门 `:3533`、`:3825`、`:4118` 不改** |
+| `DistributedStorageConfig` | 解析 KVClient 配置，提供与 `UsesKvcs()` 平级的能力判断 |
+| `ObjectMetadata` / `Replica` | 保存 key、写入 Client、副本身份、状态和读取租约，沿用既有元数据持久化方式 |
+| `Replica::Descriptor` / `DistributedFSDescriptor` | 向 Client 返回对象长度、ReplicaID 和状态。KVClient 模式下 `file_path` 为空、`offset` 为 0、`shard_idx` 为 -1，`object_size == aligned_size == N` 且 N 为 512 的倍数 |
 
 **设计要点**：
 
-1. **不新建适配器类**。`KvcsObjectStorageAdapter` 已有注入构造函数 `KvcsObjectStorageAdapter(std::unique_ptr<KvcsDriver>)`（`kvcs_object_storage_adapter.h:19`），注入后 `Init()` 跳过 `LoadKvcsEfcTarget` / `CreateKvcsLowLevelDriver`（`:71-79`）。KVClient 只是该接口的第二个实现。
+1. **不新建适配器类**。`KvcsObjectStorageAdapter` 已有注入构造函数 `KvcsObjectStorageAdapter(std::unique_ptr<KvcsDriver>)`（`kvcs_object_storage_adapter.h:19`），注入后 `Init()` 跳过 `LoadKvcsEfcTarget` / `CreateKvcsLowLevelDriver`（`:71-79`）。KVClient 只是该接口的第二个 driver 实现。
 
 2. **`KvcsDriver` 天然匹配 KVClient 的能力缺口**。`GetMountpointStats()` 基类默认返回 `NOT_SUPPORTED`（`kvcs_driver.h:69-72`），而 Master 侧对 provider 返回 `NOT_SUPPORTED` **已有优雅降级**（`master_service.cpp:883-889`）：只打 WARNING、禁用水位淘汰、`enable_dfs_` 保持 true。KVClient 无容量接口的缺口被既有代码吸收，无需新设计。
 
@@ -282,7 +418,7 @@ classDiagram
 
 4. **2 处 KVCS 专属逻辑下推为 driver 职责**（约 20 行移动，非新增）：
    - `EncodeKey`（hex 编码，`kvcs_object_storage_adapter.cpp:57-65`）→ 提为 `KvcsDriver` 虚函数。KVCS 保持 hex，KVClient 用 XXH64。
-   - Delete-before-Put（`:155-170`）→ 移进 `KvcsLowLevelDriver::BatchPut`。该逻辑源于 KVCS Put 是 insert-only；KVClient 覆盖写不需要。
+   - Delete-before-Put（`:155-170`）→ 移进 `KvcsLowLevelDriver::BatchPut`。该逻辑源于 KVCS Put 是 insert-only；KVClient 覆盖写不需要（待 T-48 真机验证）。
 
 5. **`StagingArena` 是承重组件，不可裁剪**。原因见 §2.3.2 与 SFMEA-12/13：SDK 超时后不取消设备操作，driver 必须自持内存才能安全 quarantine。
 
@@ -290,127 +426,170 @@ classDiagram
 
 ### 2.2.1 写入流程（S1 两副本）
 
+下图以新 key 的 Put 为例，按申请、数据写入和提交顺序展开。Master 的申请与收尾分别绘制，元数据 RPC 经 `MasterClient` 发送，数据由请求端访问内存池和远端存储。
+
 ```mermaid
 flowchart TB
-    C1["① Client::Put(key, slices, config)"]
+    C1["① 请求端 Client::Put<br/>key、CPU slices、replica config"]
 
-    subgraph MasterStart["Master：申请阶段"]
-        START["② PutStart / PrepareWriteStart<br/>校验 N%512==0、N<=16776704<br/>校验非三副本"]
-        ALLOC["分配 MEMORY 副本<br/>铸造 DistributedFSDescriptor<br/>object_size=aligned_size=N, shard_idx=-1"]
-        META["记录写入 Client、ReplicaID<br/>副本状态 PROCESSING"]
-        START --> ALLOC --> META
+    subgraph MasterStart["Master 进程：申请阶段"]
+        START["② MasterService::PutStart / PrepareWriteStart<br/>校验 N%512==0、N<=16776704、非三副本"]
+        ALLOC["分配 MEMORY 副本<br/>铸造逻辑 DFS 描述符<br/>object_size=aligned_size=N, shard_idx=-1"]
+        META["记录写入 Client、对象长度与 ReplicaID<br/>副本状态为 PROCESSING"]
+
+        START --> ALLOC
+        ALLOC --> META
     end
 
-    subgraph DataWrite["请求端：数据写入"]
-        T["③ TransferWrite → MEMORY 副本"]
-        GATE{"④ NonDfsTransfersSucceeded?"}
-        W["⑤ WriteDfsReplicas"]
-        B["DistributedStorageBackend::BatchWrite<br/>校验 total_size == object_size"]
-        O["KvcsObjectStorageAdapter::PutBatch"]
-        D["⑥ KvClientDriver::BatchPut<br/>EncodeKey → staging Acquire → memcpy<br/>BatchStoreAsync → Wait"]
-        J{"⑦ AllAllocatedTransfersSucceeded?<br/>memory 与 dfs 均成功且零失败"}
-        END["⑧ PutEnd(ALL)"]
-        REVOKE["⑧ PutRevoke(ALL)<br/>memory 副本一起 revoke"]
-        SKIP["跳过 DFS 写<br/>ASU 零调用"]
+    subgraph Request["请求端进程：数据写入与结果汇总"]
+        C2["③ Client<br/>接收 PROCESSING 副本描述符"]
+        T["④ TransferWrite<br/>完成 MEMORY 传输"]
+        GATE{"⑤ NonDfsTransfersSucceeded?"}
+        W["⑥ WriteDfsReplicas<br/>构造 key + 描述符 + CPU slices"]
+        B["DistributedStorageBackend::BatchWrite<br/>校验总长度等于 object_size"]
+        O["KvcsObjectStorageAdapter::PutBatch<br/>EncodeKey + 单个连续 iovec"]
+        D["⑦ KvClientDriver::BatchPut<br/>staging Acquire → memcpy<br/>BatchStoreAsync → Wait → Release/Quarantine"]
+        J{"⑧ Client 逐 key 汇总<br/>AllAllocatedTransfersSucceeded?<br/>memory 与 dfs 均成功且零失败"}
+        END["⑨ MasterClient::PutEnd<br/>key、对象校验和、ALL"]
+        REVOKE["⑨ MasterClient::PutRevoke<br/>key、ALL"]
 
+        C2 --> T
         T --> GATE
         GATE -->|"是"| W
-        GATE -->|"否"| SKIP
-        W --> B --> O --> D
-        D --> J
-        SKIP --> J
+        GATE -->|"否：跳过 DFS 写，ASU 零调用"| J
+        W --> B
+        B -->|"校验通过"| O
+        B -->|"参数错误"| J
+        O --> D
+        D -->|"逐 key 数据结果经后端返回"| J
         J -->|"成功"| END
         J -->|"失败"| REVOKE
     end
 
-    RAM["内存池 L1"]
-    S["远端 KV 存储 L3"]
+    subgraph MasterFinish["Master 进程：提交或撤销"]
+        COMMIT["⑩ MasterService::PutEnd<br/>核对写入者与副本状态<br/>发布 COMPLETE，更新访问记录"]
+        ABORT["⑩ MasterService::PutRevoke<br/>核对写入 Client 与状态<br/>移除本轮 PROCESSING 副本（含 MEMORY）"]
+    end
 
-    C1 -->|"MasterClient RPC"| START
-    META -->|"descriptor + PROCESSING"| T
-    T <--> RAM
-    D <-->|"Host RDMA"| S
-    END --> OK["⑨ Put 成功"]
-    REVOKE --> FAIL["⑨ Put 失败"]
+    OK["⑪ 请求端返回 Put 成功"]
+    FAIL["⑪ 请求端返回该 key 的失败结果"]
+    REJECT["请求端返回申请错误"]
+    RAM["MEMORY 副本<br/>Mooncake 内存池 L1"]
+    S["KVClient → 远端 KV 存储 L3<br/>按 CacheKey 写入完整 value"]
+
+    C1 -->|"MasterClient RPC：PutStart<br/>client_id、key、总长度、配置"| START
+    START -->|"申请失败"| REJECT
+    META -->|"ReplicaID、PROCESSING、对象长度<br/>及 MEMORY 副本描述符"| C2
+    T <-->|"写入并等待传输结果"| RAM
+    D <-->|"注册内存与操作结果"| S
+    END --> COMMIT
+    COMMIT -->|"提交成功"| OK
+    COMMIT -->|"提交错误或响应未知"| FAIL
+    REVOKE --> ABORT
+    ABORT -->|"撤销结果"| FAIL
 ```
 
 **关键判定**（决策 4，零代码改动）：`DetermineReplicaWriteMode` 在 `dfs > 0` 时返回 `RELIABLE_MULTI_REPLICA`（`replica.h:315-322`），故 `AllAllocatedTransfersSucceeded` 要求 memory 与 dfs **全部成功且零失败**（`client_service.cpp:329-333`），否则 `PutRevoke(ALL)`（`:384-401`）。短路顺序由 `:2160-2161` 保证：memory 失败时 ASU 零调用。
 
+PutEnd 响应未知时，Client 返回提交错误；后续通过 Master 查询或符合条件的重复提交确认发布状态。
+
 ### 2.2.2 读取流程（S1 / S5）
+
+下图展开完整对象 Get 选中 DFS 副本后的数据路径，Master 按查询阶段和 miss 清理阶段分别绘制。内存副本淘汰后，Master 仍保留已发布的 DFS 记录，读取 Client 按相同流程访问 L3。
 
 ```mermaid
 flowchart TB
-    Q["① Client::Get(key, slices)"]
+    Q["① 请求端 Client::Get → Query<br/>记录本地查询起始时间"]
 
-    subgraph MasterQuery["Master：查询阶段"]
-        GET["② GetReplicaList<br/>筛选 COMPLETE 副本"]
-        LEASE["GrantReadLease"]
+    subgraph MasterQuery["Master 进程：查询阶段"]
+        GET["② MasterService::GetReplicaList<br/>查找对象、筛选 COMPLETE 副本"]
+        LEASE["GrantReadLease<br/>更新对象读取租约"]
+
         GET -->|"存在可读副本"| LEASE
     end
 
-    subgraph ReadPath["请求端：读取与校验"]
-        SEL["③ 选择副本（本图选中 COMPLETE DFS）"]
-        B["DistributedStorageBackend::BatchRead<br/>size = desc.object_size<br/>slice 容量 >= object_size"]
-        D["④ KvClientDriver::BatchGet<br/>EncodeKey → staging Acquire<br/>BatchLoadAsync → Wait → memcpy 回原 buffer"]
-        V["⑤ 校验读回长度 == object_size"]
-        MISS{"⑥ SDK 返回明确 NOT_FOUND?"}
-        REC["⑦ ReconcileMissingKvReplica<br/>携带观察到的 ReplicaID"]
-        CHK["⑧ 检查 IsLeaseExpired"]
+    subgraph Request["请求端进程：读取与校验"]
+        QR["③ QueryResult<br/>可读副本、租约截止时间、可选校验和"]
+        SELECT["④ Client 按入口策略选择副本<br/>本图选中 COMPLETE DFS"]
+        READ["⑤ ReadDfsReplica<br/>key + DFS 描述符 + CPU 目标 slices"]
+        B["DistributedStorageBackend::BatchRead<br/>size = desc.object_size<br/>校验 slice 容量 >= object_size"]
+        D["⑥ KvClientDriver::BatchGet<br/>staging Acquire → BatchLoadAsync → Wait<br/>→ memcpy 回原目标 buffer"]
+        VERIFY["⑦ 确认完整读取 object_size 字节<br/>数据已写入原目标 buffer"]
+        CHECK["⑧ Client 检查结果<br/>对象校验和、IsLeaseExpired"]
+        MISS["⑨ 明确 NotFound<br/>携带本次观察到的 ReplicaID<br/>请求条件清理 DFS 记录"]
 
-        SEL --> B --> D --> V
-        D --> MISS
-        MISS -->|"是"| REC
-        MISS -->|"否"| V
-        V -->|"长度相符"| CHK
+        QR --> SELECT
+        SELECT --> READ
+        READ --> B
+        B -->|"logical_key + 原 buffer + object_size"| D
+        D -->|"读取完成"| VERIFY
+        D -->|"对象明确不存在"| MISS
+        VERIFY -->|"完整读取成功"| CHECK
     end
 
-    subgraph MasterCleanup["Master：miss 清理"]
-        EVICT["EvictDiskReplicaIfCurrent<br/>核对 ReplicaID，匹配则移除 DFS 记录"]
+    subgraph MasterCleanup["Master 进程：miss 清理"]
+        EVICT["⑩ EvictDiskReplicaIfCurrent<br/>核对当前 DFS ReplicaID<br/>匹配时移除失效记录"]
     end
 
-    S["远端 KV 存储 L3"]
+    RETURN["⑪ 请求端返回成功或错误<br/>租约到期返回 LEASE_EXPIRED"]
+    ERROR["请求端返回 I/O 或校验错误<br/>元数据保留"]
+    QUERY_FAIL["请求端返回查询错误"]
+    MISS_RETURN["请求端返回本次读取 miss"]
+    S["KVClient → 远端 KV 存储 L3<br/>按 CacheKey 读取 value"]
 
-    Q --> GET
-    LEASE -->|"descriptor + lease_ttl_ms"| SEL
-    D <-->|"Host RDMA"| S
-    REC --> EVICT
-    EVICT --> RET_MISS["⑨ 返回本次 miss"]
-    CHK --> RET_OK["⑨ 返回成功"]
-    V -->|"长度不符"| RET_ERR["返回 FILE_READ_FAIL"]
-    D -->|"超时 / 连接 / I/O 错误"| RET_ERR2["返回错误，元数据保留"]
+    Q -->|"MasterClient RPC：GetReplicaList(key)"| GET
+    GET -->|"OBJECT_NOT_FOUND / REPLICA_IS_NOT_READY 等"| QUERY_FAIL
+    LEASE -->|"描述符、lease_ttl_ms、可选校验和"| QR
+    D <-->|"Load 到原目标 buffer，返回逐项结果"| S
+    MISS -->|"MasterClient：条件清理请求"| EVICT
+    EVICT --> MISS_RETURN
+    CHECK --> RETURN
+    D -->|"超时、连接或 I/O 错误"| ERROR
+    B -->|"容量不足或参数错误"| ERROR
+    VERIFY -->|"读取长度不符"| ERROR
 ```
 
 **要点**：超时、连接失败、长度不符**保留副本记录**（供后续读取或诊断）；只有明确 `NOT_FOUND` 才触发条件清理。这与 KVCS 现有行为一致（`client_service.cpp:1624-1627`、`:1935-1939`）。
 
+普通 `Client::Query` 使用本地查询起始时间加 `lease_ttl_ms` 计算租约截止时间，完整对象 Get 在读取结束后检查有效期。
+
 ### 2.2.3 删除流程（S3，决策 5：value-first）
+
+删除顺序与 KVCS 相反：Client 先调用 KVClient 删除 value，再对删除成功的 key 请求 Master 移除对象元数据。
 
 ```mermaid
 flowchart TB
-    C["① Client::Remove / BatchRemove(keys, force)"]
+    C["① Client::Remove / BatchRemove<br/>key 列表与删除参数"]
 
-    subgraph ValueFirst["请求端：先删 value"]
-        DEL["② DistributedStorageBackend::BatchDeleteObjects(全部 keys)"]
+    subgraph Request["请求端进程：先删 value"]
+        B["② DistributedStorageBackend<br/>BatchDeleteObjects(全部 keys)"]
         D["③ KvClientDriver::BatchDelete<br/>EncodeKey → DeleteAsync → Wait"]
-        PICK["④ 选出删除成功项<br/>（含幂等 NOT_FOUND）"]
-        DEL --> D --> PICK
+        PICK["④ 选出 value 删除成功的项<br/>（含幂等 NOT_FOUND）"]
+
+        B --> D
+        D --> PICK
     end
 
-    subgraph MasterRemove["Master：后删元数据"]
-        M["⑤ MasterService::BatchRemove<br/>CheckRemovable：lease / 副本就绪 / 复制任务"]
-        META["⑥ Erase 元数据"]
-        M -->|"允许"| META
+    subgraph Master["Master 进程：后删元数据"]
+        M["⑤ MasterService::BatchRemove<br/>检查对象状态与读取保护"]
+        META["⑥ 移除对象元数据"]
+
+        M -->|"允许删除"| META
     end
 
-    RESULT["⑦ 回填原下标，逐 key 结果"]
-    S["远端 KV 存储 L3"]
+    RESULT["⑧ 回填原下标，汇总逐 key 结果"]
+    RETURN["⑨ 向应用返回删除结果"]
+    WINDOW["⑦ 元数据保留但 value 已失<br/>⚠️ 后续读取触发 miss 自愈"]
+    S["远端 KV 存储 L3<br/>按 CacheKey 删除 value"]
 
-    C --> DEL
-    D <-->|"Host RDMA"| S
-    PICK -->|"成功项"| M
-    PICK -->|"失败项保留各自错误"| RESULT
-    META --> RESULT
-    M -->|"CheckRemovable 拒绝<br/>⚠️ value 已删"| WINDOW["元数据保留但 value 已失<br/>→ 后续读取触发 miss 自愈"]
+    C -->|"key 列表"| B
+    D <-->|"删除请求与结果"| S
+    PICK -->|"成功项 metadata_keys"| M
+    PICK -->|"失败项保留各自错误<br/>value 与元数据均保留"| RESULT
+    M -->|"请求被拒绝或元数据错误"| WINDOW
+    META -->|"元数据删除成功"| RESULT
     WINDOW --> RESULT
+    RESULT --> RETURN
 ```
 
 **顺序理由**：KVClient 的三条孤儿回收通道全断，metadata-first 的孤儿是**永久且无界**的。
@@ -420,23 +599,80 @@ flowchart TB
 | 水位淘汰（`master_service.cpp:423-434`） | ✅ 先删 value 后改元数据，失败则元数据保留待下轮重试 | ❌ 依赖容量查询，`usage.enabled=false` → 永不触发（`:7999-8004`） |
 | Master 侧自持 driver | ✅ `kvcs_capacity_provider.cpp:61-67` | ❌ Master 无 RDMA 设备 |
 | key 枚举扫描 | ❌ | ❌ `ListKeys` → NOT_SUPPORTED |
-| 同 key 重写 pre-delete | ✅ 偶然 | ✅ 偶然（唯一残存通道） |
+| 同 key 重写覆盖 | ✅ 偶然 | ✅ 偶然（唯一残存通道） |
 
 **中间态自愈**：value 已删、元数据尚在 → 读取返回 `NOT_FOUND` → `ReconcileMissingKvReplica` → `EvictDiskReplicaIfCurrent` 按 ReplicaID 条件清理。**决策 5 依赖决策 2 同时落地**，否则中间态无人清理。
 
 **已知窗口**：`CheckRemovable` 以 `OBJECT_HAS_LEASE` / `REPLICA_IS_NOT_READY` / `OBJECT_HAS_REPLICATION_TASK` 拒绝时（`master_service.cpp:7401-7406`、`:7445-7463`），value 已删但元数据保留 → 一个仍在租约保护中的已发布对象变为不可读。对 KV cache 是「命中变未命中」，**不返回错数据**，语义安全；但确实丢了已成功 Put 的数据。此取舍成立的前提是 metadata-first 的孤儿为永久无界泄漏。
 
+**失败态可安全重试**：value 删除失败的 key **不进入**元数据删除集合，故 value 与元数据同时保留。这是 value-first 相对 metadata-first 的核心优势——metadata-first 下失败项元数据已毁、value 残留，且重试遇 `OBJECT_NOT_FOUND`（`master_service.cpp:7391-7393`）→ 不进 `removed_keys` → **永不再删，孤儿被焊死**。
+
 ### 2.2.4 Upsert 流程（S4）
 
-复用 `UpsertStart / UpsertEnd / UpsertRevoke` 三 RPC（`master_service.cpp:5943/6346/6362`、`master_client.cpp:871-948`、`client_service.cpp:2288/2368-2388`），写入路径与 §2.2.1 相同。
+Upsert 使用 `UpsertStart / UpsertEnd / UpsertRevoke` 管理本次更新。Master 按现有状态机处理对象可见性，Client 通过同一 driver 写入新 value；内存与 DFS 的结果按 key 汇总，处理方式与 Put 一致。
 
-⚠️ **原地复用分支**：`bucket_allocator_` 在 KVCS/KVClient 下恒为 null（`master_service.h:2084`、`:906` 提前 return），故同尺寸 Upsert 走 `:6196-6235`——把含 DFS 的旧 COMPLETED 副本标为 PROCESSING 并**原样返回旧描述符、不重新分配**。对 KVClient 的实际影响：ReplicaID 不变，而 CacheKey 由 logical key 派生（与 ReplicaID 无关）→ 同一 CacheKey 覆盖写，符合整值替换语义。但已存在**仅 MEMORY** 的对象无法经 Upsert 补 DFS 副本（`:6146-6181` 拓扑不符），需先 Remove 再 Put。
+```mermaid
+flowchart TB
+    C1["① 请求端 Client::Upsert<br/>key、CPU slices、replica config"]
+
+    subgraph MasterStart["Master 进程：申请阶段"]
+        START["② MasterService::UpsertStart<br/>PrepareWriteStart 校验（同 Put）"]
+        BRANCH{"③ 对象是否已存在<br/>且尺寸相同？"}
+        REUSE["原地复用分支<br/>旧 COMPLETED 副本标为 PROCESSING<br/>原样返回旧描述符、不重新分配"]
+        ALLOC["分配新副本<br/>铸造新逻辑 DFS 描述符"]
+        META["记录写入 Client 与 ReplicaID<br/>副本状态为 PROCESSING"]
+
+        START --> BRANCH
+        BRANCH -->|"是（bucket_allocator_ 为 null）"| REUSE
+        BRANCH -->|"否"| ALLOC
+        REUSE --> META
+        ALLOC --> META
+    end
+
+    subgraph Request["请求端进程：数据写入与收尾"]
+        C2["④ Client 接收 PROCESSING 描述符"]
+        W["⑤ 写入 MEMORY 与 DFS<br/>路径同 §2.2.1"]
+        J{"⑥ HasExpectedReplicaAllocation<br/>&& AllAllocatedTransfersSucceeded?"}
+        END["⑦ MasterClient::UpsertEnd"]
+        REVOKE["⑦ MasterClient::UpsertRevoke"]
+
+        C2 --> W
+        W -->|"所需数据写入均成功"| J
+        J -->|"成功"| END
+        J -->|"失败"| REVOKE
+    end
+
+    subgraph MasterFinish["Master 进程：提交或撤销"]
+        COMMIT["⑧ MasterService::UpsertEnd<br/>发布 COMPLETE"]
+        ABORT["⑧ MasterService::UpsertRevoke<br/>回滚本轮更新"]
+    end
+
+    OK["⑨ 请求端返回 Upsert 成功"]
+    FAIL["⑨ 请求端返回该 key 的失败结果"]
+    TOPO["请求端返回拓扑不符<br/>仅 MEMORY 对象无法补 DFS 副本"]
+
+    C1 -->|"MasterClient RPC：UpsertStart"| START
+    BRANCH -->|"已有对象无 DFS 且请求 dfs=1"| TOPO
+    META -->|"描述符、PROCESSING"| C2
+    END --> COMMIT
+    COMMIT --> OK
+    REVOKE --> ABORT
+    ABORT --> FAIL
+```
+
+⚠️ **原地复用分支**：`bucket_allocator_` 在 KVCS/KVClient 下恒为 null（`master_service.h:2084`、`:906` 提前 return），故同尺寸 Upsert 走 `:6196-6235`——把含 DFS 的旧 COMPLETED 副本标为 PROCESSING 并**原样返回旧描述符、不重新分配**。对 KVClient 的实际影响：ReplicaID 不变，而 CacheKey 由 logical key 派生（与 ReplicaID 无关）→ 同一 CacheKey 覆盖写，符合整值替换语义。
+
+⚠️ **仅 MEMORY 的对象无法经 Upsert 补 DFS 副本**（`:6146-6181` 拓扑不符，`restore_missing_bucket_dfs` 需 bucket allocator 非空），需先 Remove 再 Put。
 
 收尾判定：`FinalizeBatchUpsert` 不走 `DetermineFinalizeDecision`，但判据是 `HasExpectedReplicaAllocation && AllAllocatedTransfersSucceeded`（`client_service.cpp:3497-3500`），与 Put 等价严格。
 
 ## 2.3 运行设计
 
+本节按阶段展开 driver 内部的时序。各阶段的判定依据与代码位置见 §3 的 shard 设计。
+
 ### 2.3.1 初始化阶段
+
+初始化在 `CreateStorageBackend` 工厂内完成 driver 创建，随后由后端 `Init()` 触发 SDK 连接与 staging region 注册。**注册是一次性的**，整个 driver 生命周期只注册一个大 region（v1 的「按次注册、按次释放」不可行，理由见 §2.3.2）。
 
 ```mermaid
 sequenceDiagram
@@ -481,6 +717,8 @@ sequenceDiagram
 - **Master 侧初始化**（`master_service.cpp:872-907` 新增分支）：置 `enable_dfs_=true`、`use_kvclient_=true`，**不**加载 EFC target、**不**建 capacity provider、**不**调 `InitKvcsDfsEviction`，然后 return。若 `enable_oplog_` 为真则 `LOG(FATAL)`（决策 6）。
 
 ### 2.3.2 写入阶段
+
+driver 从 staging arena 取得已注册内存，把调用者的多段 slices 拷入连续 slot，按对象边界切批后一次性提交 `BatchStoreAsync`，再 `Wait` 完成。成功则归还 slot，超时或取消则 quarantine（永不归还）。
 
 ```mermaid
 sequenceDiagram
@@ -556,6 +794,8 @@ sequenceDiagram
 
 ### 2.3.3 读取阶段
 
+读路径与写路径对称：driver 从 arena 取 slot 承接设备写入，`Wait` 完成后把数据 memcpy 回调用者原 buffer。明确 `NOT_FOUND` 触发 miss 清理，超时则 quarantine slot 且**不**触发清理。
+
 ```mermaid
 sequenceDiagram
     autonumber
@@ -602,6 +842,8 @@ sequenceDiagram
 **说明**：读路径多一次 memcpy（staging → 调用者 buffer），这是同步契约的代价。读回长度校验为双层：`DistributedStorageBackend` 比对 `*object_results[i] != object_requests[i].size`（`:838-841`），driver 内再校验一次。
 
 ### 2.3.4 删除阶段
+
+删除只传 key、不传 buffer，因此不涉及 staging，也没有 quarantine 风险。value 删除成功（含幂等 `NOT_FOUND`）的 key 才进入元数据删除集合；失败项两者同时保留，可安全重试。
 
 ```mermaid
 sequenceDiagram
@@ -650,6 +892,8 @@ sequenceDiagram
 
 ### 2.3.5 miss 清理阶段
 
+清理是条件性的：Client 携带本次读取**观察到**的 ReplicaID，Master 在 key 锁内核对，只有仍为当前记录时才移除。读到 R1 而目录已是 R2 时返回不匹配，R2 原样保留。
+
 ```mermaid
 sequenceDiagram
     autonumber
@@ -687,6 +931,8 @@ const bool supports_dfs_condition = replica_type == ReplicaType::DFS &&
 非条件版传 nullptr（`:6553`），DFS 必然 `INVALID_PARAMS`。不改 `:6440` 与 `:6457` 则每次 miss 清理都失败，坏记录永久残留、读取持续失败。
 
 ### 2.3.6 关闭阶段
+
+关闭必须先排空在途操作再注销 region。quarantine 的 slot 永不归还，随 region 统一注销；`InUseSlots()` 非零是泄漏信号，需显式告警。
 
 ```mermaid
 sequenceDiagram
