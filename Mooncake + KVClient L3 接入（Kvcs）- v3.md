@@ -31,7 +31,6 @@ KVClient 与 KVCS 同为「网络可寻址 KV」，但底层能力差异决定�
 
 ### 1.1.3 已裁决事项
 
-按**落地位置**排列，便于实施时按 §3 的 shard 顺序查阅。「落地位置」列首项为主要实施处，括号内为配合处。
 
 | 内容 | 落地位置 |
 | --- | --- |
@@ -58,7 +57,7 @@ KVClient 与 KVCS 同为「网络可寻址 KV」，但底层能力差异决定�
 
 ### 1.2.2 明确不支持的场景
 
-以下能力在 KVClient 后端下返回 `NOT_SUPPORTED` 或启动期拒绝，**不在本方案范围内**：
+以下能力在 KVClient 后端下返回 `NOT_SUPPORTED` 或启动期拒绝：
 
 | 场景 | 原因 | 行为 |
 | --- | --- | --- |
@@ -78,7 +77,7 @@ KVClient 与 KVCS 同为「网络可寻址 KV」，但底层能力差异决定�
 
 ### 2.1.1 逻辑模型
 
-KVClient 后端位于 Mooncake 数据面的最南端。新增的 `KvClientObjectStorageAdapter` 与既有 `KvcsObjectStorageAdapter` **平级**，同实现 `ObjectStorageAdapter` 接口，由工厂按 `fs_adapter_type` 二选一创建。**KVCS 侧代码零改动**。
+KVClient 后端位于 Mooncake 数据面的最南端。新增的 `KvClientObjectStorageAdapter` 与既有 `KvcsObjectStorageAdapter` **平级**，同实现 `ObjectStorageAdapter` 接口，由工厂按 `fs_adapter_type` 二选一创建。
 
 实线表示应用调用与存储 I/O，虚线表示元数据交互。灰色模块沿用现有职责，黄色模块需要调整，绿色模块为新增。
 
@@ -112,7 +111,7 @@ flowchart TB
         M -.->|"查询与更新"| META
     end
 
-    RAM["Mooncake 内存池<br/>L1：可位于本机或远端"]
+    RAM["Mooncake 内存池<br/>L2：可位于本机或远端"]
     S["远端 KV 存储<br/>L3：CacheKey 到 value 的定位、物理空间、内部冗余"]
 
     RPC -.->|"PutStart / PutEnd / PutRevoke<br/>GetReplicaList / Remove<br/>EvictDiskReplicaIfCurrent"| M
@@ -189,56 +188,21 @@ classDiagram
         +Init()
         +GetName()
     }
-    class KvcsObjectStorageAdapter["KvcsObjectStorageAdapter（复用，零改动）"] {
-        -driver_
-        +Init()
-        +PutBatch(requests)
-        +GetBatch(requests)
-        +DeleteBatch(keys)
-    }
+   
     class KvClientObjectStorageAdapter["KvClientObjectStorageAdapter（新增）"] {
         -kv_client_
-        -arena_
-        -config_
-        -initialized_
         +Init()
-        +Put(key, data)
         +PutV(key, iov, iovcnt)
         +PutBatch(requests)
-        +Get(key, buf, len)
         +GetBatch(requests)
-        +Exists(key)
-        +Delete(key)
         +DeleteBatch(keys)
-        +ListKeys()
-        +GetName()
-        +GetStats()
-        -EncodeKey(logical_key)
-        -SubmitAndWait(op, entries, indices, slots, results)
-        -MapEntryStatus(status)
-        -PreflightSharedProvider()
-        -Shutdown()
+        -RegisterBuffers(buffers)
+        -WaitForCompletion(task_id)
+        -ReleaseRegistrations(handles)
     }
-    class StagingArena["StagingArena（新增）"] {
-        -base_
-        -canonical_handle_
-        -slot_stride_
-        -states_
-        -free_list_
-        +Init(client, region_bytes, max_slot_bytes)
-        +Shutdown(client)
-        +Acquire(bytes)
-        +Release(slot)
-        +Quarantine(slot)
-        +InUseSlots()
-        +QuarantinedBytes()
-        +CanonicalHandle()
-    }
-    class SdkKvClient["kv::KvClient（复用，SDK 不改）"] {
+
+    class SdkKvClient["kv::KvClient"] {
         +Init(configPath)
-        +Shutdown()
-        +RegisterRegions(regions, registered)
-        +UnregisterRegions(handles)
         +BatchStoreAsync(entries, task_id)
         +BatchLoadAsync(entries, task_id)
         +DeleteAsync(keys, task_id)
@@ -251,9 +215,7 @@ classDiagram
     Client o-- DistributedStorageBackend : "共享持有"
     DistributedStorageBackend *-- DistributedStorageConfig : "保存配置"
     DistributedStorageBackend *-- ObjectStorageAdapter : "持有对象适配器"
-    ObjectStorageAdapter <|-- KvcsObjectStorageAdapter
     ObjectStorageAdapter <|-- KvClientObjectStorageAdapter
-    KvClientObjectStorageAdapter *-- StagingArena : "自持注册内存"
     KvClientObjectStorageAdapter *-- SdkKvClient : "持有 SDK 实例"
     DistributedStorageConfig ..> KvClientObjectStorageAdapter : "工厂按配置创建"
 
@@ -264,11 +226,8 @@ classDiagram
     style StagingArena fill:#e3f5e8,stroke:#28864b,color:#111827
     style DistributedStorageBackend fill:#f3f4f6,stroke:#6b7280,color:#111827
     style ObjectStorageAdapter fill:#f3f4f6,stroke:#6b7280,color:#111827
-    style KvcsObjectStorageAdapter fill:#f3f4f6,stroke:#6b7280,color:#111827
     style SdkKvClient fill:#f3f4f6,stroke:#6b7280,color:#111827
 ```
-
-继承线表示接口实现，实心菱形表示对象内持有，空心菱形表示共享持有，虚线箭头表示创建依赖。`FileStorage` 与 `Client` 使用同一份 `DistributedStorageBackend`；后端持有的对象适配器由工厂按 `fs_adapter_type` 二选一——`kvcs-lowlevel` 时取 `KvcsObjectStorageAdapter`，`kvclient` 时取 `KvClientObjectStorageAdapter`。两者**平级**，同实现 `ObjectStorageAdapter`，互不依赖。
 
 | 类或函数 | 接口与改动说明 |
 | --- | --- |
@@ -360,7 +319,7 @@ Master 查询自身对象目录，Client 根据返回的描述符调用 driver�
 | `MasterService` | 新增私有 `use_kvclient_`（与 `use_kvcs_` 平级，不合并——不支持恢复裁决要求恢复门保持 KVCS-only）。改动 6 处：`enable_dfs_` 判定（`:847`）、初始化新增分支（`:872` 前）、descriptor 铸造（`:5090`，`aligned_size = AlignUp(value_length,512)`）、`PrepareWriteStart` 门与 N 上限校验（`:5248-5249`）、`EvictDiskReplicaImpl` 白名单（`:6440`、`:6457`）。**恢复门 `:3533`、`:3825`、`:4118` 不改** |
 | `DistributedStorageConfig` | 解析 KVClient 配置，提供与 `UsesKvcs()` 平级的能力判断 |
 | `ObjectMetadata` / `Replica` | 保存 key、写入 Client、副本身份、状态和读取租约，沿用既有元数据持久化方式 |
-| `Replica::Descriptor` / `DistributedFSDescriptor` | 向 Client 返回对象长度、ReplicaID 和状态。KVClient 模式下 `file_path` 为空、`offset` 为 0、`shard_idx` 为 -1，`object_size == aligned_size == N` 且 N 为 512 的倍数 |
+| `Replica::Descriptor` / `DistributedFSDescriptor` | 向 Client 返回对象长度、ReplicaID 和状态。KVClient 模式下 `file_path` 为空、`offset` 为 0、`shard_idx` 为 -1，`object_size = N`（应用原始长度，任意值）、`aligned_size = AlignUp(N, 512)`（线格式长度） |
 
 **设计要点**：
 
@@ -392,8 +351,8 @@ flowchart TB
     C1["① 请求端 Client::Put<br/>key、CPU slices、replica config"]
 
     subgraph MasterStart["Master 进程：申请阶段"]
-        START["② MasterService::PutStart / PrepareWriteStart<br/>校验 N%512==0、N<=16776704、非三副本"]
-        ALLOC["分配 MEMORY 副本<br/>铸造逻辑 DFS 描述符<br/>object_size=aligned_size=N, shard_idx=-1"]
+        START["② MasterService::PutStart / PrepareWriteStart<br/>校验 slice_length<=16776704"]
+        ALLOC["分配 MEMORY 副本<br/>逻辑 DFS 描述符<br/>object_size=N, aligned_size=AlignUp(N,512), shard_idx=-1"]
         META["记录写入 Client、对象长度与 ReplicaID<br/>副本状态为 PROCESSING"]
 
         START --> ALLOC
@@ -512,7 +471,7 @@ flowchart TB
 
 普通 `Client::Query` 使用本地查询起始时间加 `lease_ttl_ms` 计算租约截止时间，完整对象 Get 在读取结束后检查有效期。
 
-### 2.2.3 删除流程（S3，value-first 删除裁决：value-first）
+### 2.2.3 删除流程（S3，value-first）
 
 删除顺序与 KVCS 相反：Client 先调用 KVClient 删除 value，再对删除成功的 key 请求 Master 移除对象元数据。
 
@@ -560,7 +519,7 @@ flowchart TB
 | key 枚举扫描 | ❌ | ❌ `ListKeys` → NOT_SUPPORTED |
 | 同 key 重写覆盖 | ✅ 偶然 | ✅ 偶然（唯一残存通道） |
 
-**中间态自愈**：value 已删、元数据尚在 → 读取返回 `NOT_FOUND` → `ReconcileMissingKvReplica` → `EvictDiskReplicaIfCurrent` 按 ReplicaID 条件清理。**value-first 删除裁决 依赖miss 清理裁决 同时落地**，否则中间态无人清理。
+**中间态自愈**：value 已删、元数据尚在 → 读取返回 `NOT_FOUND` → `ReconcileMissingKvReplica` → `EvictDiskReplicaIfCurrent` 按 ReplicaID 条件清理。**value-first 删除依赖 miss 清理同时落地**，否则中间态无人清理。
 
 **已知窗口**：`CheckRemovable` 以 `OBJECT_HAS_LEASE` / `REPLICA_IS_NOT_READY` / `OBJECT_HAS_REPLICATION_TASK` 拒绝时（`master_service.cpp:7401-7406`、`:7445-7463`），value 已删但元数据保留 → 一个仍在租约保护中的已发布对象变为不可读。对 KV cache 是「命中变未命中」，**不返回错数据**，语义安全；但确实丢了已成功 Put 的数据。此取舍成立的前提是 metadata-first 的孤儿为永久无界泄漏。
 
@@ -568,7 +527,7 @@ flowchart TB
 
 ### 2.2.4 Upsert 流程（S4）
 
-Upsert 使用 `UpsertStart / UpsertEnd / UpsertRevoke` 管理本次更新。Master 按现有状态机处理对象可见性，Client 通过同一 driver 写入新 value；内存与 DFS 的结果按 key 汇总，处理方式与 Put 一致。
+Upsert 使用 `UpsertStart / UpsertEnd / UpsertRevoke` 管理本次更新。Master 按现有状态机处理对象可见性，Client 通过同一适配器写入新 value；内存与 DFS 的结果按 key 汇总，处理方式与 Put 一致。
 
 ```mermaid
 flowchart TB
@@ -627,11 +586,11 @@ flowchart TB
 
 ## 2.3 运行设计
 
-本节按阶段展开 driver 内部的时序。各阶段的判定依据与代码位置见 §3 的 shard 设计。
+本节按阶段展开适配器内部的时序。各阶段的判定依据与代码位置见 §3 的 shard 设计。
 
 ### 2.3.1 初始化阶段
 
-初始化在 `CreateStorageBackend` 工厂内完成 driver 创建，随后由后端 `Init()` 触发 SDK 连接与 staging region 注册。**注册是一次性的**，整个 driver 生命周期只注册一个大 region（v1 的「按次注册、按次释放」不可行，理由见 §2.3.2）。
+初始化在 `CreateStorageBackend` 工厂内创建适配器，随后由后端 `Init()` 触发 SDK 连接与 staging region 注册。**注册是一次性的**，整个适配器生命周期只注册一个大 region（v1 的「按次注册、按次释放」不可行，理由见 §2.3.2）。
 
 ```mermaid
 sequenceDiagram
@@ -666,21 +625,20 @@ sequenceDiagram
 
 **说明**：
 
-- **一次性注册，非按次注册**。v1 的「按次注册、按次释放」不可行（§2.3.2）。整个 driver 生命周期只注册一个大 region，所有 I/O 从中做 512B 对齐变长子分配。
+- **一次性注册，非按次注册**。v1 的「按次注册、按次释放」不可行（§2.3.2）。整个适配器生命周期只注册一个大 region，所有 I/O 从中做 512B 对齐变长子分配。
 - **`PreflightSharedProvider` 是硬门禁**。默认 `INDEPENDENT` 模式下 SDK 为每个 ASU 节点新建 provider 并 `BindMemory` 全部已注册区域（`kv_client_impl.cc:687-702`、`:719-731`），而 AICPU provider 的 `BindMemory` **只接受 `MEM_DEVICE`**（`aicpu_trans_provider.cc:1691-1699`）→ 非空 view 下注册必然 `PARTIAL_FAILED`。故要求 `sharedProviderMode=SHARED`，缺省或为 0 直接返回 `DFS_SERVICE_UNAVAILABLE`。（AIV provider 无此限制，`aiv_trans_provider.h:80-90` 透传 memoryType；按 provider 类型放宽门禁可作后续优化。）
 - **Master 侧初始化**（`master_service.cpp:872-907` 新增分支）：置 `enable_dfs_=true`、`use_kvclient_=true`，**不**加载 EFC target、**不**建 capacity provider、**不**调 `InitKvcsDfsEviction`，然后 return。若 `enable_oplog_` 为真则 `LOG(FATAL)`（不支持恢复裁决）。
 
 ### 2.3.2 写入阶段
 
-driver 从 staging arena 取得已注册内存，把调用者的多段 slices 拷入连续 slot，按对象边界切批后一次性提交 `BatchStoreAsync`，再 `Wait` 完成。成功则归还 slot，超时或取消则 quarantine（永不归还）。
+适配器从 staging arena 取得已注册内存，把调用者的多段 slices 拷入连续 slot（尾部补零到 `aligned_size`），按对象边界切批后一次性提交 `BatchStoreAsync`，再 `Wait` 完成。成功则归还 slot，超时或取消则 quarantine（永不归还）。
 
 ```mermaid
 sequenceDiagram
     autonumber
     participant C as Client
     participant BE as DistributedStorageBackend
-    participant AD as KvcsObjectStorageAdapter
-    participant DR as KvClientDriver
+    participant AD as KvClientObjectStorageAdapter
     participant AR as StagingArena
     participant SDK as kv::KvClient
     participant S as 远端存储
@@ -688,42 +646,39 @@ sequenceDiagram
     C->>BE: BatchWrite(key + descriptor + slices)
     BE->>BE: 校验 total_size == desc.object_size<br/>每 slice 转 iovec（不合并）
     BE->>AD: PutBatch(ObjectPutRequest{key, iov, iovcnt})
-    AD->>DR: driver_->EncodeKey(logical_key)
-    AD->>AD: 逐请求校验 iov 非空、size<=MaxValueSize()<br/>同批重复 logical_key 拒绝
-    AD->>DR: BatchPut(span<KvcsIoRequest>)
     loop 每个请求
-        DR->>DR: 校验 size%512==0 && size<=16776704
-        DR->>AR: Acquire(size)
+        AD->>AD: EncodeKey(logical_key) → CacheKey<br/>校验 iov 非空、同批重复 key 拒绝
+        AD->>AD: n = Σiov_len；wire_len = AlignUp(n,512)<br/>校验 wire_len <= 16776704
+        AD->>AR: Acquire(wire_len)
         alt arena 耗尽
-            AR-->>DR: NO_AVAILABLE_HANDLE
-            DR->>DR: results[i] = 错误（不阻塞等待）
+            AR-->>AD: NO_AVAILABLE_HANDLE
+            AD->>AD: results[i] = 错误（不阻塞等待）
         else 成功
-            AR-->>DR: Slot{ptr, size, index}
-            DR->>DR: memcpy(slices → slot.ptr)
+            AR-->>AD: Slot{ptr, wire_len, index}
+            AD->>AD: memcpy(iov → slot.ptr)<br/>memset 尾部 [n, wire_len) 补零
         end
     end
-    DR->>DR: 按 110 切批（不切开单个对象）<br/>记录 originalIndices
-    DR->>SDK: BatchStoreAsync(entries, taskId)
+    AD->>AD: 按 110 切批（不切开单个对象）<br/>记录 originalIndices
+    AD->>SDK: BatchStoreAsync(entries, taskId)
     SDK->>SDK: 按 nodeId 路由拆分 transport task
-    SDK->>S: Host RDMA write
-    SDK-->>DR: 提交结果
+    SDK->>S: Host RDMA write（entry.length = wire_len）
+    SDK-->>AD: 提交结果
     alt 提交失败
-        DR->>AR: Release(全部 slot)
-        DR-->>AD: 逐项错误
+        AD->>AR: Release(全部 slot)
+        AD-->>BE: 逐项错误
     else 已受理
-        DR->>SDK: Wait(taskId, timeoutMs, result)
+        AD->>SDK: Wait(taskId, timeoutMs, result)
         alt Wait 返回 OK
-            SDK-->>DR: TaskResult{status, entryStatus[]}
-            DR->>DR: 逐项映射 entryStatus → ErrorCode
-            DR->>AR: Release(全部 slot)
+            SDK-->>AD: TaskResult{status, entryStatus[]}
+            AD->>AD: 逐项映射 entryStatus → ErrorCode
+            AD->>AR: Release(全部 slot)
         else Wait 超时 / CANCELED
-            Note over DR,AR: ⚠️ 禁止读 entryStatus（初值 OK，假成功）
-            DR->>AR: Quarantine(全部 slot)<br/>永不归还、永不注销
-            DR->>DR: 逐项置 RPC_TIMEOUT / INTERNAL_ERROR
+            Note over AD,AR: ⚠️ 禁止读 entryStatus（初值 OK，假成功）
+            AD->>AR: Quarantine(全部 slot)<br/>永不归还、永不注销
+            AD->>AD: 逐项置 RPC_TIMEOUT / INTERNAL_ERROR
         end
-        DR-->>AD: KvcsIoResults
+        AD-->>BE: 逐项 expected
     end
-    AD-->>BE: 逐项 expected
     BE-->>C: results[index]
     C->>C: AllAllocatedTransfersSucceeded?<br/>→ PutEnd(ALL) 或 PutRevoke(ALL)
 ```
@@ -755,45 +710,44 @@ sequenceDiagram
     autonumber
     participant C as Client
     participant BE as DistributedStorageBackend
-    participant AD as KvcsObjectStorageAdapter
-    participant DR as KvClientDriver
+    participant AD as KvClientObjectStorageAdapter
     participant AR as StagingArena
     participant SDK as kv::KvClient
     participant S as 远端存储
 
     C->>C: GetReplicaList → descriptor + lease
     C->>BE: BatchRead(key + descriptor + slices)
-    BE->>BE: 校验 slice 容量 >= object_size<br/>size = desc.object_size
-    BE->>AD: GetBatch(ObjectGetRequest{key, buffer, size})
-    AD->>DR: EncodeKey + BatchGet(span<KvcsIoRequest>)
+    BE->>BE: 校验 slice 容量 >= object_size<br/>size = desc.object_size = N
+    BE->>AD: GetBatch(ObjectGetRequest{key, buffer, N})
     loop 每个请求
-        DR->>AR: Acquire(size)
-        AR-->>DR: Slot
+        AD->>AD: EncodeKey(logical_key) → CacheKey<br/>wire_len = AlignUp(N,512)
+        AD->>AR: Acquire(wire_len)
+        AR-->>AD: Slot{ptr, wire_len}
     end
-    DR->>SDK: BatchLoadAsync(entries, taskId)
+    AD->>SDK: BatchLoadAsync(entries, taskId)<br/>entry.length = wire_len
     SDK->>S: Host RDMA read
-    DR->>SDK: Wait(taskId, timeoutMs, result)
+    AD->>SDK: Wait(taskId, timeoutMs, result)
     alt 成功
-        SDK-->>DR: entryStatus[] 全 OK
-        DR->>DR: memcpy(slot.ptr → 调用者 buffer)
-        DR->>AR: Release(slot)
-        DR-->>AD: OK
-        AD-->>BE: expected<size_t>(size)
-        BE->>BE: 校验 *result == request.size<br/>（双层：BE :838-841 + driver）
+        SDK-->>AD: entryStatus[] 全 OK
+        AD->>AD: memcpy(slot.ptr → 调用者 buffer, **仅前 N 字节**)<br/>尾部 padding 丢弃
+        AD->>AR: Release(slot)
+        AD-->>BE: expected<size_t>(**N**)
+        BE->>BE: 校验 *result == request.size(=N)<br/>（双层：BE :838-841 + 适配器）
     else 明确 NOT_FOUND
-        DR->>AR: Release(slot)
-        DR-->>AD: OBJECT_NOT_FOUND
-        AD-->>C: 逐 key 错误
+        AD->>AR: Release(slot)
+        AD-->>C: 逐 key OBJECT_NOT_FOUND
         C->>C: ReconcileMissingKvReplica(key, ReplicaID)
     else 超时 / CANCELED
-        Note over DR,AR: ⚠️ 禁止读 entryStatus
-        DR->>AR: Quarantine(slot)
-        DR-->>AD: RPC_TIMEOUT / INTERNAL_ERROR
+        Note over AD,AR: ⚠️ 禁止读 entryStatus
+        AD->>AR: Quarantine(slot)
+        AD-->>C: RPC_TIMEOUT / INTERNAL_ERROR
         Note over C: 元数据保留，不触发清理
     end
 ```
 
-**说明**：读路径多一次 memcpy（staging → 调用者 buffer），这是同步契约的代价。读回长度校验为双层：`DistributedStorageBackend` 比对 `*object_results[i] != object_requests[i].size`（`:838-841`），driver 内再校验一次。
+**说明**：读路径多一次 memcpy（staging → 调用者 buffer），这是同步契约的代价。slot 按 `aligned_size`（= `AlignUp(N,512)`）分配以容纳设备写入，但只把前 N 字节交还调用者，且 `GetBatch` 返回 **N**——因为 `DistributedStorageBackend` 比对的是 `request.size`，而它取 `desc.object_size` = N（`:817-818`）；返回 `wire_len` 会让每次读取都误报 `FILE_READ_FAIL`（`:838-841`）。
+
+⚠️ **slot 必须按 `aligned_size` 而非 N 分配**，否则设备按 `entry.length = wire_len` 写入会越过 slot 边界，踩坏相邻 slot 的数据。
 
 ### 2.3.4 删除阶段
 
@@ -805,22 +759,22 @@ sequenceDiagram
     participant APP as 应用
     participant C as Client
     participant BE as DistributedStorageBackend
-    participant DR as KvClientDriver
+    participant AD as KvClientObjectStorageAdapter
     participant SDK as kv::KvClient
     participant MC as MasterClient
     participant M as MasterService
 
     APP->>C: BatchRemove(keys, force)
     C->>BE: BatchDeleteObjects(全部 keys)
-    BE->>DR: BatchDelete(logical_keys)
-    DR->>DR: EncodeKey → CacheKey[]
-    DR->>SDK: DeleteAsync(keys, taskId)
-    DR->>SDK: Wait(taskId, timeoutMs, result)
+    BE->>AD: DeleteBatch(logical_keys)
+    AD->>AD: EncodeKey → CacheKey[]
+    AD->>SDK: DeleteAsync(keys, taskId)
+    AD->>SDK: Wait(taskId, timeoutMs, result)
     alt 成功或 NOT_FOUND（幂等）
-        SDK-->>DR: entryStatus OK / ENTRY_KEY_NOT_EXIST
-        DR-->>C: 逐项 OK
+        SDK-->>AD: entryStatus OK / ENTRY_KEY_NOT_EXIST
+        AD-->>C: 逐项 OK
     else 超时 / 失败
-        DR-->>C: 逐项错误
+        AD-->>C: 逐项错误
         Note over C: 该 key 不进元数据删除集合<br/>value 与元数据均保留 → 无孤儿
     end
     C->>C: 选出删除成功项 metadata_keys
@@ -891,23 +845,23 @@ const bool supports_dfs_condition = replica_type == ReplicaType::DFS &&
 ```mermaid
 sequenceDiagram
     autonumber
-    participant DR as KvClientDriver
+    participant AD as KvClientObjectStorageAdapter
     participant AR as StagingArena
     participant SDK as kv::KvClient
 
-    Note over DR: 析构 / Shutdown
-    DR->>DR: 停止接受新提交
-    DR->>SDK: Drain / 等待 in-flight task 结束
-    DR->>AR: InUseSlots() == 0 ?
+    Note over AD: 析构 / Shutdown
+    AD->>AD: 停止接受新提交
+    AD->>SDK: Drain / 等待 in-flight task 结束
+    AD->>AR: InUseSlots() == 0 ?
     alt 仍有占用
-        AR-->>DR: 非零
-        DR->>DR: LOG(ERROR) 泄漏告警<br/>列出 quarantined 字节数
+        AR-->>AD: 非零
+        AD->>AD: LOG(ERROR) 泄漏告警<br/>列出 quarantined 字节数
     else 已排空
-        AR-->>DR: 0
+        AR-->>AD: 0
     end
-    DR->>AR: Shutdown()
+    AD->>AR: Shutdown()
     AR->>SDK: UnregisterRegions(canonical handle)
-    DR->>SDK: Shutdown()
+    AD->>SDK: Shutdown()
 ```
 
 **说明**：不显式逐个 `UnregisterRegions`；quarantine 的 slot 永不归还，`Shutdown` 时统一随 region 注销。`QuarantinedBytes()` 非零是**内存泄漏指标**，需在关闭日志中显式输出。
@@ -917,16 +871,16 @@ sequenceDiagram
 | 用例编号 | 故障模式 | 是否涉及 | 故障影响 | 容错措施 | 故障注入方法 | 备注 |
 | --- | --- | --- | --- | --- | --- | --- |
 | SFMEA-01 | logical key XXH64 碰撞：两个不同 key 映射到同一 CacheKey | 是 | **静默数据损坏**：后写覆盖先写，读到错 value，无校验可发现 | 无（key 碰撞裁决：默许碰撞、不做 fingerprint） | 构造两个 XXH64 相同的 key（或临时把 seed 空间缩到 8-bit 强制碰撞） | 概率 ≈ n²/2^65：10^7 key → 2.7e-6；10^8 → 2.7e-4；10^9 → 2.7%。须在部署文档写明 key 数量级上限 |
-| SFMEA-02 | logical key 为空 | 是 | 无法编码 | driver 入口返回 `INVALID_PARAMS` | 传空 key | 与 `IsKvcsKeyStringSafe` 一致 |
-| SFMEA-03 | 同批重复 logical key | 是 | 同 CacheKey 在一个 task 内冲突，SDK 行为未定义 | 适配器写侧直接拒绝（`kvcs_object_storage_adapter.cpp:144-147` 既有）；读/查/删去重后 fan-out | 同批传两个相同 key | 写侧拒绝是既有行为，不改 |
+| SFMEA-02 | logical key 为空 | 是 | 无法编码 | 适配器 `EncodeKey` 入口返回 `INVALID_PARAMS` | 传空 key | hash 编码不受长度限制，只需拒空（KVCS 的 `IsKvcsKeyStringSafe` 还要限长，此处不需要） |
+| SFMEA-03 | 同批重复 logical key | 是 | 同 CacheKey 在一个 task 内冲突，SDK 行为未定义 | 适配器写侧直接拒绝；读/查/删去重后 fan-out | 同批传两个相同 key | 需在新适配器内自行实现（KVCS 的同名逻辑在 `kvcs_object_storage_adapter.cpp:144-147`，可参照但不共享代码） |
 | SFMEA-04 | 适配器未按 `AlignUp(N,512)` 补零，直接把 N 当作 `entry.length` 提交 | 是 | SDK 协议层 length 须 512 对齐，提交被拒或行为未定义 | 适配器内 `wire_len = AlignUp(n, 512)`，`Acquire(wire_len)`，尾部 `[n, wire_len)` 显式 `memset` 补零 | Put 一个 513 字节对象，断言提交的 `entry.length == 1024` 且 slot 尾部 511 字节全为 0 | N 本身非 512 倍数是**合法输入**，不是故障；故障在于补零遗漏。补零同时防止 slot 复用时把上一次 I/O 的残留数据发到存储侧 |
-| SFMEA-05 | N > 16,776,704 | 是 | 超 24-bit length 上限，`PackSqe` 本地拒绝；但预发送失败会 **abort 整个 transport task**，把所有 entryStatus 置 CANCELED（`trans_task_executor.cc:227-232`） | driver `MaxValueSize()` 返回 16776704，适配器逐请求预检（`:133`、`:197` 既有） | Put 一个 16,777,216 字节对象 | 不能指望「只失败超限那一条」，必须逐 entry 预检 |
-| SFMEA-06 | N == 0 | 是 | SDK 不接受空 value | 适配器既有校验 `size == 0 → INVALID_PARAMS`（`:140`、`:196`） | Put 空对象 | 既有行为 |
+| SFMEA-05 | N > 16,776,704 | 是 | 超 24-bit length 上限，`PackSqe` 本地拒绝；但预发送失败会 **abort 整个 transport task**，把所有 entryStatus 置 CANCELED（`trans_task_executor.cc:227-232`） | 适配器逐请求预检 `wire_len <= kKvClientMaxValueBytes`；Master 侧 `PrepareWriteStart` 另有第一道校验 | Put 一个 16,777,216 字节对象 | 不能指望「只失败超限那一条」，必须逐 entry 预检。Master 那道必需，因为 `kMaxSliceSize`（16,777,200）更宽且只在 CACHELIB 下生效 |
+| SFMEA-06 | N == 0 | 是 | SDK 不接受空 value | 适配器校验 `n == 0 → INVALID_PARAMS` | Put 空对象 | 后端 `BatchWrite` 也有 `desc.object_size == 0` 校验（`distributed_storage_backend.cpp:675-678`），双重保障 |
 | SFMEA-07 | `sharedProviderMode != SHARED` | 是 | INDEPENDENT 模式下 SDK 为每个 ASU 节点新建 provider 并 `BindMemory` 全部已注册区域（`kv_client_impl.cc:687-702`、`:719-731`），AICPU 的 `BindMemory` 只接受 `MEM_DEVICE`（`aicpu_trans_provider.cc:1691-1699`）→ **非空 view 下注册必然 PARTIAL_FAILED** | `Init()` 中 `PreflightSharedProvider` 硬门禁，缺省或为 0 直接 `DFS_SERVICE_UNAVAILABLE` | 配置文件设 `sharedProviderMode=0` 后 Init | 部署硬门禁，必须在 Init 阶段失败而非运行期 |
 | SFMEA-08 | `RegisterRegions` 失败 | 是 | 无 staging 内存，所有 I/O 不可用 | `Init()` 失败 → 后端初始化失败 → `FileStorage::Init` 明确失败 | fake SDK 让 RegisterRegions 返回 PARTIAL_FAILED | 部分成功时 SDK 已自行回滚（`kv_client_impl.cc:359-373`） |
 | SFMEA-09 | Staging arena 耗尽 | 是 | 新 I/O 无法分配 slot | 逐项返回 `NO_AVAILABLE_HANDLE`，**不阻塞等待**；计入 metric | 把 arena 配到 1 slot 后并发 2 个请求 | 不可 fail-silent：读路径静默失败会永久不可诊断 |
 | SFMEA-10 | 提交时 `buffer.handle` 非 canonical | 是 | 非 0 但未注册的 handle 在提交阶段**不报错**，要到 Wait 才以 `BUFFER_NOT_REGISTERED` 暴露且**连坐整 task** | 提交前预检 handle **精确等于** canonical handle（不是 `!= kInvalidMRHandle`） | 手工篡改 entry 的 handle | 预检必须精确相等 |
-| SFMEA-11 | `mrKey` 被调用方填入 | 否 | 无影响 | `SubmitAsync` 无条件重置并按 `buffer.handle` 回填（`kv_client_impl.cc:452-458`） | — | driver 侧一律留 `std::nullopt` |
+| SFMEA-11 | `mrKey` 被调用方填入 | 否 | 无影响 | `SubmitAsync` 无条件重置并按 `buffer.handle` 回填（`kv_client_impl.cc:452-458`） | — | 适配器侧一律留 `std::nullopt` |
 | SFMEA-12 | `Wait` 超时，设备仍在访问 staging | 是 | 若归还 slot 并被复用 → 设备写入他人数据 = **数据损坏** | slot **quarantine**：永不归还、永不注销，直到排空；`Wait` 超时后不再触碰该 slot | fake SDK 让 Wait 返回 TIMEOUT 但保持 task in-flight | **承重组件，不可裁剪**。SDK 无取消能力（`Cancel` 无生产调用者） |
 | SFMEA-13 | 超时后读 `entryStatus` | 是 | 初值是 `Status::OK()`（`kv_client_impl.cc:460`、`:514`），`BuildResult` 在 `!Done()` 时原样返回（`task_manager.cc:354-357`）→ **假成功**，数据未落盘却报成功 | 代码层禁止：`Wait` 非 OK 时**不读** `entryStatus`，直接逐项置错误 | fake SDK 让 Wait 超时且 entryStatus 保持初值 | 必须有专门用例覆盖，否则极易回归 |
 | SFMEA-14 | task 级 `PARTIAL_FAILED`，逐项 entryStatus 部分失败 | 是 | 部分 key 成功部分失败 | 逐项映射 entryStatus → ErrorCode，按 `originalIndices` 回填原下标 | fake SDK 让第 2 项返回 ENTRY_NO_RETRY_ADVISED | `entryStatus` 与输入严格一一对应 |
@@ -935,19 +889,19 @@ sequenceDiagram
 | SFMEA-17 | `CQE_OUT_OF_CREATE_SIZE`（设备侧空间不足） | 是 | 该 key 写入失败 | 映射为 `NO_AVAILABLE_HANDLE`；两副本硬逻辑裁决下触发 `PutRevoke(ALL)`，整个 Put 失败 | fake SDK 返回该 CQE 码 | 无容量查询接口 → 无法预判，只能事后失败 |
 | SFMEA-18 | `CQE_KEY_NOT_EXIST` / `ENTRY_KEY_NOT_FOUND`（读时） | 是 | 对象在存储侧不存在 | 映射为 `OBJECT_NOT_FOUND` → 触发 `ReconcileMissingKvReplica` 条件清理 | fake SDK 返回该码 | 必须与超时严格区分：超时**不**触发清理 |
 | SFMEA-19 | 连接失败 / `CONNECTION_ERROR` | 是 | I/O 失败 | 映射为 `DFS_SERVICE_UNAVAILABLE`；元数据保留 | 断开存储网络 | 与 KVCS `CallError` 映射对齐（`kvcs_capi_driver.cpp:77-100`） |
-| SFMEA-20 | 删除阶段：value 删除成功但 Master `BatchRemove` 失败 | 是 | value 已失、元数据保留 → 已发布对象不可读 | 后续读取返回 `NOT_FOUND` → miss 自愈清理 DFS 记录（miss 清理裁决） | fake MasterClient 让 BatchRemove 返回 RPC_FAIL | value-first 删除裁决 依赖miss 清理裁决，二者必须同时落地 |
+| SFMEA-20 | 删除阶段：value 删除成功但 Master `BatchRemove` 失败 | 是 | value 已失、元数据保留 → 已发布对象不可读 | 后续读取返回 `NOT_FOUND` → miss 自愈清理 DFS 记录 | fake MasterClient 让 BatchRemove 返回 RPC_FAIL | value-first 删除依赖 miss 清理自愈，二者必须同时落地 |
 | SFMEA-21 | 删除阶段：`CheckRemovable` 拒绝（lease / 未就绪 / 复制任务） | 是 | 同 SFMEA-20，但**无自愈**——对象仍受租约保护，元数据不会被判为失效 | 返回该 key 错误；元数据保留；靠后续读取 miss 自愈 | 对处于 lease 中的对象调 Remove | 已知窗口。语义安全（不返回错数据），但丢已成功 Put 的数据 |
 | SFMEA-22 | 删除阶段：value 删除失败（超时 / 不可达） | 是 | value 与元数据**同时保留** | 该 key 不进元数据删除集合 → **无孤儿**；返回错误供上层重试 | fake SDK 让 DeleteAsync 超时 | value-first 的核心收益：失败态可安全重试 |
 | SFMEA-23 | 迟到 Delete 误删新 value（同 key 重写） | 是 | 旧删除请求命中新写入的 value | 无专门机制。XXH64 下新旧 value 同 CacheKey | 并发 Remove + Put 同 key | 调用方须串行组织同 key 的删除/重建/更新（v1 §1.2 约定保留） |
 | SFMEA-24 | 删除后 Client 崩溃（value 已删、元数据未删） | 是 | 同 SFMEA-20 | 重启后由读取 miss 自愈 | 在两阶段之间 kill 进程 | 无 pending-delete 持久化队列，依赖自愈 |
-| SFMEA-25 | `RemoveAll` / `RemoveByRegex` 被调用 | 是 | 若只删元数据不删 value → **一次性泄漏整个 L3** | 门控放宽到 KVClient，返回 `NOT_SUPPORTED` 且**不删元数据** | 直接调用两个 API | `client_service.cpp:3843`、`:3864`，value-first 删除裁决 连带必改项 |
+| SFMEA-25 | `RemoveAll` / `RemoveByRegex` 被调用 | 是 | 若只删元数据不删 value → **一次性泄漏整个 L3** | 门控放宽到 KVClient，返回 `NOT_SUPPORTED` 且**不删元数据** | 直接调用两个 API | `client_service.cpp:3843`、`:3864`，value-first 删除的连带必改项 |
 | SFMEA-26 | Master 重启（默认无 HA） | 是 | 对象目录全丢；L3 value 仍在但**不可发现**（无枚举能力）→ 等同丢失且永久占用空间 | 无恢复能力（不支持恢复裁决）。运维需知晓；残留由存储侧或人工处理 | 重启 Master 进程 | 默认 `enable_ha=false`、`enable_oplog=false` |
 | SFMEA-27 | 误配 `enable_oplog=true` | 是 | 恢复门 3825 会在 HA 切换时返回 `DFS_SERVICE_UNAVAILABLE`（响亮失败，非静默丢数据） | `InitDfsAllocatorFromEnvironment` 启动期 `LOG(FATAL)`，把失败点提前到启动时 | 配置 `enable_oplog=true` 启动 Master | 恢复门 3533/3825/4118 保持 `use_kvcs_` only，**不改** |
 | SFMEA-28 | 三副本 `memory + nof + ASU` | 是 | `dfs > 0` 时 `FLEXIBLE_DUAL_REPLICA` 不可达（`replica.h:315-318`）→ 静默落入 RELIABLE，**nof 变为必需**，nof 抖动导致整 Put 失败 | `PrepareWriteStart` 显式拒绝 `INVALID_PARAMS` | 配置三副本后 Put | 有意与 KVCS 不对称，把运行期惊喜变成启动期可发现约束 |
 | SFMEA-29 | `PutEnd` 响应未知 | 是 | 数据已落 L3，但发布状态不明 | Client 返回提交错误；后续经查询或符合条件的重复提交确认（既有行为） | fake MasterClient 让 PutEnd 超时 | 沿用 Mooncake 现有语义，不新增机制 |
 | SFMEA-30 | miss 清理 CAS 不匹配（读到 R1，目录已是 R2） | 是 | 无 | `EvictDiskReplicaIfCurrent` 返回 false，R2 原样保留（`master_service.cpp:6463-6473`） | 构造 R1→R2 替换后发 R1 的清理请求 | 既有 CAS 语义，仅需放宽白名单 |
-| SFMEA-31 | 存储侧空间满，无水位淘汰 | 是 | 写入持续失败，无自动回收 | `GetMountpointStats()` 返回 `NOT_SUPPORTED` → Master 既有降级（`:883-889`）仅 WARNING、禁用淘汰；写入按 SFMEA-17 失败 | 填满存储 | 容量管理留待 SDK 提供接口 |
-| SFMEA-32 | `Shutdown` 时仍有 in-flight task | 是 | 注销 region 会导致设备访问已注销内存 | 先 `Drain` 排空，再断言 `InUseSlots()==0`，非零则 `LOG(ERROR)` 泄漏告警并输出 `QuarantinedBytes()` | 在 I/O 进行中析构 driver | quarantine 的 slot 永不归还，关闭时随 region 统一注销 |
+| SFMEA-31 | 存储侧空间满，无水位淘汰 | 是 | 写入持续失败，无自动回收 | Master 的 KVClient 初始化分支**根本不建** capacity provider（对照 KVCS 的 `:872-907`），`RunKvcsDfsEviction` 因 `dfs_kvcs_capacity_provider_` 为 null 直接返回（`:7999-8004`），水位淘汰不启用；写入按 SFMEA-17 失败 | 填满存储 | 容量管理留待 SDK 提供接口 |
+| SFMEA-32 | `Shutdown` 时仍有 in-flight task | 是 | 注销 region 会导致设备访问已注销内存 | 先 `Drain` 排空，再断言 `InUseSlots()==0`，非零则 `LOG(ERROR)` 泄漏告警并输出 `QuarantinedBytes()` | 在 I/O 进行中析构适配器 | quarantine 的 slot 永不归还，关闭时随 region 统一注销 |
 | SFMEA-33 | 读回长度 != `object_size` | 是 | 数据不完整 | 双层校验：适配器内 + `DistributedStorageBackend:838-841`，返回 `FILE_READ_FAIL` | fake SDK 返回短读 | ⚠️ 适配器 `GetBatch` 必须返回 **N**（= `object_size`）而非 `aligned_size`：后端比对的是 `request.size`（取 `desc.object_size`），返回 `wire_len` 会让每次读取都误报 `FILE_READ_FAIL` |
 | SFMEA-34 | 范围读请求 | 是 | `BatchRead` 对象分支忽略 `range_read`/`value_offset`，slice 容量 < object_size → `INVALID_PARAMS`（`:802-818`） | 不支持。上层需回退整对象读后截取 | 发一个窗口小于 object_size 的范围读 | RealClient 的 DFS 范围读只分配窗口大小 staging（`real_client.cpp:7610-7617`），故 KVCS 下今天也会失败 |
 | SFMEA-35 | 租约到期 | 是 | 读取结果可能已失效 | `IsLeaseExpired` 检查后返回 `LEASE_EXPIRED`（既有） | 把 `lease_ttl_ms` 配到极小 | 沿用 Mooncake 现有语义 |
@@ -987,9 +941,9 @@ sequenceDiagram
 
 | 指标 | 类型 | 说明 |
 | --- | --- | --- |
-| `kvclient_driver_ops_total{op,result}` | counter | op ∈ {put,get,delete,query}，result ∈ {ok,error,timeout,canceled} |
-| `kvclient_driver_bytes_total{op}` | counter | 提交字节数 |
-| `kvclient_driver_latency_us{op,phase}` | histogram | phase ∈ {encode,acquire,memcpy,submit,wait,release} |
+| `kvclient_adapter_ops_total{op,result}` | counter | op ∈ {put,get,delete,query}，result ∈ {ok,error,timeout,canceled} |
+| `kvclient_adapter_bytes_total{op,direction}` | counter | direction ∈ {payload,padded}，分别统计 N 与 `aligned_size` 字节数，二者差值即补零开销 |
+| `kvclient_adapter_latency_us{op,phase}` | histogram | phase ∈ {encode,acquire,memcpy,pad,submit,wait,release} |
 | `kvclient_staging_slots_in_use` | gauge | 当前占用 slot 数 |
 | `kvclient_staging_quarantined_bytes` | gauge | **泄漏指标**：单调不减，非零即有未排空的超时 slot |
 | `kvclient_staging_exhausted_total` | counter | arena 耗尽次数 |
@@ -997,27 +951,32 @@ sequenceDiagram
 
 `kvclient_staging_quarantined_bytes` 持续增长是**内存泄漏的确定信号**，应配告警。
 
+`kvclient_adapter_bytes_total` 拆 payload / padded 两个方向是为了直接观测补零放大率：小对象（N 远小于 512）的放大最严重，N=1 时 padded 是 512，放大 512 倍。这是评估「是否值得让上层聚合小对象」的数据来源。
+
 ### 2.5.4 定位手册
 
 | 症状 | 排查路径 |
 | --- | --- |
 | Init 失败 `DFS_SERVICE_UNAVAILABLE` | 查 `sharedProviderMode` 是否为 SHARED（SFMEA-07）；查 view service 可达性 |
 | Init 失败 `PARTIAL_FAILED` | 查 `RegisterRegions` 日志；AICPU provider 下确认 SHARED 模式 |
-| Put 全部失败但 SDK 日志无异常 | 查是否读了超时后的 `entryStatus`（SFMEA-13）；查 `kvclient_driver_ops_total{result="timeout"}` |
+| Put 全部失败但 SDK 日志无异常 | 查是否读了超时后的 `entryStatus`（SFMEA-13）；查 `kvclient_adapter_ops_total{result="timeout"}` |
 | 读到错误数据，无报错 | **优先怀疑 key 碰撞**（SFMEA-01）：grep VLOG(2) 日志，比对两个 logical_key 是否得到同一 `cache_key` |
+| 读取恒返回 `FILE_READ_FAIL`，但数据其实写对了 | 查 `GetBatch` 是否误返回 `aligned_size` 而非 N（§3.5）——后端比对的是 `desc.object_size` |
+| 读到的对象尾部有脏数据 | 查写路径是否漏了 `memset` 补零，或读路径 memcpy 是否误用了 `wire_len` 而非 N |
 | 内存持续增长不释放 | 查 `kvclient_staging_quarantined_bytes`；非零说明有超时 slot 未排空（SFMEA-12） |
 | Remove 返回成功但存储侧仍有 value | 不可能——value-first 下成功即已删。若出现，查是否走了 `RemoveAll`/`RemoveByRegex`（SFMEA-25） |
 | Remove 返回错误且对象变为不可读 | 已知窗口（SFMEA-21）：value 已删但 `CheckRemovable` 拒绝。等待后续读取触发 miss 自愈 |
 | Get 持续 `OBJECT_NOT_FOUND` 但目录有记录 | 查 `EvictDiskReplicaIfCurrent` 是否返回 `INVALID_PARAMS`——说明 `use_kvclient_` 白名单漏改（§3.6） |
-| 对象大于 4 MiB 写入失败 | 查 `MaxValueSize()` 是否被误配；KVClient 上限是 16,776,704 而非 KVCS 的 4 MiB |
+| 对象大于 4 MiB 写入失败 | 查 `kKvClientMaxValueBytes` 是否被误配；KVClient 上限是 16,776,704 而非 KVCS 的 4 MiB |
+| N 在 16,776,705 ~ 16,777,200 之间的对象写入失败 | 预期行为。该区间能通过 Mooncake 的 `kMaxSliceSize` 但超 SDK 线格式上限，由 `PrepareWriteStart` 拒绝（§3.6） |
 | Master 重启后 L3 全部读不到 | 预期行为（不支持恢复裁决，SFMEA-26）。目录不可恢复，value 不可枚举 |
 
 ### 2.5.5 诊断辅助接口
 
-driver 暴露只读诊断方法（不进 `KvcsDriver` 接口，通过 `dynamic_cast` 或独立头文件提供）：
+适配器暴露只读诊断方法（不在 `ObjectStorageAdapter` 接口上，通过独立头文件提供，运维工具 `dynamic_cast` 获取）：
 
 ```cpp
-struct KvClientDriverStats {
+struct KvClientAdapterStats {
     size_t slots_total;
     size_t slots_in_use;
     size_t slots_quarantined;
@@ -1025,11 +984,12 @@ struct KvClientDriverStats {
     uint64_t submits_total;
     uint64_t timeouts_total;
     uint64_t canceled_total;
+    uint64_t padded_bytes_total;   // 累计补零字节数
 };
-KvClientDriverStats KvClientDriver::GetStats() const;
+KvClientAdapterStats KvClientObjectStorageAdapter::GetStats() const;
 ```
 
-配合 driver 内部用 `QueryAsync` 实现的存在性核查供运维手工使用。注意：适配器层 `Exists` 仍返回 `NOT_SUPPORTED`（沿用 KVCS 既有行为）；且**物理存在性只能观测、不能当权威**——`QueryResult` 只有 `exists` 位图（`kv_types.h:98-101`），无长度信息，长度权威始终是 Master 元数据。
+另提供存在性核查工具方法（内部用 `QueryAsync`）供运维手工排查单个 key。注意：适配器层 `Exists` 仍返回 `NOT_SUPPORTED`（与 KVCS 一致），因为**物理存在性只能观测、不能当权威**——`QueryResult` 只有 `exists` 位图（`kv_types.h:98-101`），无长度信息，长度权威始终是 Master 元数据。
 
 ---
 
@@ -1093,7 +1053,7 @@ inline std::string CacheKeyToLogString(const kv::CacheKey& key) {
 
 - **seed 选择**：借鉴 `nvme_kv/key_codec.cpp:44-45` 的 XXH64 用法，但那里用双 seed 产出 16 字节（`low`/`high`）；本方案只需 8 字节，单 seed 即可。
 - **不做 fingerprint**（key 碰撞裁决）：value 前 N 字节就是应用原始数据（尾部 `[N, aligned_size)` 是补零，读回时丢弃），故无需 value 内嵌校验头，§2.3.3 的双层长度校验得以保留。代价是碰撞不可检测，只能靠 §2.5.1 的 `cache_key` 日志事后排查。
-- **纯函数约束**：映射不得混入 epoch / 进程 id / 随机种子。这既是跨 Client 读取的前提，也是不支持恢复裁决（不支持恢复）下唯一需要保证的稳定性。
+- **纯函数约束**：映射不得混入 epoch / 进程 id / 随机种子。这既是跨 Client 读取的前提，也是不支持恢复裁决下唯一需要保证的稳定性。
 
 ## 3.2 shard-2：staging arena（`kvclient_staging_arena`）
 
@@ -1280,7 +1240,7 @@ class KvClientObjectStorageAdapter final : public ObjectStorageAdapter {
     void SubmitAndWait(kv::AsuOpType op, std::vector<kv::KVBuffer>& entries,
                        const std::vector<size_t>& original_indices,
                        const std::vector<StagingArena::Slot>& slots,
-                       size_t wire_len_base, BatchResults& results);
+                       BatchResults& results);
     static ErrorCode MapEntryStatus(const kv::Status& status);
     bool PreflightSharedProvider() const;
     void Shutdown();
@@ -1346,7 +1306,7 @@ tl::expected<void, ErrorCode> KvClientObjectStorageAdapter::Init() {
 void KvClientObjectStorageAdapter::SubmitAndWait(
     kv::AsuOpType op, std::vector<kv::KVBuffer>& entries,
     const std::vector<size_t>& original_indices,
-    const std::vector<StagingArena::Slot>& slots, size_t wire_len_base,
+    const std::vector<StagingArena::Slot>& slots,
     BatchResults& results) {
     // Every entry must carry the canonical handle exactly. A non-zero but
     // unregistered handle is not rejected at submit time; it surfaces only at
@@ -1460,7 +1420,11 @@ results[original_indices[i]] =
 
 删除路径**不使用 staging**（`DeleteAsync` 只传 key，无 buffer），故无 quarantine 风险。
 
-**切批常量**（`kv_types.h:196-199`）：`kBatchStoreIoNum = 110`、`kBatchLoadIoNum = 110`、`kDeleteIoNum = 254`、`kQueryIoNum = 256`。三者不可统一成 110——那会让 Delete/Query 无谓降批；也不可放大，可能触发协议错误。
+**切批上限**：`TransportConfig` 的 `batchLoadIoNum` / `batchStoreIoNum` = 110、`deleteIoNum` = 254、`queryIoNum` = 256（`kv_types.h:196-199`，均为**结构体成员字段**而非编译期常量，可被配置文件覆盖）。适配器不应硬编码这些值，而应：
+
+- 优先从 SDK 的 `TransportConfig` 读取实际生效值；若 SDK 不暴露读取入口，则用同值作为适配器侧的保守默认，并在 `Init` 日志中打印所用批上限，便于与 SDK 配置不一致时排查。
+- 三个上限不可统一成 110——那会让 Delete/Query 无谓降批；也不可放大，可能触发协议错误。
+- 切批按对象边界，绝不切开单个对象（§2.3.2）。
 
 ## 3.4 shard-4：配置（`kvclient_config`）
 
@@ -1472,9 +1436,10 @@ results[original_indices[i]] =
 | `MOONCAKE_KVCLIENT_STAGING_BYTES` | 128 MiB | arena region 大小 |
 | `MOONCAKE_KVCLIENT_MAX_SLOT_BYTES` | 16,776,704 | 单 slot 上限，须 512 对齐 |
 | `MOONCAKE_KVCLIENT_WAIT_TIMEOUT_MS` | 30000 | `Wait` 超时 |
-| `MOONCAKE_KVCLIENT_MAX_KEY_SIZE` | 1024 | 仅供适配器 Init 合理性检查 |
 
-**校验**（`ReadConfig`）：`config_path` 非空；`staging_bytes >= max_slot_bytes`；`max_slot_bytes % 512 == 0 && <= 16776704`；`wait_timeout_ms > 0`；`max_key_size in (0, 1024]`。
+**校验**（`ReadConfig`）：`config_path` 非空；`staging_bytes >= max_slot_bytes`；`max_slot_bytes % 512 == 0 && <= 16776704`；`wait_timeout_ms > 0`。
+
+**不设 `MAX_KEY_SIZE`**：hash 编码后 key 恒为 8 字节，与 logical key 长度无关，该配置无意义（这正是 `KvcsDriver::MaxKeySize()` 不适配 KVClient 的表现之一）。
 
 `DistributedStorageConfig::Validate()` 新增分支（`distributed_storage_config.cpp:63-77` 旁）：
 
@@ -1512,7 +1477,7 @@ bool UsesKvClient() const { return fs_adapter_type == "kvclient"; }
 // PutBatch: 后端传来的 ObjectPutRequest{logical_key, iov, iovcnt}
 const size_t n = SumIovecBytes(request.iov, request.iovcnt);
 const size_t wire_len = AlignUp(n, kv::kAlignmentBytes);   // 512
-if (wire_len > kMaxValueBytes) {
+if (wire_len > kKvClientMaxValueBytes) {
     results[i] = tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     continue;
 }
@@ -1557,7 +1522,7 @@ return n;                                        // 返回 n，不是 wire_len
 | 层 | 校验 | 位置 |
 | --- | --- | --- |
 | Master | `value_length <= 16,776,704` | `PrepareWriteStart`（§3.6） |
-| 适配器写 | `AlignUp(n,512) <= kMaxValueBytes` | `PutBatch` 逐请求 |
+| 适配器写 | `AlignUp(n,512) <= kKvClientMaxValueBytes` | `PutBatch` 逐请求 |
 | 适配器读 | slot 容量 >= `AlignUp(n,512)`，返回长度 == n | `GetBatch` 逐请求 |
 
 Master 那道必需，因为 `kMaxSliceSize`（16,777,200）比 SDK 上限宽 496 字节，且只在 CACHELIB 分配器下生效（`master_service.cpp:5287-5293`）。
@@ -1574,9 +1539,9 @@ Master 那道必需，因为 `kMaxSliceSize`（16,777,200）比 SDK 上限宽 49
 | --- | --- |
 | `master_service.cpp:847` | `enable_dfs_ = DfsEnablementConfig::FromEnvironment().enabled \|\| dfs_config.UsesKvcs() \|\| dfs_config.UsesKvClient();` |
 | `:872` 之前 | 新增 `if (dfs_config.UsesKvClient()) { ... return; }` 分支 |
-| `:5090` | `if (use_kvcs_ \|\| use_kvclient_) {` — descriptor 铸造，公式不变（`object_size = aligned_size = value_length`、`shard_idx = -1`） |
+| `:5090` | `if (use_kvcs_ \|\| use_kvclient_) {` — descriptor 铸造。**KVClient 分支公式与 KVCS 不同**：`object_size = value_length`、`aligned_size = AlignUp(value_length, 512)`、`shard_idx = -1`（KVCS 分支 `:5092-5093` 两者都取 `value_length`，不改） |
 | `:5249` | `(!use_kvcs_ && !use_kvclient_ && (!dfs_allocator_ \|\| ...))` |
-| `:5248` 旁 | 新增 512 对齐校验与三副本拒绝（见下） |
+| `:5248` 旁 | 新增 N 上限校验与三副本拒绝（见下）。**不校验 512 整除**——N 任意是合法输入，对齐由适配器补零承担 |
 | `:6440` | `use_kvcs_ \|\| use_kvclient_` |
 | `:6457` | `(use_kvcs_ \|\| use_kvclient_) && expected_replica_id != nullptr && ...` |
 | **不改** `:3533`、`:3825`、`:4118` | 恢复门保持 `use_kvcs_` only（不支持恢复裁决） |
@@ -1606,20 +1571,24 @@ if (dfs_config.UsesKvClient()) {
 **`PrepareWriteStart` 新增校验**（512 对齐裁决 + 两副本硬逻辑裁决）：
 
 ```cpp
+// In PrepareWriteStart the length parameter is named slice_length
+// (master_service.cpp:5225), not value_length.
 if (config.dfs_replica_num > 0 && use_kvclient_) {
-    // Decision 3: the wire format needs a 512B-aligned length, but N itself may
-    // be arbitrary -- the adapter pads the staging slot, it does not reject the
-    // object. The bound is on the padded length:
-    //     AlignUp(value_length, 512) <= 16'776'704
-    // which is equivalent to value_length <= 16'776'704 (the limit is itself a
+    // 512-alignment ruling: the wire format needs a 512B-aligned length, but N
+    // itself may be arbitrary -- the adapter pads the staging slot, it does not
+    // reject the object. The bound is on the padded length:
+    //     AlignUp(slice_length, 512) <= 16'776'704
+    // which is equivalent to slice_length <= 16'776'704 (the limit is itself a
     // multiple of 512). Mooncake's own kMaxSliceSize is 16'777'200, i.e. 496
-    // bytes wider, so it will happily admit values that cannot go on the wire.
-    if (value_length > 16'776'704) {
-        LOG(ERROR) << "key=" << key << ", value_length=" << value_length
+    // bytes wider, and it is only enforced under the CACHELIB allocator
+    // (master_service.cpp:5287-5293), so it will happily admit values that
+    // cannot go on the wire.
+    if (slice_length > 16'776'704) {
+        LOG(ERROR) << "key=" << key << ", slice_length=" << slice_length
                    << ", error=kvclient_value_too_large";
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
-    // Decision 4: only two-replica (memory + ASU) and DFS-only are supported.
+    // Two-replica ruling: only (memory + ASU) and DFS-only are supported.
     // With dfs > 0 the write mode is RELIABLE_MULTI_REPLICA, which would make
     // a NoF replica silently mandatory as well.
     if (config.nof_replica_num > 0) {
@@ -1795,7 +1764,7 @@ set(MOONCAKE_KVCLIENT_SDK_FOUND ${MOONCAKE_KVCLIENT_SDK_FOUND} PARENT_SCOPE)
 新增源文件（`MOONCAKE_STORE_SHARED_OBJECTS` / `mooncake_store`）：
 
 ```cmake
-storage/distributed/kvclient/kvclient_driver.cpp
+storage/distributed/kvclient/kvclient_object_storage_adapter.cpp
 storage/distributed/kvclient/kvclient_staging_arena.cpp
 ```
 
@@ -1812,14 +1781,15 @@ endif()
 
 **`mooncake_store_master` 不链接 KVClient SDK**——不支持恢复裁决下 Master 无适配器实例、无 capacity provider，与 KVCS 需要链接（`:719-721`）不同。
 
-SDK 缺失时 `CreateKvClientDriver` 返回 `NOT_SUPPORTED`（对照 `kvcs_capi_driver.cpp:404-407`），其他后端照常构建。
+SDK 缺失时工厂的 `UsesKvClient()` 分支返回 `NOT_SUPPORTED`（对照 `kvcs_capi_driver.cpp:404-407` 的 stub 模式），其他后端照常构建。
 
 测试目标（`tests/CMakeLists.txt:416-424` 模式）：
 
 ```cmake
-add_store_test(kvclient_driver_test kvclient_driver_test.cpp)
+add_store_test(kvclient_object_storage_adapter_test
+               kvclient_object_storage_adapter_test.cpp)
 if(NOT MOONCAKE_KVCLIENT_SDK_FOUND)
-  target_compile_definitions(kvclient_driver_test
+  target_compile_definitions(kvclient_object_storage_adapter_test
                              PRIVATE MOONCAKE_KVCLIENT_TEST_NO_SDK=1)
 endif()
 ```
@@ -1837,10 +1807,13 @@ endif()
 | T-03 | 缩小 seed 空间强制构造碰撞，写入 k1 后写入 k2 | k2 覆盖 k1，读 k1 得到 k2 的数据，**无错误返回** | SFMEA-01（验证碰撞后果符合「默许」定义） |
 | T-04 | 空 logical key | `INVALID_PARAMS` | SFMEA-02 |
 | T-05 | 同批两个相同 logical key 写入 | 后者 `INVALID_PARAMS` | SFMEA-03 |
-| T-06 | N = 513（非 512 倍数） | Master `PrepareWriteStart` 返回 `INVALID_PARAMS`，driver 未被调用 | SFMEA-04、512 对齐裁决 |
-| T-07 | N = 16,776,704 | 成功 | §2.3 上限 |
-| T-08 | N = 16,777,216 | driver `MaxValueSize` 预检拒绝，**不提交 SDK** | SFMEA-05 |
+| T-06 | N = 513（非 512 倍数） | **成功**。断言提交的 `entry.length == 1024`，slot 尾部 `[513, 1024)` 全为 0；读回后调用者 buffer 前 513 字节正确 | SFMEA-04、512 对齐裁决（N 任意是合法输入，不是拒绝条件） |
+| T-07 | N = 16,776,704（上限，本身 512 对齐） | 成功，`entry.length == 16776704`，无补零 | §3.6 上限 |
+| T-08 | N = 16,777,000（能过 `kMaxSliceSize`=16,777,200，但 `AlignUp` 后为 16,777,216 超线格式上限） | Master `PrepareWriteStart` 返回 `INVALID_PARAMS`，适配器未被调用 | SFMEA-05（**关键用例**：这正是 Master 那道校验存在的理由） |
+| T-08b | N = 16,777,216 | 同上被拒；若绕过 Master 直达适配器，适配器预检也拒绝且**不提交 SDK** | SFMEA-05 双层防护 |
 | T-09 | N = 0 | `INVALID_PARAMS` | SFMEA-06 |
+| T-09b | 连续写 A（N=513）后写 B（N=1024）复用同一 slot，再读 A | A 的内容正确，**不含 B 的残留**；A 的 `[513,1024)` 为 0 而非 B 的数据 | SFMEA-04（补零防 slot 残留外泄，回归防护） |
+| T-09c | `GetBatch` 对 N=513 的对象 | 返回值是 **513**，不是 1024；后端 `:838-841` 的长度比对通过 | §3.5（返回 wire_len 会导致每次读都误报 FILE_READ_FAIL） |
 | T-10 | `sharedProviderMode = 0` 时 `Init()` | `DFS_SERVICE_UNAVAILABLE`，不进入 `RegisterRegions` | SFMEA-07 |
 | T-11 | `RegisterRegions` 返回 `PARTIAL_FAILED` | `Init()` 失败，`FileStorage::Init` 明确失败 | SFMEA-08 |
 | T-12 | arena 配 1 slot，并发 2 个请求 | 第 2 个立即 `NO_AVAILABLE_HANDLE`，**不阻塞** | SFMEA-09 |
@@ -1856,10 +1829,12 @@ endif()
 | T-22 | 跨对象合批：3 个对象共 250 entry，批上限 110 | 切成 3 批（110/110/30），无对象被切开，结果下标正确 | §2.3.2 |
 | T-23 | `BatchDelete` 遇 `ENTRY_KEY_NOT_EXIST` | 视为幂等成功 | §3.3 |
 | T-24 | `Shutdown` 时仍有 in-flight | 先 Drain；若 `InUseSlots() != 0` 则 `LOG(ERROR)` 且输出 `QuarantinedBytes()` | SFMEA-32 |
-| T-25 | `GetMountpointStats()` | 返回 `NOT_SUPPORTED`（基类默认，未覆写） | §3.3、SFMEA-31 |
+| T-25 | 补零正确性：写 N=513，检查提交给 SDK 的 `entry.length` 与 slot 内存 | `entry.length == 1024`；slot `[0,513)` 为原始数据、`[513,1024)` 全 0 | SFMEA-04、§3.5 |
+| T-25b | slot 复用不串数据：连续写 A(N=513)、B(N=1024) 复用同一 slot，再读 A | A 的前 513 字节正确，`[513,1024)` 为 0 而**非 B 的数据** | §3.5（补零防 slot 残留外泄） |
+| T-25c | `GetBatch` 对 N=513 对象的返回值 | 返回 **513**，不是 1024 | §3.5、SFMEA-33 |
 | T-26 | `Exists()` / `ListKeys()` / `GetRange()` | 均 `NOT_SUPPORTED` | §1.2.2 |
-| T-27 | driver 读回长度 != 请求长度 | `FILE_READ_FAIL` | SFMEA-33 |
-| T-28 | `EncodeKey` 返回含 NUL 的 8 字节 string，经 `BatchDelete` 传递 | driver 按 `size()` 解读，key 未被截断 | §3.5 改造 1 二进制安全 |
+| T-27 | 适配器读回长度 != 请求长度 | `FILE_READ_FAIL` | SFMEA-33 |
+| T-28 | 含 NUL 与全 0 字节的 logical key | `EncodeKey` 正常产出 8 字节 CacheKey，删除与查询路径不被截断 | §3.1（hash 编码天然二进制安全，无 KVCS 的 `.c_str()` 问题） |
 
 ## 4.2 集成测试（Mooncake 端到端，fake SDK）
 
@@ -1868,7 +1843,7 @@ endif()
 | T-29 | 两副本 Put 成功 → 淘汰 memory → 另一 Client Get | 读到原始数据，逐字节相同 | S1 |
 | T-30 | DFS-only Put / Get / Remove | 全流程成功 | S2 |
 | T-31 | 注入 ASU 写失败 | Put 失败，且 Master 侧查不到该对象（memory 副本被一起 revoke） | 两副本硬逻辑裁决 |
-| T-32 | 注入 memory 写失败 | driver 侧提交计数器为 0（ASU 零调用），Put 失败 | 两副本硬逻辑裁决 短路 |
+| T-32 | 注入 memory 写失败 | 适配器侧提交计数器为 0（ASU 零调用），Put 失败 | 两副本硬逻辑裁决的短路行为 |
 | T-33 | 配置 `memory + nof + ASU` 后 Put | `PrepareWriteStart` 返回 `INVALID_PARAMS` | SFMEA-28 |
 | T-34 | Upsert 同尺寸对象 | 原地复用分支，ReplicaID 不变，同 CacheKey 覆盖写，读到新值 | §2.2.4 |
 | T-35 | 仅 MEMORY 的对象做 Upsert 请求 dfs=1 | 失败（拓扑不符），需先 Remove 再 Put | §2.2.4 限制 |
@@ -1880,20 +1855,20 @@ endif()
 | T-41 | Client 观察到 R1 miss，Master 已发布 R2 | 条件清理返回 false，R2 原样保留且可读 | SFMEA-30 |
 | T-42 | `enable_oplog=true` + KVClient 启动 Master | `LOG(FATAL)`，启动失败，错误信息明确指出不支持恢复 | SFMEA-27、不支持恢复裁决 |
 | T-43 | 默认配置（无 HA）重启 Master | 目录全丢，Get 返回 `OBJECT_NOT_FOUND`，无崩溃、无脏数据 | SFMEA-26、不支持恢复裁决 |
-| T-44 | 范围读（窗口 < object_size） | `INVALID_PARAMS`，不触达 driver | SFMEA-34 |
+| T-44 | 范围读（窗口 < object_size） | `INVALID_PARAMS`，不触达适配器 | SFMEA-34 |
 | T-45 | `PutEnd` 响应未知 | Client 返回提交错误；重复 Put 或查询可确认状态 | SFMEA-29 |
 | T-46 | 无 KVClient SDK 时构建 | 全部目标构建成功；显式初始化 KVClient 后端返回 `NOT_SUPPORTED`；KVCS/oss/s3 后端功能不受影响 | §3.8 |
-| T-47 | 既有 KVCS 回归 | `kvcs_object_storage_adapter_test` 全部通过（`EncodeKey` 与 Delete-before-Put 下推后行为不变，`GetName()` 默认值不变） | §3.5 改造不回归 |
+| T-47 | 既有 KVCS 回归 | `kvcs_object_storage_adapter_test`、`object_storage_adapter_test`、`distributed_storage_config_test` 全部通过 | 平级架构下 **KVCS 代码零改动**，此用例是验证「确实没碰到」的护栏；若它失败说明改动越界了 |
 
 ## 4.3 真机验证项（无法用 fake 覆盖）
 
 | 编号 | 验证项 | 方法 | 阻塞级别 |
 | --- | --- | --- | --- |
-| T-48 | ASU `Store` 是否支持**覆盖写** | 同 CacheKey 连续两次 Store 不同 value，读回应为第二次 | **阻塞**：决定 `KvClientDriver::BatchPut` 是否需要 Delete-before-Put |
+| T-48 | ASU `Store` 是否支持**覆盖写** | 同 CacheKey 连续两次 Store 不同 value，读回应为第二次 | **阻塞**：决定 `KvClientObjectStorageAdapter::PutBatch` 是否需要先 Delete（KVCS 因 insert-only 必须这么做，`kvcs_object_storage_adapter.cpp:155-170`）。若不支持覆盖写，Upsert 与同 key 重写都会失败 |
 | T-49 | `Wait` 超时后设备是否仍访问 buffer | 超时后立即用哨兵值覆写 staging slot，检查是否被设备改写 | **阻塞**：验证 quarantine 的必要性边界 |
 | T-50 | 设备侧 `singleValueMaxBytes` 实际值 | 读 SDK `Init` 日志（该值只打日志、不 clamp entry 长度） | 高：若 < 16,776,704 则实际上限更低 |
 | T-51 | 跨节点合批的路由正确性 | 多 ASU 节点部署下提交跨节点批次，验证 `originalIndices` 回填 | 高：SDK 自动拆分（`task_manager.cc:266-302`）未在真机验证 |
-| T-52 | 512 对齐是否为设备硬要求 | 提交 N = 512k+1 的 Store，观察是本地拒绝还是设备拒绝 | 中：512 对齐裁决 已在上层拒绝，此项用于确认无遗漏路径 |
+| T-52 | 设备对 512 对齐的真实要求 | 适配器始终补零到 `AlignUp(N,512)`，设备只会看到对齐长度。此项**反向确认**：直接构造一个非对齐 length 的 SQE 提交，观察设备是否拒绝——用以验证「补零确属必要」而非过度设计 | 中：新语义下 N 非 512 倍数是合法输入，不再被上层拒绝，故本项是防御性确认 |
 | T-53 | 非 512 对齐的 `buffer_addr` 行为 | SDK 不校验地址对齐，需确认设备是否容忍 | 中：arena 已保证对齐，此项为防御性确认 |
 | T-54 | 推荐 I/O 粒度 | 分层测量 `encode/acquire/memcpy/submit/wait/release` 耗时（§2.5.2），扫描对象大小 | 低：性能调优，不阻塞功能 |
 
@@ -1916,8 +1891,9 @@ endif()
 | 不支持元数据恢复 | Master 重启即目录全丢，L3 数据不可发现 | 启动期显式拒绝 `enable_oplog`；运维需知晓 |
 | 不支持 key 枚举 | `ListKeys` / `RemoveAll` / `RemoveByRegex` 返回 `NOT_SUPPORTED` | 同 key 重写时覆盖 |
 | 不支持范围读 | `BatchRead` 对象分支忽略 `range_read`（`:802-818`） | 上层回退整对象读后截取 |
-| driver 内一次 memcpy | §2.3.2 的同步契约强制 staging | 零拷贝需 SDK 提供真正的设备级中止能力 |
-| 单对象上限 16,776,704 B | SDK 线格式 24-bit length + 512 对齐 | 无 |
+| 适配器内 memcpy + 补零 | §2.3.2 的同步契约强制 staging；512 对齐裁决又要求尾部补零 | 零拷贝需 SDK 提供真正的设备级中止能力 |
+| **小对象补零放大** | N < 512 时线格式长度仍是 512，放大最高 512 倍（N=1）；带宽与存储双浪费 | 上层聚合小对象；用 `kvclient_adapter_bytes_total{direction}` 观测实际放大率（§2.5.3） |
+| 单对象上限 16,776,704 B | SDK 线格式 24-bit length + 512 对齐。比 Mooncake 的 `kMaxSliceSize`（16,777,200）窄 496 字节 | `PrepareWriteStart` 显式校验（§3.6）；无其他缓解 |
 | Upsert 无法为仅 MEMORY 对象补 DFS 副本 | `master_service.cpp:6146-6181` 拓扑不符 | 先 Remove 再 Put |
 
 ---
