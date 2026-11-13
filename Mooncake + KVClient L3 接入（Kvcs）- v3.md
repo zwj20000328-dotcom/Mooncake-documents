@@ -409,7 +409,7 @@ flowchart TB
         QR["③ QueryResult<br/>可读副本、租约截止时间、可选校验和"]
         SELECT["④ Client 按入口策略选择副本<br/>本图选中 COMPLETE DFS"]
         READ["⑤ ReadDfsReplica<br/>key + DFS 描述符 + CPU 目标 slices"]
-        B["DistributedStorageBackend::BatchRead<br/>（仅 UsesKvClient 子分支）校验切片覆盖 object_size<br/>透传调用方 buffer 与 capacity 声明（无 staging）"]
+        B["DistributedStorageBackend::BatchRead<br/>（仅 UsesKvClient 子分支）单切片透传 buffer + capacity<br/>多切片沿用后端 staging（读后散回各 slice，capacity=0）"]
         D["⑥ KvClientObjectStorageAdapter::GetBatch<br/>校验并注册（直传或暂存）→ LoadAsync → waitForCompletion<br/>→ 暂存则拷回 N 字节 → ReleaseBuffers（终态或提交失败时注销）<br/>设备写入提交 buffer（直传或 staging）"]
         VERIFY["⑦ 确认完整读取 object_size 字节<br/>数据已写入原目标 buffer"]
         CHECK["⑧ Client 检查结果<br/>对象校验和、IsLeaseExpired"]
@@ -569,12 +569,14 @@ sequenceDiagram
     participant SDK as kv::KvClient
     participant C as Client
 
-    RC->>FS: Init()（UsesKvClient 时强制 kDistributed）
+    RC->>FS: 构造（UsesKvClient 时强制 kDistributed）
     FS->>F: CreateStorageBackend(config)
     F->>F: DistributedStorageConfig::Validate()<br/>single_tenant / 无 eviction_check_interval 要求
     F->>AD: CreateKvClientObjectStorageAdapter()<br/>（SDK 缺失时 stub 返回 NOT_SUPPORTED）
     F->>BE: DistributedStorageBackend(cfg, distributed_cfg, nullptr, adapter)
     F-->>FS: backend
+    FS->>C: SetDfsStorageBackend(backend)
+    RC->>FS: Init()
     FS->>BE: Init()
     BE->>AD: Init()
     AD->>AD: kv::CreateKvClient()
@@ -585,7 +587,7 @@ sequenceDiagram
     SDK-->>AD: Status
     AD->>AD: CheckSharedProviderMode()<br/>sharedProviderMode == SHARED ?
     AD-->>BE: OK
-    FS->>C: SetDfsStorageBackend(backend)
+    BE-->>FS: OK
 ```
 
 **注册按批进行**：`PutBatch` / `GetBatch` 先把本批涉及的 buffer 去重，再一次 `RegisterRegions`；`Wait` 返回终态（或提交被拒）后一次 `UnregisterRegions`。没有跨批注册表，也不要求应用调用额外的注册 API（§3.2.2）。
@@ -651,7 +653,7 @@ sequenceDiagram
     C->>C: GetReplicaList → descriptor + lease
     C->>BE: BatchRead(key + descriptor + slices)
     BE->>BE: 校验切片覆盖 object_size<br/>size = desc.object_size = N；capacity 由上层声明（默认 0）
-    BE->>AD: GetBatch(ObjectGetRequest{logical_key, buffer, N, capacity})
+    BE->>AD: GetBatch(ObjectGetRequest{logical_key, buffer, N, capacity})<br/>多切片时 buffer 指向后端 staging
     AD->>AD: RegisterBuffers(requests, plans, errors)<br/>逐条校验 buffer + 按 (addr, wire_len) 去重注册<br/>handle 回填各自的 plan
     alt 注册失败（RegisterRegions）
         AD-->>BE: 逐项 DFS_SERVICE_UNAVAILABLE（整批，不提交 SDK）
@@ -1550,6 +1552,8 @@ if (config.dfs_replica_num > 0 && use_kvclient_) {
 
 ⚠️ **上限校验是必需的，不能省略**。`AlignUp(N,512) <= 16776704` 等价于 `N <= 16776704`（上限本身是 512 的倍数），但 Mooncake 自己的 `kMaxSliceSize = 16,777,200` 比它宽 496 字节：
 
+`AlignUp` 在 master TU 同样由文件内 helper 提供（不要引用 Transfer Engine 的同名内部函数）。
+
 ⚠️ **Master 的 slice 校验还只在 CACHELIB 分配器下生效**（`master_service.cpp:5312-5318`），DFS-only 写 + 非 CACHELIB 时那道门根本不开。适配器侧须独立再校验一次。
 
 **descriptor 铸造**：
@@ -1708,8 +1712,8 @@ if (dfs_storage_backend_ &&
 | `real_client.cpp:1619-1629` | `enable_kvcs` 判断加入 `UsesKvClient()`（否则 kvclient 不会强制 `kDistributed`），随后创建 `FileStorage` |
 | `file_storage.cpp:126` | `enable_dfs = !UsesObjectStorage() \|\| UsesKvcs() \|\| UsesKvClient()`，并注入 DFS 后端 |
 | `file_storage_config.cpp:240` | 跳过本地目录校验 |
-| `object_storage_adapter.h:21-31` | `ObjectPutRequest` / `ObjectGetRequest` 各加 `size_t capacity = 0`（默认 0，其他后端与既有聚合初始化不受影响） |
-| `distributed_storage_backend.h:26-40` | `DfsWriteRequest` / `DfsReadRequest` 各加 `size_t capacity = 0`；`BatchWrite` / `BatchRead` 原样透传到对象请求 |
+| `object_storage_adapter.h:21-31` | `ObjectPutRequest` / `ObjectGetRequest` 各追加 `size_t capacity = 0`，必须是最后一个成员（保持既有聚合初始化兼容，默认 0） |
+| `distributed_storage_backend.h:26-40` | `DfsWriteRequest` / `DfsReadRequest` 各追加 `size_t capacity = 0`（最后成员）；`BatchWrite` / `BatchRead` 原样透传到对象请求 |
 | `distributed_storage_backend.h:70-71` | 新增 `bool UsesKvClient() const { return UsesObjectStorage() && distributed_config_.UsesKvClient(); }`；**注册在适配器内按批完成，不经后端** |
 | `client_service.{h,cpp}`、`real_client.cpp` 的 buffer 注册与读写路径 | **零改动**：buffer 注册与读写都在 `KvClientObjectStorageAdapter` 内按批完成（其余位置见本节改动 1~3 与本表上一行） |
 | `storage_backend.cpp:6523` | 在既有 `UsesKvcs()` 分支旁新增 `UsesKvClient()` 分支，转调 `CreateKvClientObjectStorageAdapter()` |
@@ -1783,6 +1787,11 @@ if(MOONCAKE_KVCLIENT_SDK_FOUND)
   add_store_test(kvclient_key_codec_test kvclient_key_codec_test.cpp)
   add_store_test(kvclient_object_storage_adapter_test
                  kvclient_object_storage_adapter_test.cpp)
+  # SDK 是 mooncake_store 的 PRIVATE 依赖，include 目录不会传给测试；
+  # 测试需直接链接 imported target 才能找到 kv_client.h / 符号。
+  target_link_libraries(kvclient_key_codec_test PRIVATE PkgConfig::KVCLIENT)
+  target_link_libraries(kvclient_object_storage_adapter_test
+                        PRIVATE PkgConfig::KVCLIENT)
 endif()
 ```
 
