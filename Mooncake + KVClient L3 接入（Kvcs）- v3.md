@@ -182,7 +182,7 @@ classDiagram
         -MakeCacheKey(logical_key)
         -PlanBuffer(iov, object_size, is_store)
         -RegisterBuffers(plans)
-        -ReleaseBatchBuffers(registered)
+        -ReleaseBuffers(registered)
         -FindHandle(registered, addr, len)
         -waitForCompletion(task_id)
     }
@@ -223,7 +223,7 @@ classDiagram
 | `Client` | `ReconcileMissingKvcsReplica()` 推广为图中的 `ReconcileMissingKvReplica()`；**内存注册不经过 Client** |
 | `DistributedStorageBackend` | 新增 `UsesKvClient()` 判断与注册转发；**读写分支透传调用方 buffer**（读分支去掉多切片 staging，校验 `capacity >= AlignUp(N,512)`） |
 | `ObjectStorageAdapter` | **零改动**。同步契约（payload 须在返回前保持有效）是零拷贝路径成立的前提 |
-| `KvClientObjectStorageAdapter` | **新增**。实现 `ObjectStorageAdapter`：`MakeCacheKey`、`PlanBuffer`、`RegisterBuffers` / `ReleaseBatchBuffers`、`waitForCompletion`；数据面见 §3.2.3 |
+| `KvClientObjectStorageAdapter` | **新增**。实现 `ObjectStorageAdapter`：`MakeCacheKey`、`PlanBuffer`、`RegisterBuffers` / `ReleaseBuffers`、`waitForCompletion`；数据面见 §3.2.3 |
 | `kv::KvClient` | **SDK 不改**。提交面只用 `StoreAsync` / `LoadAsync` / `DeleteAsync` / `QueryAsync`，另用 `Wait` / `RegisterRegions` / `UnregisterRegions` 完成等待与注册——SDK 不暴露 `Batch*Async`；`StoreAsync` / `LoadAsync` 按 `entries.size() > 1 \|\| useBatchIoForSingleKey`（默认 true，故单条也走 `BATCH_*`）内部选择 opcode，适配器无需关心。四个方法均带 `const kv::IoOptions& options = {}`；本方案不填 `kvns`、不用 `prerequisite`（见 §3.2.3、§5） |
 
 ### 2.1.3 Master 侧类图
@@ -1012,7 +1012,7 @@ class KvClientObjectStorageAdapter final : public ObjectStorageAdapter {
     tl::expected<std::vector<RegisteredBuffer>, ErrorCode> RegisterBuffers(
         std::span<const BufferPlan> plans);
     // Unregisters the batch's handles. Called once, after Wait returns.
-    void ReleaseBatchBuffers(std::span<const RegisteredBuffer> registered);
+    void ReleaseBuffers(std::span<const RegisteredBuffer> registered);
     // Containment lookup on the padded range [addr, addr + wire_len).
     std::optional<kv::MRHandle> FindHandle(
         std::span<const RegisteredBuffer> registered, uintptr_t addr,
@@ -1066,7 +1066,7 @@ KvClientObjectStorageAdapter::RegisterBuffers(
     return registered;
 }
 
-void KvClientObjectStorageAdapter::ReleaseBatchBuffers(
+void KvClientObjectStorageAdapter::ReleaseBuffers(
     std::span<const RegisteredBuffer> registered) {
     std::vector<kv::MRHandle> handles;
     handles.reserve(registered.size());
@@ -1144,7 +1144,7 @@ if (status.ok()) {
 }
 
 // 5) 本批注销（无条件）
-ReleaseBatchBuffers(*registered);
+ReleaseBuffers(*registered);
 return results;
 ```
 
