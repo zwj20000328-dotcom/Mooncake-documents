@@ -26,10 +26,10 @@
 | --- | --- |
 | `mooncake-common/include/environment_variables.h` | 新增 `KvClientEnvironmentVariables`（三个 env 变量声明） |
 | `include/storage/distributed/kvclient/kvclient_config.h` | 新增，header-only：`kKvClientMaxValueBytes`、`KvClientAdapterConfig`、`FromEnvironment()`、`Validate()` |
-| `include/storage/distributed/kvclient/kvclient_key_codec.h` | 新增，header-only：`MakeCacheKey` / `EncodeBinaryKey` |
+| `include/storage/distributed/kvclient/kvclient_key_codec.h` | 新增，header-only：`kKvClientHashSeed`、`EncodeBinaryKey`（`MakeCacheKey` 是适配器私有方法，转调它） |
 | `include/storage/distributed/kvclient/kvclient_backend.h` | 新增，厂商无关工厂声明 |
 | `src/storage/distributed/kvclient/kvclient_backend_stub.cpp` | 新增，SDK 缺失时的 `NOT_SUPPORTED` 实现 |
-| `include/storage/distributed/kvclient/kvclient_object_storage_adapter.h` | 新增，类定义（数据方法占位） |
+| `include/storage/distributed/kvclient/kvclient_object_storage_adapter.h` | 新增，类定义（数据方法占位；含 `Completion` 与 `waitForCompletion`，删除路径依赖它） |
 | `src/storage/distributed/kvclient/kvclient_object_storage_adapter.cpp` | 新增，控制面实现 + 数据方法 stub + 工厂实现 |
 | `include/config/distributed_storage_config.h`、`src/config/distributed_storage_config.cpp` | `UsesKvClient()`、`Validate()` 分支、`UsesObjectStorage()` 列表 |
 | `src/config/file_storage_config.cpp` | `Validate()` 跳过本地目录校验 |
@@ -53,6 +53,11 @@ classDiagram
         +Validate() bool
     }
 
+    class Completion {
+        +bool terminal
+        +vector~Status~ entryStatus
+    }
+
     class KvClientObjectStorageAdapter {
         -KvClientAdapterConfig config_
         -unique_ptr~kv::KvClient~ kv_client_
@@ -74,6 +79,8 @@ classDiagram
         -CheckSharedProviderMode(cfg) bool
     }
 
+    KvClientObjectStorageAdapter ..> Completion : 返回
+
     class SdkKvClient["kv::KvClient"] {
         +Init(cfg)
         +StoreAsync(...)
@@ -87,7 +94,7 @@ classDiagram
     }
 
     class Factory["CreateKvClientObjectStorageAdapter()"] {
-        +returns unique_ptr~ObjectStorageAdapter~
+        +returns tl::expected~unique_ptr~ObjectStorageAdapter~~, ErrorCode~
     }
 
     KvClientObjectStorageAdapter *-- SdkKvClient : 持有
@@ -123,6 +130,7 @@ sequenceDiagram
     participant AD as KvClientObjectStorageAdapter
     participant BE as DistributedStorageBackend
     participant SDK as kv::KvClient
+    participant C as Client
 
     RC->>FS: 构造（UsesKvClient 强制 kDistributed）
     FS->>F: CreateStorageBackend(config)
@@ -131,7 +139,7 @@ sequenceDiagram
     AD->>AD: KvClientAdapterConfig::FromEnvironment().Validate()
     F->>BE: DistributedStorageBackend(cfg, dcfg, nullptr, adapter)
     F-->>FS: backend
-    FS->>FS: SetDfsStorageBackend(backend)
+    FS->>C: SetDfsStorageBackend(backend)
     RC->>FS: Init()
     FS->>BE: Init()
     BE->>AD: Init()
@@ -160,6 +168,8 @@ struct KvClientEnvironmentVariables {
 
 // kvclient_config.h（header-only，不包含 SDK 头）
 inline constexpr uint64_t kKvClientMaxValueBytes = 16'776'704;
+// 与 SDK 的 kAlignmentBytes 同值；本地声明，避免配置单元依赖 SDK 头。
+inline constexpr size_t kKvClientAlignment = 512;
 
 struct KvClientAdapterConfig {
     std::string config_path;
@@ -183,7 +193,7 @@ struct KvClientAdapterConfig {
 
     bool Validate() const {
         return !config_path.empty() &&
-               max_object_bytes % kv::kAlignmentBytes == 0 &&
+               max_object_bytes % kKvClientAlignment == 0 &&
                max_object_bytes <= kKvClientMaxValueBytes &&
                wait_timeout_ms > 0;
     }
@@ -194,8 +204,10 @@ struct KvClientAdapterConfig {
 
 ```cpp
 // kvclient_key_codec.h
+inline constexpr uint64_t kKvClientHashSeed = 5381;   // 与 key_resolver 一致
+
 inline kv::BinaryKey EncodeBinaryKey(std::string_view logical_key) {
-    uint64_t hash = XXH64(logical_key.data(), logical_key.size(), 5381);
+    uint64_t hash = XXH64(logical_key.data(), logical_key.size(), kKvClientHashSeed);
     if (hash == 0) hash = 1;              // 全零映射为非零常量
     kv::BinaryKey key{};
     std::memcpy(key.data(), &hash, sizeof(hash));
@@ -252,13 +264,14 @@ tl::expected<void, ErrorCode> KvClientObjectStorageAdapter::Init() {
     return {};
 }
 
-void KvClientObjectStorageAdapter::Shutdown() {   // 析构内调用
+KvClientObjectStorageAdapter::~KvClientObjectStorageAdapter() {
+    // 没有独立的 Shutdown()：先停止受理，再由 SDK 排空 pending task。
     if (kv_client_) kv_client_->Shutdown();
 }
 
 ErrorCode KvClientObjectStorageAdapter::ToErrorCode(const kv::Status& s) {
     using kv::StatusCode;
-    switch (s.code()) {
+    switch (s.code) {
         case StatusCode::OK: return ErrorCode::OK;
         case StatusCode::TIMEOUT:
         case StatusCode::CQE_IO_TIMEOUT: return ErrorCode::RPC_TIMEOUT;
@@ -287,7 +300,7 @@ KvClientObjectStorageAdapter::waitForCompletion(kv::TaskId task_id,
     kv::TaskResult result;
     const auto wait_status =
         kv_client_->Wait(task_id, config_.wait_timeout_ms, result);
-    const auto code = wait_status.ok() ? result.status.code() : wait_status.code();
+    const auto code = wait_status.ok() ? result.status.code : wait_status.code;
 
     Completion c;
     if (code == kv::StatusCode::TASK_NOT_FOUND) {
@@ -381,8 +394,8 @@ ObjectStorageIoResults KvClientObjectStorageAdapter::DeleteBatch(
 | `include/storage/distributed/object_storage_adapter.h` | `ObjectPutRequest` / `ObjectGetRequest` 末尾追加 `size_t capacity = 0` |
 | `include/storage/distributed/distributed_storage_backend.h` | `DfsWriteRequest` / `DfsReadRequest` 末尾追加 `size_t capacity = 0` |
 | `src/storage/distributed/distributed_storage_backend.cpp` | 透传 capacity |
-| `include/storage/distributed/kvclient/kvclient_object_storage_adapter.h` | `BufferPlan`、`Completion`、`RegisterBuffers`/`ReleaseBuffers`/`RetainOrphans` |
-| `src/storage/distributed/kvclient/kvclient_object_storage_adapter.cpp` | 数据面实现 |
+| `include/storage/distributed/kvclient/kvclient_object_storage_adapter.h` | `BufferPlan`、`RegisterBuffers`/`ReleaseBuffers`/`RetainOrphans`、`orphans_` 成员（`Completion` 已在 PR1 声明） |
+| `src/storage/distributed/kvclient/kvclient_object_storage_adapter.cpp` | 数据面实现；析构中清理 `orphans_` |
 | `include/master_service.h` / `src/master_service.cpp` | `use_kvclient_`、门控、descriptor、白名单 |
 
 ### 2.3 类图
@@ -445,13 +458,16 @@ flowchart TB
     DIR --> REG["按 (addr,wire_len) 去重<br/>一次 RegisterRegions<br/>handle 回填 plan"]
     STG --> REG
     REG --> SUB["一次 StoreAsync / LoadAsync"]
-    SUB --> WAIT["waitForCompletion(task_id, count)"]
+    SUB --> SUBOK{"提交被受理?"}
+    SUBOK -->|否| SUBFAIL["逐项 ToErrorCode(submit)<br/>ReleaseBuffers（未触达设备）"]
+    SUBOK -->|是| WAIT["waitForCompletion(task_id, count)"]
     WAIT --> TERM{"terminal?"}
     TERM -->|否| KEEP["返回 RPC_TIMEOUT/INTERNAL_ERROR<br/>RetainOrphans：handle+staging 留到 Shutdown"]
     TERM -->|是| MAP["逐项映射 entryStatus<br/>读且 staged：拷回 N 字节<br/>返回 N（不是 wire_len）"]
     MAP --> REL["ReleaseBuffers：注销 handle<br/>staging 随 plan 释放"]
     KEEP --> END["返回逐项结果"]
     REL --> END
+    SUBFAIL --> END
 ```
 
 ### 2.5 时序图（写路径，读路径对称）
@@ -476,16 +492,18 @@ sequenceDiagram
         SDK-->>AD: 提交结果
         SDK->>S: worker 线程异步派发 / 子批写入
         alt 提交被拒
-            AD-->>BE: 逐项 ToErrorCode(submit)，跳过 Wait
+            AD->>AD: 逐项 ToErrorCode(submit)
+            AD->>AD: ReleaseBuffers（未触达设备，handle 可注销）
+            AD-->>BE: 逐项错误
         else 已受理
             AD->>SDK: Wait(taskId, timeout, result)
             alt 终态
                 SDK-->>AD: entryStatus[]
                 AD->>AD: 逐项映射（写侧无回拷）
+                AD->>AD: ReleaseBuffers（去重注销，staging 随 plan 释放）
             else 非终态
-                AD->>AD: 逐项 RPC_TIMEOUT/INTERNAL_ERROR<br/>RetainOrphans
+                AD->>AD: 逐项 RPC_TIMEOUT/INTERNAL_ERROR<br/>RetainOrphans（handle+staging 留到 Shutdown）
             end
-            AD->>AD: ReleaseBuffers（仅终态/提交被拒）
             AD-->>BE: 逐项 expected
         end
     end
@@ -524,7 +542,7 @@ void CopyIovTo(char* dst, const iovec* iov, int iovcnt);
 std::shared_ptr<char[]> AllocateStaging(size_t wire_len);  // 512B 对齐，失败返回 null
 
 template <typename T>
-void FillAll(std::vector<tl::expected<T, ErrorCode>>& results, ErrorCode e) {
+void FillError(std::vector<tl::expected<T, ErrorCode>>& results, ErrorCode e) {
     for (auto& r : results) r = tl::make_unexpected(e);
 }
 ```
@@ -649,7 +667,7 @@ std::vector<tl::expected<void, ErrorCode>> KvClientObjectStorageAdapter::PutBatc
     std::vector<ErrorCode> errors(requests.size(), ErrorCode::INVALID_PARAMS);
 
     if (!RegisterBuffers(requests, plans, errors)) {
-        FillAll(results, ErrorCode::DFS_SERVICE_UNAVAILABLE);
+        FillError(results, ErrorCode::DFS_SERVICE_UNAVAILABLE);
         return results;
     }
     for (size_t i = 0; i < plans.size(); ++i)
@@ -679,7 +697,7 @@ std::vector<tl::expected<void, ErrorCode>> KvClientObjectStorageAdapter::PutBatc
         const auto completion = waitForCompletion(task_id, entries.size());
         terminal = completion.terminal;
         if (completion.entryStatus.size() != entries.size()) {
-            FillAll(results, ErrorCode::INTERNAL_ERROR);
+            FillError(results, ErrorCode::INTERNAL_ERROR);
         } else {
             for (size_t j = 0; j < entries.size(); ++j) {
                 const size_t i = indices[j];
@@ -690,7 +708,7 @@ std::vector<tl::expected<void, ErrorCode>> KvClientObjectStorageAdapter::PutBatc
             }
         }
     } else {
-        FillAll(results, ToErrorCode(submit));
+        FillError(results, ToErrorCode(submit));
     }
 
     if (terminal) ReleaseBuffers(plans);
@@ -705,7 +723,22 @@ std::vector<tl::expected<void, ErrorCode>> KvClientObjectStorageAdapter::PutBatc
 #### 2.6.3 Master 门控
 
 ```cpp
-// PrepareWriteStart
+// 初始化（MasterService 构造 / 配置注入）
+use_kvcs_ = (distributed_config.fs_adapter_type == "kvcs-lowlevel");
+use_kvclient_ = (distributed_config.fs_adapter_type == "kvclient");
+enable_dfs_ = DfsEnablementConfig::FromEnvironment().enabled ||
+              distributed_config.UsesKvcs() ||
+              distributed_config.UsesKvClient();
+
+// DFS 可用性门（master_service.cpp:5273-5275）：保留 !enable_dfs_ 前缀
+if (config.dfs_replica_num > 0 &&
+    (!enable_dfs_ ||
+     (!use_kvcs_ && !use_kvclient_ &&
+      (!dfs_allocator_ || !dfs_allocator_->IsInitialized())))) {
+    return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+}
+
+// PrepareWriteStart：长度上限 + 三副本拒绝
 if (config.dfs_replica_num > 0 && use_kvclient_) {
     if (slice_length > 16'776'704) return INVALID_PARAMS;
     if (config.nof_replica_num > 0) return INVALID_PARAMS;   // 三副本不支持
@@ -720,11 +753,23 @@ if (use_kvclient_) {
     replicas.emplace_back(std::move(d), ReplicaStatus::PROCESSING);
 }
 
-// 白名单
+// 白名单 1：replica_type 校验
 const bool supports_dfs_condition =
     replica_type == ReplicaType::DFS &&
     expected_replica_id != nullptr &&
     (use_kvcs_ || use_kvclient_);
+
+// 白名单 2：target_pred 里同样要放宽（:6481）
+auto target_pred = [this, replica_type, &client_id, expected_replica_id](
+                       const Replica& r) {
+    if (replica_type == ReplicaType::DFS) {
+        return (use_kvcs_ || use_kvclient_) &&
+               expected_replica_id != nullptr &&
+               r.is_dfs_replica() && r.id() == *expected_replica_id;
+    }
+    // DISK / LOCAL_DISK 分支保持原样
+    return false;
+};
 ```
 
 ### 2.7 验收
@@ -752,10 +797,10 @@ const bool supports_dfs_condition =
 | 文件 | 改动 |
 | --- | --- |
 | `include/client_service.h` | `ReconcileMissingKvcsReplica` → `ReconcileMissingKvReplica` |
-| `src/client_service.cpp` | 改名与 3 处调用点；`BatchRemove` 的 KVClient 分支；`Remove`/`RemoveAll`/`RemoveByRegex` 门控；`AttachHostId` |
+| `src/client_service.cpp` | 改名（声明 + 2 处调用点 `:1626`、`:1936`）；`BatchRemove` 的 KVClient 分支；`Remove`/`RemoveAll`/`RemoveByRegex` 门控；`AttachHostId` |
 | `tests/kvclient_key_codec_test.cpp` | 新增 |
 | `tests/kvclient_object_storage_adapter_test.cpp` | 新增 |
-| `tests/CMakeLists.txt` | 测试目标（仅 SDK 存在时） |
+| `tests/CMakeLists.txt` | 新增两个测试目标（仅 SDK 存在时），并 `target_link_libraries(... PkgConfig::KVCLIENT)` |
 
 ### 3.3 类图
 
@@ -850,6 +895,7 @@ sequenceDiagram
 std::vector<tl::expected<void, ErrorCode>> Client::BatchRemove(
     const std::vector<std::string>& keys, bool force) {
     std::vector<tl::expected<void, ErrorCode>> results(keys.size());
+    if (hot_cache_) hot_cache_->BumpKeyGenerations(keys);
     const bool kvclient =
         dfs_storage_backend_ && dfs_storage_backend_->UsesKvClient();
 
@@ -954,11 +1000,16 @@ if (dfs_storage_backend_ &&
     return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);   // 不删元数据
 }
 
-// AttachHostId
-if (dfs_storage_backend_ &&
-    (dfs_storage_backend_->UsesKvcs() ||
-     dfs_storage_backend_->UsesKvClient())) {
-    config.dfs_replica_num = 1;
+// AttachHostId：const 入参，改本地副本
+ReplicateConfig Client::AttachHostId(const ReplicateConfig& config) const {
+    ReplicateConfig client_cfg = config;
+    if (dfs_storage_backend_ &&
+        (dfs_storage_backend_->UsesKvcs() ||
+         dfs_storage_backend_->UsesKvClient())) {
+        client_cfg.dfs_replica_num = 1;
+    }
+    if (!host_id_.empty()) client_cfg.host_id = host_id_;
+    return client_cfg;
 }
 ```
 
@@ -968,10 +1019,11 @@ if (dfs_storage_backend_ &&
 TEST(KvClientCodec, IdempotentAndInjective) { /* T-01 */ }
 TEST(KvClientAdapter, RejectEmptyKeyZeroLengthAndDuplicate) { /* T-02 */ }
 TEST(KvClientAdapter, DirectAndStagedPaths) { /* T-03 */ }
-TEST(KvClientAdapter, RegisterFailureFailsBatch) { /* T-18 */ }
+TEST(KvClientAdapter, RegisterFailureFailsBatch) { /* T-20 */ }
 TEST(KvClientAdapter, TimeoutKeepsHandlesAndStaging) { /* T-08 */ }
 TEST(KvClientAdapter, BufferNotRegisteredFailsSubBatch) { /* T-07 */ }
 TEST(KvClientClient, ValueFirstDeleteOrder) { /* T-17 */ }
+TEST(KvClientClient, RemoveAllAndRegexAreNotSupported) { /* T-18 */ }
 ```
 
 ### 3.7 验收
