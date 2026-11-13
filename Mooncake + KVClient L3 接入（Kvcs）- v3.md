@@ -1,6 +1,6 @@
 # Mooncake + KVClient L3 接入设计方案
 
-版本：v4.0　更新日期：2026-11-13
+版本：v4.1　更新日期：2026-11-13
 
 ---
 
@@ -182,8 +182,7 @@ classDiagram
         -MakeCacheKey(logical_key)
         -PlanBuffer(iov, object_size, is_store)
         -RegisterBuffers(plans)
-        -ReleaseBuffers(registered)
-        -FindHandle(registered, addr, len)
+        -ReleaseBuffers(plans)
         -waitForCompletion(task_id)
     }
 
@@ -782,7 +781,7 @@ sequenceDiagram
 | SFMEA-02 | 非法 key / 长度：空 key、同批重复、N == 0、N > 16,776,704、全零 CacheKey | 编码失败；协议层拒绝，预发送失败会 **abort 整个 transport task** | `MakeCacheKey` 拒空并把全零映射为非零常量；写侧拒绝同批重复；逐请求预检 `n > 0` 且 `wire_len <= max_object_bytes`；Master `PrepareWriteStart` 第一道校验 | 不能指望「只失败越界那条」 |
 | SFMEA-03 | 写路径未按 `AlignUp(N,512)` 补零或未清零尾部 | 提交被拒；调用方 buffer 尾部的残留字节被当成 padding 发到存储侧 | `wire_len = AlignUp(N,512)`；`PlanBuffer` 清零尾部 `[N, wire_len)` | 写 513 字节对象，断言尾部全 0 |
 | SFMEA-04 | 初始化门禁失败：`sharedProviderMode != SHARED`、SDK `Init` 失败、transport deadline < `Wait` 超时 | 适配器不可用；或健康但较慢的写被判 `PARTIAL_FAILED` + `TIMEOUT` | `CheckSharedProviderMode` 硬门禁；`Init` 失败即失败；校验 `cfg.timeoutMs >= wait_timeout_ms` | 全部在 `Init` 阶段失败 |
-| SFMEA-05 | 提交的 handle 与本批注册结果不一致，或 `mrKey` 被误填 | 到 `Wait` 才以 `BUFFER_NOT_REGISTERED` 暴露且**连坐整 task** | handle 一律取自本批 `RegisterBuffers` 的结果；`mrKey` 留 `std::nullopt` | 注册只在批内产生，生命周期与 batch 相同 |
+| SFMEA-05 | 提交的 handle 与本批注册结果不一致，或 `mrKey` 被误填 | 到 `Wait` 才以 `BUFFER_NOT_REGISTERED` 暴露且**连坐整 task** | handle 由本批 `RegisterBuffers` 直接回填进 `BufferPlan`，构造 `KVBuffer` 时按下标取；`mrKey` 留 `std::nullopt` | 注册只在批内产生，生命周期与 batch 相同 |
 | SFMEA-06 | `Wait` 超时 / 取消：调用方 buffer 可能被迟到写覆盖，且 `entryStatus` 仍停留在初值 `OK` | 读到错数据；或把未落盘的数据报成功 | 非终态**不读** `entryStatus`，整批置错；**buffer 复用由调用方保证**（依赖 T-19） | SDK 无面向业务的中止能力 |
 | SFMEA-07 | task 级 `PARTIAL_FAILED`、派发后 `CANCELED`、或路由失败 | 部分 key 成功、部分失败；`CANCELED` 时设备可能已访问调用方 buffer | 逐项映射 `entryStatus` 并按 `originalIndices` 回填；适配器不持有 buffer，无需处置 | entryStatus 与输入严格一一对应 |
 | SFMEA-08 | 设备侧资源 / 连接错误：`CQE_OUT_OF_CREATE_SIZE`、`CONNECTION_ERROR`、存储空间耗尽 | 写或读失败；无容量查询与自动回收 | 分别映射为 `NO_AVAILABLE_HANDLE` / `DFS_SERVICE_UNAVAILABLE`；Master 不建 capacity provider | 容量管理留待 SDK |
@@ -993,11 +992,7 @@ class KvClientObjectStorageAdapter final : public ObjectStorageAdapter {
         uintptr_t addr = 0;
         size_t n = 0;
         size_t wire_len = 0;
-    };
-    // One buffer registered for the current batch only.
-    struct RegisteredBuffer {
-        uintptr_t base = 0;
-        size_t size = 0;
+        // Filled by RegisterBuffers; buffers sharing (addr, wire_len) share it.
         kv::MRHandle handle = kv::kInvalidMRHandle;
     };
 
@@ -1008,15 +1003,12 @@ class KvClientObjectStorageAdapter final : public ObjectStorageAdapter {
     std::optional<BufferPlan> PlanBuffer(const iovec* iov, int iovcnt,
                                          size_t object_size, bool is_store,
                                          ErrorCode& error);
-    // Registers every distinct buffer of this batch with one RegisterRegions.
-    tl::expected<std::vector<RegisteredBuffer>, ErrorCode> RegisterBuffers(
-        std::span<const BufferPlan> plans);
-    // Unregisters the batch's handles. Called once, after Wait returns.
-    void ReleaseBuffers(std::span<const RegisteredBuffer> registered);
-    // Containment lookup on the padded range [addr, addr + wire_len).
-    std::optional<kv::MRHandle> FindHandle(
-        std::span<const RegisteredBuffer> registered, uintptr_t addr,
-        size_t wire_len) const;
+    // Registers every distinct buffer of this batch with one RegisterRegions
+    // and writes each plan's handle back into the plan itself.
+    tl::expected<void, ErrorCode> RegisterBuffers(
+        std::span<std::optional<BufferPlan>> plans);
+    // Unregisters the distinct handles carried by this batch's plans.
+    void ReleaseBuffers(std::span<const std::optional<BufferPlan>> plans);
 
     // Waits for a submitted task and returns one Status per input entry.
     std::vector<kv::Status> waitForCompletion(kv::TaskId task_id);
@@ -1034,25 +1026,29 @@ class KvClientObjectStorageAdapter final : public ObjectStorageAdapter {
 ### 3.2.2 按批注册与释放
 
 ```cpp
-tl::expected<std::vector<KvClientObjectStorageAdapter::RegisteredBuffer>, ErrorCode>
+tl::expected<void, ErrorCode>
 KvClientObjectStorageAdapter::RegisterBuffers(
-    std::span<const BufferPlan> plans) {
-    std::vector<RegisteredBuffer> registered;
+    std::span<std::optional<BufferPlan>> plans) {
     std::vector<kv::MemoryRegion> regions;
-    for (const auto& plan : plans) {
-        bool duplicated = false;
-        for (const auto& r : registered) {
-            if (r.base == plan.addr && r.size == plan.wire_len) {
-                duplicated = true;
+    std::vector<size_t> plan_to_region(plans.size(), SIZE_MAX);
+    for (size_t i = 0; i < plans.size(); ++i) {
+        if (!plans[i]) continue;
+        size_t region_index = regions.size();
+        for (size_t j = 0; j < regions.size(); ++j) {
+            if (regions[j].addr == plans[i]->addr &&
+                regions[j].size == plans[i]->wire_len) {
+                region_index = j;
                 break;
             }
         }
-        if (duplicated) continue;
-        registered.push_back({plan.addr, plan.wire_len, kv::kInvalidMRHandle});
-        regions.push_back({kv::MemoryType::HOST, plan.addr, plan.wire_len,
-                           /*deviceId=*/-1, /*numaNode=*/-1});
+        if (region_index == regions.size()) {
+            regions.push_back({kv::MemoryType::HOST, plans[i]->addr,
+                               plans[i]->wire_len, /*deviceId=*/-1,
+                               /*numaNode=*/-1});
+        }
+        plan_to_region[i] = region_index;
     }
-    if (regions.empty()) return registered;
+    if (regions.empty()) return {};
 
     std::vector<kv::RegisteredMemory> out;
     if (!kv_client_->RegisterRegions(regions, out).ok() ||
@@ -1060,27 +1056,33 @@ KvClientObjectStorageAdapter::RegisterBuffers(
         // The SDK rolls back partial registrations itself.
         return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
     }
-    for (size_t i = 0; i < registered.size(); ++i) {
-        registered[i].handle = out[i].handle;
+
+    for (size_t i = 0; i < plans.size(); ++i) {
+        if (plans[i]) plans[i]->handle = out[plan_to_region[i]].handle;
     }
-    return registered;
+    return {};
 }
 
 void KvClientObjectStorageAdapter::ReleaseBuffers(
-    std::span<const RegisteredBuffer> registered) {
-    std::vector<kv::MRHandle> handles;
-    handles.reserve(registered.size());
-    for (const auto& r : registered) handles.push_back(r.handle);
-    if (handles.empty()) return;
-    if (!kv_client_->UnregisterRegions(handles).ok()) {
+    std::span<const std::optional<BufferPlan>> plans) {
+    std::vector<kv::MRHandle> unique;
+    for (const auto& plan : plans) {
+        if (!plan || plan->handle == kv::kInvalidMRHandle) continue;
+        if (std::find(unique.begin(), unique.end(), plan->handle) ==
+            unique.end()) {
+            unique.push_back(plan->handle);
+        }
+    }
+    if (unique.empty()) return;
+    if (!kv_client_->UnregisterRegions(unique).ok()) {
         LOG(ERROR) << "action=kvclient_batch_unregister_failed"
-                   << ", handles=" << handles.size();
+                   << ", handles=" << unique.size();
     }
 }
 ```
 
-- **一次注册**：同一批内相同 `(addr, wire_len)` 只注册一次。
-- **一次注销**：`Wait` 返回后无条件注销，成功、业务错误、超时都走这一条。
+- **一次注册**：同一批内相同 `(addr, wire_len)` 只注册一次；handle 直接回填进各自的 `BufferPlan`，重复 buffer 拿到同一个 handle，构造 `KVBuffer` 时按请求下标取，无需查表。
+- **一次注销**：`Wait` 返回后对 plan 中出现的 handle 去重后无条件注销，成功、业务错误、超时都走这一条。
 - **不跨批保留**：适配器没有常驻注册表；下一批重新注册。代价是每批一次注册开销。
 - **注册失败**：整批请求失败（`DFS_SERVICE_UNAVAILABLE`），不提交 SDK。
 
@@ -1091,32 +1093,28 @@ void KvClientObjectStorageAdapter::ReleaseBuffers(
 ```cpp
 // 1) 纯几何校验，得到每条请求的 plan（不触碰 SDK）
 std::vector<std::optional<BufferPlan>> plans(requests.size());
-std::vector<BufferPlan> valid_plans;
 for (size_t i = 0; i < requests.size(); ++i) {
     auto plan = PlanBuffer(request.iov, request.iovcnt, object_size,
                            is_store, error);   // GetBatch 见上文说明
     if (!plan) { results[i] = tl::make_unexpected(error); continue; }
     plans[i] = *plan;
-    valid_plans.push_back(*plan);
 }
 
-// 2) 本批 buffer 一次注册
-auto registered = RegisterBuffers(valid_plans);
+// 2) 本批 buffer 一次注册，handle 回填进各自的 plan
+auto registered = RegisterBuffers(plans);
 if (!registered) {
     FillError(results, ToErrorCode(registered.error()));
     return results;
 }
 
-// 3) 绑定 handle，构造 KVBuffer
+// 3) 按请求下标取 plan 中的 handle，构造 KVBuffer
 for (size_t i = 0; i < requests.size(); ++i) {
     if (!plans[i]) continue;
-    const auto handle = FindHandle(*registered, plans[i]->addr, plans[i]->wire_len);
-    if (!handle) { results[i] = tl::make_unexpected(ErrorCode::INVALID_PARAMS); continue; }
     kv::KVBuffer entry;
     entry.key = kv::CacheKey::FromBytes(MakeCacheKey(requests[i].key));
     entry.buffer.region = {kv::MemoryType::HOST, plans[i]->addr,
                            plans[i]->wire_len, /*deviceId=*/-1, /*numaNode=*/-1};
-    entry.buffer.handle = *handle;
+    entry.buffer.handle = plans[i]->handle;
     entry.offset = 0;
     entry.mrKey = std::nullopt;
     entries.push_back(std::move(entry));
@@ -1144,7 +1142,7 @@ if (status.ok()) {
 }
 
 // 5) 本批注销（无条件）
-ReleaseBuffers(*registered);
+ReleaseBuffers(plans);
 return results;
 ```
 
@@ -1190,6 +1188,7 @@ std::optional<BufferPlan> KvClientObjectStorageAdapter::PlanBuffer(
 | 提交失败 | 全部置 `ToErrorCode(submit)`，跳过 Wait |
 | 终态（`OK` / `PARTIAL_FAILED`） | 逐条映射 `entryStatus`；成功项写 `OK` / 读 `N` |
 | `TIMEOUT` / `CANCELED` / `IN_PROGRESS`（task 未终态） | 不读 `entryStatus`，逐条置 `RPC_TIMEOUT` / `INTERNAL_ERROR` |
+
 ## 3.3 shard-3：配置（`kvclient_config`）
 
 **环境变量**（沿用 `Environ::ReadOr` 模式，`kvcs_capi_driver.cpp:39-75`）：
