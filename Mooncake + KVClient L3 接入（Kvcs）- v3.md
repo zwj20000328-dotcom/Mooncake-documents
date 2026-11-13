@@ -1,6 +1,6 @@
 # Mooncake + KVClient L3 接入设计方案
 
-版本：v3.2　更新日期：2026-11-12
+版本：v3.3　更新日期：2026-11-13
 
 ---
 
@@ -19,7 +19,7 @@ L3 当前的 `DistributedStorageBackend` 已支持 `hf3fs` / `posix` / `oss` / `
 | 内容 | 落地位置 |
 | --- | --- |
 | key 映射：XXH64 单 seed → 8B `kv::BinaryKey`，再包成 `kv::CacheKey::FromBytes(...)`；value 就是原始 N 字节。`EncodeKey` 作为 `KvClientObjectStorageAdapter` 的私有方法 | §3.1（§3.4） |
-| 数据面**按 512B 对齐**：注册区间、对象槽位、线格式长度全部 512B 对齐（对象在 buffer 中占 `AlignUp(N,512)`，写路径尾部补零、读路径尾部忽略）。**原 buffer 的注册与读写全部在 `KvClientObjectStorageAdapter` 内完成**：首次 I/O 惰性注册并缓存句柄（LRU 淘汰），命中即零拷贝直读直写；不连续或注册失败时回退 staging | §3.2.3（§3.4） |
+| 数据面**只有零拷贝一条路径**，且按 512B 对齐：注册区间、对象槽位、线格式长度全部 512B 对齐（对象在 buffer 中占 `AlignUp(N,512)`，写路径尾部补零、读路径尾部忽略）。**原 buffer 的注册与读写全部在 `KvClientObjectStorageAdapter` 内完成**：首次 I/O 惰性注册后常驻、不淘汰，按地址包含关系查句柄（同步 ASUStore 的持久注册模型）；不连续、未对齐或注册失败一律**返回错误**，不回退 staging | §3.2.3（§3.4） |
 | SDK 侧 string key 哈希（`CacheKey::FromEngineKey`）**为预留能力，本方案不使用**。key 由 Mooncake 侧 XXH64 算好后以 `FromBytes` 传入。 | §3.1（SFMEA-26、SFMEA-39） |
 | 只增加 `UsesKvClient()`，与 `UsesKvcs()` **平级**；不引入 `UsesManagedKvStorage()`。 | §3.3（§3.5、§3.6） |
 | 双副本（memory + ASU）硬逻辑：ASU 写失败 → 整个 Put 失败 + memory 副本一起 revoke。 | §3.5 |
@@ -75,8 +75,8 @@ flowchart TB
         TE["TransferWrite / TransferRead<br/>Transfer Engine / memcpy"]
         B["DistributedStorageBackend<br/>BatchWrite / BatchRead / BatchDeleteObjects<br/>长度校验"]
         O["ObjectStorageAdapter<br/>按逻辑 key 读写"]
-        K["KvClientObjectStorageAdapter<br/>key 编码<br/>提交与完成等待、结果转换"]
-        REG["注册缓存（适配器内）<br/>addr → MRHandle<br/>在途计数、tainted 区间"]
+        K["KvClientObjectStorageAdapter<br/>key 编码、注册与零拷贝读写<br/>提交与完成等待、结果转换"]
+        REG["持久注册表（适配器内）<br/>addr → MRHandle<br/>地址包含查找"]
         SDK["KVClient<br/>CacheKey 路由、Host RDMA"]
 
         A <-->|"Put / Get / Remove"| R
@@ -86,7 +86,7 @@ flowchart TB
         C <-->|"读写：key + 描述符 + CPU slices<br/>删除：key"| B
         B <-->|"PutBatch / GetBatch / DeleteBatch"| O
         O <--> K
-        K <-->|"查缓存 / 惰性注册 / 直传调用方地址"| REG
+        K <-->|"查表 / 首次 I/O 注册"| REG
         K <-->|"内存注册 / 批量提交 / 完成等待"| SDK
     end
 
@@ -121,8 +121,8 @@ flowchart TB
 | `DistributedStorageBackend` | slices → 对象请求转换、长度校验 | 仅新增 `UsesKvClient()` 组合判断 |
 | `ObjectStorageAdapter` | 对象存储统一契约 | **零改动**（接口不变） |
 | `KvcsObjectStorageAdapter` | KVCS 后端实现 | **零改动**（与 KVClient 平级，互不影响） |
-| `KvClientObjectStorageAdapter` | KVClient 后端实现：key 编码、惰性注册、快路径判定、staging 兜底、提交与完成等待 | **新增**；原 buffer 的注册与读写都在适配器内完成（§3.2.3） |
-| `RegionRegistry` | 适配器内的惰性注册缓存：`addr → MRHandle` 查找、LRU 淘汰、在途计数、tainted 区间 | **新增** |
+| `KvClientObjectStorageAdapter` | KVClient 后端实现：key 编码、原 buffer 注册、零拷贝读写、提交与完成等待 | **新增**；注册与读写都在适配器内完成（§3.2.3） |
+| `RegionRegistry` | 适配器内的**持久**注册表：`addr → MRHandle` 的地址包含查找，注册一次常驻至关闭 | **新增** |
 
 ### 2.1.2 Client 侧类图
 
@@ -181,34 +181,23 @@ classDiagram
     class KvClientObjectStorageAdapter["KvClientObjectStorageAdapter（新增）"] {
         -kv_client_
         -region_registry_
-        -staging_region_
-        -staging_slot_stride_
-        -staging_states_
-        -canonical_handle_
         +Init()
         +PutV(key, iov, iovcnt)
         +PutBatch(requests)
         +GetBatch(requests)
         +DeleteBatch(keys)
         -EncodeKey(logical_key)
-        -TryPlanFastPath(iov, object_size, is_store)
-        -AcquireHandle(addr, len)
-        -EvictRegistrations(need_bytes)
-        -RegisterStagingRegion()
-        -AcquireSlot(wire_len)
-        -ReleaseSlot(slot)
-        -QuarantineSlot(slot)
-        -Taint(region, addr, wire_len)
-        -SubmitAndWait(is_store, entries, owners, results)
+        -PlanIo(iov, object_size, is_store)
+        -SubmitAndWait(is_store, entries, plans, results)
     }
 
     class RegionRegistry["RegionRegistry（新增，适配器私有）"] {
         -regions_
-        +Acquire(addr, len, handle)
-        +Find(addr, len)
-        +EvictLru(need_bytes)
+        +FindPersistentHandle(addr, len)
+        +Add(region, handle)
         +ReleaseAll()
         +IsTainted(region, addr, len)
+        +Taint(region, addr, len)
         +Taint(region, addr, len)
     }
 
@@ -249,8 +238,8 @@ classDiagram
 | `FileStorage` | 修改构造时的 DFS 启用判断，将 KVClient 后端注入 Client；沿用现有初始化入口 |
 | `Client` | `ReconcileMissingKvcsReplica()` 推广为图中的 `ReconcileMissingKvReplica()`；**内存注册不经过 Client** |
 | `DistributedStorageBackend` | 读写路径已由 `UsesObjectStorage()` 抽象化；仅新增 `UsesKvClient()` 组合判断，不参与注册 |
-| `ObjectStorageAdapter` | **零改动**。同步契约（payload 须在返回前保持有效）是 staging 兜底与零拷贝快路径共同的前提 |
-| `RegionRegistry` | **新增，适配器私有**。惰性注册缓存的 `addr → MRHandle` 包含关系查找、LRU 淘汰、在途计数、tainted 区间；不暴露到任何接口（§3.2.3） |
+| `ObjectStorageAdapter` | **零改动**。同步契约（payload 须在返回前保持有效）是零拷贝路径成立的前提 |
+| `RegionRegistry` | **新增，适配器私有**。注册一次常驻的 `addr → MRHandle` 地址包含查找（同 ASUStore `FindPersistentHandle`）；不暴露到任何接口（§3.2.3） |
 | `kv::KvClient` | **SDK 不改**。只用 `StoreAsync` / `LoadAsync` / `DeleteAsync` / `QueryAsync` 四个公共方法——SDK 不暴露 `Batch*Async`；`StoreAsync` / `LoadAsync` 按 `entries.size() > 1 \|\| useBatchIoForSingleKey`（默认 true，故单条也走 `BATCH_*`）内部选择 opcode，适配器无需关心。四个方法均带 `const kv::IoOptions& options = {}`；本方案不填 `kvns`、不用 `prerequisite`（见 §3.2.1） |
 
 ### 2.1.3 Master 侧类图
@@ -360,7 +349,7 @@ flowchart TB
         W["⑥ WriteDfsReplicas<br/>构造 key + 描述符 + CPU slices"]
         B["DistributedStorageBackend::BatchWrite<br/>校验总长度等于 object_size"]
         O["KvClientObjectStorageAdapter::PutBatch<br/>EncodeKey + 补零到 aligned_size"]
-        D["⑦ staging Acquire → memcpy<br/>StoreAsync → Wait → Release/Quarantine"]
+        D["⑦ PlanIo → 注册/查表 → 清零尾部<br/>StoreAsync → Wait → 复用或 taint"]
         J{"⑧ Client 逐 key 汇总<br/>AllAllocatedTransfersSucceeded?<br/>memory 与 dfs 均成功且零失败"}
         END["⑨ MasterClient::PutEnd<br/>key、对象校验和、ALL"]
         REVOKE["⑨ MasterClient::PutRevoke<br/>key、ALL"]
@@ -425,7 +414,7 @@ flowchart TB
         SELECT["④ Client 按入口策略选择副本<br/>本图选中 COMPLETE DFS"]
         READ["⑤ ReadDfsReplica<br/>key + DFS 描述符 + CPU 目标 slices"]
         B["DistributedStorageBackend::BatchRead<br/>size = desc.object_size<br/>校验 slice 容量 >= object_size"]
-        D["⑥ KvClientObjectStorageAdapter::GetBatch<br/>staging Acquire → LoadAsync → Wait<br/>→ memcpy 前 N 字节回原目标 buffer"]
+        D["⑥ KvClientObjectStorageAdapter::GetBatch<br/>PlanIo → LoadAsync → Wait<br/>设备直接写入原目标 buffer"]
         VERIFY["⑦ 确认完整读取 object_size 字节<br/>数据已写入原目标 buffer"]
         CHECK["⑧ Client 检查结果<br/>对象校验和、IsLeaseExpired"]
         MISS["⑨ 明确 NotFound<br/>携带本次观察到的 ReplicaID<br/>请求条件清理 DFS 记录"]
@@ -570,7 +559,7 @@ flowchart TB
 
 ### 2.3.1 初始化阶段
 
-初始化在 `CreateStorageBackend` 工厂内创建适配器，随后由后端 `Init()` 触发 SDK 连接与 staging region 注册。**注册是一次性的**，整个适配器生命周期只注册一个大 region。
+初始化在 `CreateStorageBackend` 工厂内创建适配器，随后由后端 `Init()` 触发 SDK 连接。**`Init` 不注册任何内存**：原 buffer 由首次 I/O 惰性注册并常驻。
 
 ```mermaid
 sequenceDiagram
@@ -595,20 +584,16 @@ sequenceDiagram
     AD->>SDK: Init(cfg)
     SDK-->>AD: Status
     AD->>AD: PreflightSharedProvider()<br/>sharedProviderMode == SHARED ?
-    AD->>AD: RegisterStagingRegion(region_bytes, max_slot_bytes)
-    AD->>SDK: RegisterRegions(单个大 region)
-    SDK-->>AD: RegisteredMemory{handle, tokenId}
-    AD->>AD: 记录 canonical handle<br/>按 512B 对齐切分 slot 位图
     AD-->>BE: OK
     BE-->>FS: backend
     FS->>RC: Client::SetDfsStorageBackend(backend)
 ```
 
-**注册表初始为空**：`RegionRegistry` 不参与 `Init`，由适配器在首次 I/O 时惰性注册并缓存；首次请求因此多一次注册开销。注册失败时该请求回退 staging，功能不受影响（§3.2.3）。
+**注册表初始为空**：`RegionRegistry` 不参与 `Init`，由适配器在首次 I/O 时注册并**常驻到关闭**（同步 ASUStore 的 `persistentRegions_` 模型，不淘汰）。首次请求因此多一次 `RegisterRegions` 开销；注册失败则该请求**直接失败**，不回退 staging（§3.2.3）。
 
 ### 2.3.2 写入阶段
 
-写路径分两条：命中**快路径**（已注册、单段连续、槽位 512B 对齐、未 tainted）时直接把调用方地址填进 `KVBuffer`，只清零尾部 `[N, wire_len)`，不拷贝 payload；否则回退 **staging**（拷入 slot 并补零到 `wire_len`）。两条路径随后共用同一套提交与结果处理：按对象边界切批后一次性提交 `StoreAsync`，再 `Wait` 完成；task 终态为 `OK` / `PARTIAL_FAILED` 时逐条映射 `entryStatus`，并**按每条 entry 的状态**处置其 buffer（快路径 taint 区间、兜底路径 quarantine slot）；task 本身为非终态时整批置错并处置全部 buffer。
+写路径只有一条：`PlanIo` 先校验长度、连续性与槽位对齐，再按地址包含关系查注册表（未命中则注册一次并常驻），然后把调用方地址直接填进 `KVBuffer`，只清零尾部 `[N, wire_len)`，不拷贝 payload。**不连续、槽位未 512B 对齐、区间已 tainted 或注册失败一律返回错误，不回退 staging。** 随后按对象边界切批，一次性提交 `StoreAsync`，再 `Wait`；task 终态为 `OK` / `PARTIAL_FAILED` 时逐条映射 `entryStatus`，`TIMEOUT` / `CANCELED` / `IN_PROGRESS` 的条目 taint 其区间。
 
 ```mermaid
 sequenceDiagram
@@ -625,16 +610,11 @@ sequenceDiagram
     loop 每个请求
         AD->>AD: EncodeKey(logical_key) → BinaryKey<br/>CacheKey::FromBytes(...)<br/>校验 iov 非空、同批重复 key 拒绝
         AD->>AD: n = Σiov_len；wire_len = AlignUp(n,512)<br/>校验 wire_len <= 16776704
-        AD->>AD: TryPlanFastPath(iov, n, is_store=true)<br/>缓存未命中则惰性 RegisterRegions
-        alt 命中：已缓存或本次注册成功 & 单段连续 & 槽位 512B 对齐 & 未 tainted
-            AD->>AD: owner = RegionRange<br/>region.inflight++<br/>memset 尾部 [n, wire_len) 补零<br/>KVBuffer{key, addr, wire_len, handle, offset=0}
-        else 未命中，回退 staging
-            AD->>AD: AcquireSlot(wire_len)
-            alt staging 耗尽
-                AD->>AD: results[i] = NO_AVAILABLE_HANDLE（不阻塞等待）
-            else 成功
-                AD->>AD: owner = Slot{ptr, wire_len, index}<br/>memcpy(iov → slot.ptr)<br/>memset 尾部 [n, wire_len) 补零
-            end
+        AD->>AD: PlanIo：单段连续？槽位 512B 对齐？<br/>FindPersistentHandle（未命中则 RegisterRegions 后常驻）
+        alt 全部满足
+            AD->>AD: region.inflight++<br/>memset 尾部 [n, wire_len) 补零<br/>KVBuffer{key, addr, wire_len, handle, offset=0}
+        else 不连续 / 未对齐 / 已 tainted / 注册失败
+            AD->>AD: results[i] = INVALID_PARAMS 或 DFS_SERVICE_UNAVAILABLE
         end
     end
     AD->>AD: 按 110 切批（不切开单个对象）<br/>记录 originalIndices
@@ -643,18 +623,17 @@ sequenceDiagram
     SDK->>S: Host RDMA write（buffer.region.size = wire_len）
     SDK-->>AD: 提交结果
     alt 提交失败（含 key 解析失败，整批同步失败）
-        AD->>AD: Slot: ReleaseSlot(全部)<br/>Region: inflight--（未触达设备）
+        AD->>AD: inflight--（未触达设备）
         AD-->>BE: 逐项错误
     else 已受理
         AD->>SDK: Wait(taskId, timeoutMs, result)
         alt task status = OK / PARTIAL_FAILED（终态，entryStatus 逐条可信）
             SDK-->>AD: TaskResult{status, entryStatus[]}
             AD->>AD: 逐项映射 entryStatus → ErrorCode<br/>PARTIAL_FAILED 不整批置错
-            AD->>AD: 逐条处置 buffer（看 entry，不看 task）<br/>TIMEOUT/CANCELED/IN_PROGRESS → Slot: Quarantine / Region: Taint<br/>其余 → Slot: Release / Region: inflight--
+            AD->>AD: 逐条处置（看 entry，不看 task）<br/>TIMEOUT/CANCELED/IN_PROGRESS → Taint(range)<br/>其余 → inflight--
         else TIMEOUT / CANCELED / IN_PROGRESS
             Note over AD: ⚠️ 禁止读 entryStatus（初值 OK，假成功）
-            AD->>AD: Slot: QuarantineSlot(全部)<br/>Region: Taint(全部区间)<br/>永不归还、永不注销
-            AD->>AD: 逐项置 RPC_TIMEOUT / INTERNAL_ERROR
+            AD->>AD: Taint(全部区间)；逐项置 RPC_TIMEOUT / INTERNAL_ERROR
         end
         AD-->>BE: 逐项 expected
     end
@@ -664,7 +643,7 @@ sequenceDiagram
 
 ### 2.3.3 读取阶段
 
-读路径与写路径对称：命中快路径时设备直接写入调用方 buffer（槽位容量为 `AlignUp(N,512)`，尾部写在同一槽位内）；否则取 staging slot 承接设备写入，`Wait` 完成后只把前 N 字节 memcpy 回调用者 buffer。明确 `NOT_FOUND` 触发 miss 清理；超时则处置 buffer（slot quarantine / 区间 taint）且**不**触发清理。
+读路径与写路径对称：设备直接写入调用方 buffer 的 512B 槽位（容量 `AlignUp(N,512)`，尾部写在同一槽位内，调用方只取前 N 字节）。不连续、未对齐、已 tainted 或注册失败一律返回错误。明确 `NOT_FOUND` 触发 miss 清理；超时则 taint 区间且**不**触发清理。
 
 ```mermaid
 sequenceDiagram
@@ -681,11 +660,11 @@ sequenceDiagram
     BE->>AD: GetBatch(ObjectGetRequest{key, buffer, N})
     loop 每个请求
         AD->>AD: EncodeKey(logical_key) → BinaryKey<br/>CacheKey::FromBytes(...)<br/>wire_len = AlignUp(N,512)
-        AD->>AD: TryPlanFastPath(slices, N, is_store=false)<br/>缓存未命中则惰性 RegisterRegions
-        alt 命中：已缓存或本次注册成功 & 单段连续 & 槽位 512B 对齐 & 未 tainted
-            AD->>AD: owner = RegionRange<br/>region.inflight++<br/>KVBuffer{key, 调用方 addr, wire_len, handle, offset=0}
-        else 未命中，回退 staging
-            AD->>AD: AcquireSlot(wire_len) → owner = Slot{ptr, wire_len}
+        AD->>AD: PlanIo：单段连续？槽位 512B 对齐？<br/>FindPersistentHandle（未命中则 RegisterRegions 后常驻）
+        alt 全部满足
+            AD->>AD: region.inflight++<br/>KVBuffer{key, 调用方 addr, wire_len, handle, offset=0}
+        else 不连续 / 未对齐 / 已 tainted / 注册失败
+            AD->>AD: results[i] = INVALID_PARAMS 或 DFS_SERVICE_UNAVAILABLE
         end
     end
     AD->>SDK: LoadAsync(entries, taskId)<br/>buffer.region.size = wire_len
@@ -694,22 +673,21 @@ sequenceDiagram
     alt task status = OK / PARTIAL_FAILED（终态，entryStatus 逐条可信）
         SDK-->>AD: entryStatus[]（逐 key）
         alt entryStatus = OK
-            AD->>AD: 兜底：memcpy(slot.ptr → 调用方 buffer, **仅前 N 字节**)<br/>快路径：无需拷贝
-            AD->>AD: Slot: ReleaseSlot / Region: inflight--
+            AD->>AD: 设备已直接写入调用方 buffer；inflight--
             AD-->>BE: expected<size_t>(**N**)
             BE->>BE: 校验 *result == request.size(=N)<br/>（双层：BE :838-841 + 适配器）
         else entryStatus = ENTRY_KEY_NOT_FOUND
-            AD->>AD: Slot: ReleaseSlot / Region: inflight--（不 taint）
+            AD->>AD: inflight--（不 taint）
             AD-->>C: 逐 key OBJECT_NOT_FOUND
             C->>C: ReconcileMissingKvReplica(key, ReplicaID)
         else entryStatus = TIMEOUT / CANCELED
-            AD->>AD: Slot: QuarantineSlot / Region: Taint(range)（设备可能仍在写）
+            AD->>AD: Taint(range)（设备可能仍在写）；inflight--
             AD-->>C: RPC_TIMEOUT / INTERNAL_ERROR
             Note over C: 元数据保留，不触发清理
         end
     else TIMEOUT / CANCELED / IN_PROGRESS
         Note over AD: 禁止读 entryStatus
-        AD->>AD: Slot: QuarantineSlot(全部) / Region: Taint(全部区间)
+        AD->>AD: Taint(全部区间)
         AD-->>C: RPC_TIMEOUT / INTERNAL_ERROR
         Note over C: 元数据保留，不触发清理
     end
@@ -717,7 +695,7 @@ sequenceDiagram
 
 ### 2.3.4 删除阶段
 
-删除只传 key、不传 buffer，因此不涉及 staging，也没有 quarantine 风险。value 删除成功（含幂等 `NOT_FOUND`）的 key 才进入元数据删除集合；失败项两者同时保留，可安全重试。
+删除只传 key、不传 buffer，因此不涉及注册与 buffer 处置。value 删除成功（含幂等 `NOT_FOUND`）的 key 才进入元数据删除集合；失败项两者同时保留，可安全重试。
 
 ```mermaid
 sequenceDiagram
@@ -790,7 +768,7 @@ sequenceDiagram
 
 ### 2.3.6 关闭阶段
 
-关闭必须先排空在途操作再注销全部 region：staging region 与 `RegionRegistry` 缓存的区间都要注销。quarantine 的 slot 与 tainted 区间都表示「设备可能仍可访问」，`InUseSlots()` 或区间在途计数非零即为泄漏信号，需显式告警。
+关闭必须先排空在途操作再注销全部注册区间。tainted 区间表示「设备可能仍可访问」，区间在途计数非零即为泄漏信号，需显式告警。
 
 ```mermaid
 sequenceDiagram
@@ -801,18 +779,17 @@ sequenceDiagram
     Note over AD: 析构 / Shutdown
     AD->>AD: 停止接受新提交
     AD->>SDK: Drain / 等待 in-flight task 结束
-    AD->>AD: 检查 InUseSlots() == 0 且全部区间 inflight == 0 ?
+    AD->>AD: 检查全部区间 inflight == 0 ?
     alt 仍有占用
-        AD->>AD: LOG(ERROR) 泄漏告警<br/>列出 quarantined / tainted 字节数
+        AD->>AD: LOG(ERROR) 泄漏告警<br/>列出 tainted 字节数
     else 已排空
         AD->>AD: 继续
     end
-    AD->>SDK: UnregisterRegions(staging canonical handle)
     AD->>SDK: UnregisterRegions(注册表中全部区间 handle)
     AD->>SDK: Shutdown()
 ```
 
-**说明**：staging region 不逐个注销，随 canonical handle 统一释放；`RegionRegistry` 中的缓存区间按 handle 逐个注销。区间注册与注销都由适配器负责，上层无感知。`QuarantinedBytes()` / `TaintedBytes()` 非零是**泄漏或降级指标**，需在关闭日志中显式输出。
+**说明**：注册区间按 handle 逐个注销，注册与注销都由适配器负责，上层无感知。`TaintedBytes()` 非零表示有区间因超时被降级，需在关闭日志中显式输出。
 
 ## 2.4 SFMEA 分析
 
@@ -822,15 +799,14 @@ sequenceDiagram
 | --- | --- | --- | --- | --- |
 | SFMEA-01 | logical key XXH64 碰撞：两个不同 key 映射到同一 CacheKey | **数据损坏**：后写覆盖先写，读到错 value。默认（`MOONCAKE_STORE_CHECKSUM` 关闭）无从发现；开启后 Get 端以 `CHECKSUM_MISMATCH` 暴露，但 Put 侧仍是覆盖写、不报错 | 不做 fingerprint（默许碰撞）；可复用既有 object checksum 作为检测手段；部署文档须写明 key 数量级上限 | 缩小 seed 空间强制构造碰撞。概率 ≈ n²/2^65：10^8 key → 2.7e-4，10^9 → 2.7% |
 | SFMEA-02/03 | 非法 logical key：为空，或同批内重复 | 空 key 无法编码；同批重复会让同一 CacheKey 在一个 task 内冲突，SDK 行为未定义 | `EncodeKey` 拒空（`INVALID_PARAMS`）；写侧拒绝同批重复，读/查/删去重后 fan-out | 去重需在新适配器内自行实现（可参照 `kvcs_object_storage_adapter.cpp:144-147`） |
-| SFMEA-04 | 未按 `AlignUp(N,512)` 补零，直接把 N 当作线格式长度（`buffer.region.size`） | 提交被拒或行为未定义；slot 复用时把上次 I/O 的残留数据发到存储侧 | `wire_len = AlignUp(n, 512)`，`Acquire(wire_len)`，尾部 `[n, wire_len)` 显式 `memset` 补零 | 写 513 字节对象，断言 `buffer.region.size == 1024` 且尾部全 0。N 非 512 倍数是**合法输入**，故障在补零遗漏 |
+| SFMEA-04 | 未按 `AlignUp(N,512)` 补零：直接把 N 当作线格式长度，且未清零尾部 | 提交被拒或行为未定义；槽位里上一次 I/O 的残留字节会被发到存储侧 | `wire_len = AlignUp(n, 512)`；写路径显式 `memset` 尾部 `[n, wire_len)` | 写 513 字节对象，断言 `buffer.region.size == 1024` 且尾部全 0。N 非 512 倍数是**合法输入**，故障在补零遗漏 |
 | SFMEA-05/06 | 长度非法：N > 16,776,704，或 N == 0 | 超限会被 `PackSqe` 本地拒绝，预发送失败 **abort 整个 transport task**（`trans_task_executor.cc:227-232`）；N == 0 不被 SDK 接受 | 适配器逐请求预检 `wire_len <= kKvClientMaxValueBytes` 且 `n > 0`；Master `PrepareWriteStart` 第一道校验 | 不能指望「只失败超限那条」。Master 那道必需：`kMaxSliceSize`（16,777,200）更宽且只在 CACHELIB 下生效 |
-| SFMEA-07/08 | 初始化门禁失败：`sharedProviderMode != SHARED`，或 `RegisterRegions` 失败 | 前者在 INDEPENDENT 下 SDK 会为每个 ASU 节点 `BindMemory` 全部已注册区域，而 AICPU 的 `BindMemory` 只接受 `MEM_DEVICE` → **非空 view 下注册必然 PARTIAL_FAILED**；后者无 staging 内存，所有 I/O 不可用 | `Init()` 中 `PreflightSharedProvider` 硬门禁（缺省或为 0 直接 `DFS_SERVICE_UNAVAILABLE`）；注册失败则 `Init()` → `FileStorage::Init` 明确失败 | 必须在 Init 阶段失败而非运行期；注册部分成功时 SDK 已自行回滚 |
-| SFMEA-09 | staging slot 耗尽 | 新 I/O 无法分配 slot | 逐项返回 `NO_AVAILABLE_HANDLE`，**不阻塞等待**；在日志中记录 | 不可 fail-silent：读路径静默失败会永久不可诊断 |
-| SFMEA-10/11 | 提交前 buffer 元数据不合法：`buffer.handle` 与预期不符，或调用方自填 `mrKey` | 非 0 但未注册的 handle 在提交阶段**不报错**，到 Wait 才以 `BUFFER_NOT_REGISTERED` 暴露且**连坐整 task**；`mrKey` 由 SDK 回填，自填值无效 | 提交前按 owner 预检：staging 条目**精确等于** canonical handle，快路径条目精确等于注册表 handle（都不接受「非 0 即可」）；`mrKey` 一律留 `std::nullopt` | 两套注册（TE / SDK）并存，不能用「非 0」近似 |
-| SFMEA-12 | `Wait` 超时，设备仍在访问 staging | 若归还 slot 并被复用 → 设备写入他人数据 = **数据损坏** | slot **quarantine**：永不归还、永不注销，直到排空；超时后不再触碰该 slot | **承重组件，不可裁剪**。SDK 无面向业务的中止能力：`Cancel` 只由 `Shutdown` 调用，且只放弃任务、不停设备（`kv_transport_impl.cc:196-201`） |
+| SFMEA-07/08 | 初始化门禁失败：`sharedProviderMode != SHARED`，或 SDK `Init` 失败 | 前者在 INDEPENDENT 下 SDK 会为每个 ASU 节点 `BindMemory` 全部已注册区域，而 AICPU 的 `BindMemory` 只接受 `MEM_DEVICE` → **非空 view 下注册必然 PARTIAL_FAILED**；后者适配器不可用 | `Init()` 中 `PreflightSharedProvider` 硬门禁（缺省或为 0 直接 `DFS_SERVICE_UNAVAILABLE`）；SDK `Init` 失败则适配器 `Init` 失败 | 必须在 Init 阶段失败而非运行期 |
+| SFMEA-10/11 | 提交前 buffer 元数据不合法：`buffer.handle` 为空或与注册表不符，调用方自填 `mrKey`，或区间未注册 | 非 0 但未注册的 handle 在提交阶段**不报错**，到 Wait 才以 `BUFFER_NOT_REGISTERED` 暴露且**连坐整 task**；`mrKey` 由 SDK 回填，自填值无效 | handle 一律取自 `RegionRegistry`，提交前预检非空且属于本适配器；未注册区间直接在建 plan 阶段失败；`mrKey` 一律留 `std::nullopt` | 注册经 SDK 完成，不接受调用方传入的 handle |
+| SFMEA-12 | `Wait` 超时，设备仍在访问调用方 buffer | 缓冲区被复用 → 设备写入新数据 = **数据损坏** | 该区间标记为 tainted，后续重叠请求**直接失败**；tainted 常驻到进程重启（注册不淘汰） | **承重**。SDK 无面向业务的中止能力：`Cancel` 只由 `Shutdown` 调用，且只放弃任务、不停设备（`kv_transport_impl.cc:196-201`） |
 | SFMEA-13 | 超时后读 `entryStatus` | 初值是 `Status::OK()`，`BuildResult` 在 `!Done()` 时原样返回 → **假成功**，数据未落盘却报成功 | 仅 `OK` / `PARTIAL_FAILED` 两个可信终态下映射 `entryStatus`；`TIMEOUT` / `CANCELED` / `IN_PROGRESS` 或本地 `Wait` 非 OK 时**不读**，整批置错 | 必须有专门用例覆盖，否则极易回归 |
-| SFMEA-14 | task 级 `PARTIAL_FAILED`，逐项 entryStatus 部分失败 | 部分 key 成功部分失败 | 逐项映射 entryStatus → ErrorCode 并按 `originalIndices` 回填；slot 按 **entry status** 处置：业务错误 → Release，`TIMEOUT` / `CANCELED` / `IN_PROGRESS` → Quarantine | entryStatus 与输入严格一一对应；task 终态**不等于**可安全归还（SFMEA-40） |
-| SFMEA-15/16 | 派发阶段失败：已派发后 `CANCELED`，或路由失败（`routed asu transport not found`） | `CANCELED` 时设备可能已接触 buffer；路由失败时未触达设备 | `CANCELED` → quarantine slot / taint 区间；路由失败 → Release / `inflight--` | 两者都发生在提交阶段，但 buffer 安全性相反，**不能合并处置** |
+| SFMEA-14 | task 级 `PARTIAL_FAILED`，逐项 entryStatus 部分失败 | 部分 key 成功部分失败 | 逐项映射 entryStatus → ErrorCode 并按 `originalIndices` 回填；区间按 **entry status** 处置：业务错误 → `inflight--`，`TIMEOUT` / `CANCELED` / `IN_PROGRESS` → `Taint` | entryStatus 与输入严格一一对应；task 终态**不等于**可安全复用（SFMEA-40） |
+| SFMEA-15/16 | 派发阶段失败：已派发后 `CANCELED`，或路由失败（`routed asu transport not found`） | `CANCELED` 时设备可能已接触 buffer；路由失败时未触达设备 | `CANCELED` → `Taint`；路由失败 → `inflight--` | 两者都发生在提交阶段，但 buffer 安全性相反，**不能合并处置** |
 | SFMEA-17/19/31 | 设备侧资源/连接错误：`CQE_OUT_OF_CREATE_SIZE`、`CONNECTION_ERROR`、存储空间耗尽 | 写入或读取失败；无容量查询与自动回收 | 分别映射为 `NO_AVAILABLE_HANDLE` / `DFS_SERVICE_UNAVAILABLE`；Master 不建 capacity provider | 无容量接口 → 只能事后失败；容量管理留待 SDK |
 | SFMEA-18 | `CQE_KEY_NOT_EXIST` / `ENTRY_KEY_NOT_FOUND`（读时） | 对象在存储侧不存在 | 映射为 `OBJECT_NOT_FOUND` → 触发 `ReconcileMissingKvReplica` 条件清理 | **必须与超时严格区分**：超时**不**触发清理 |
 | SFMEA-20/21/24 | 删除中间态：value 已删而元数据残留（Master `BatchRemove` 失败 / `CheckRemovable` 拒绝 / Client 崩溃） | 已发布对象不可读；`CheckRemovable` 拒绝时对象仍受租约保护，元数据不会被判为失效 | 后续读取返回 `NOT_FOUND` → miss 自愈清理 DFS 记录；无 pending-delete 持久化队列 | 已知窗口：语义安全（不返回错数据），但会丢已成功 Put 的数据。value-first 依赖 miss 清理，二者必须同时落地 |
@@ -840,16 +816,15 @@ sequenceDiagram
 | SFMEA-26/27 | 不支持元数据恢复：Master 重启（默认无 HA），或误配 `enable_oplog=true` | 重启后目录全丢、L3 value 不可发现；误配时恢复门会在 HA 切换时拒绝所有 DFS 描述符 | 检测到 `enable_oplog` 即启动期 `LOG(FATAL)`；恢复门保持 `use_kvcs_` only，**不改** | 把运行期失效提前到启动期；运维须知晓无恢复能力 |
 | SFMEA-28 | 三副本 `memory + nof + ASU` | `dfs > 0` 时 `FLEXIBLE_DUAL_REPLICA` 不可达（`replica.h:315-318`）→ 静默落入 RELIABLE，**nof 变为必需**，nof 抖动导致整 Put 失败 | `PrepareWriteStart` 显式拒绝 `INVALID_PARAMS` | 有意与 KVCS 不对称：把运行期惊喜变成启动期可发现约束 |
 | SFMEA-30 | miss 清理 CAS 不匹配（读到 R1，目录已是 R2） | 无 | `EvictDiskReplicaIfCurrent` 返回 false，R2 原样保留（`master_service.cpp:6463-6473`） | 既有 CAS 语义，仅需放宽白名单 |
-| SFMEA-32 | `Shutdown` 时仍有 in-flight task | 注销 region 会导致设备访问已注销内存 | 先 `Drain` 排空，再断言 `InUseSlots()==0` 且各区间 `inflight==0`，非零则 `LOG(ERROR)` 并输出 `QuarantinedBytes()` / `TaintedBytes()` | staging region 与注册区间分别注销 |
+| SFMEA-32 | `Shutdown` 时仍有 in-flight task | 注销 region 会导致设备访问已注销内存 | 先 `Drain` 排空，再断言各区间 `inflight==0`，非零则 `LOG(ERROR)` 并输出 `TaintedBytes()` | 注册区间在 Shutdown 统一注销 |
 | SFMEA-33 | 读回长度 != `object_size` | 数据不完整 | 双层校验：适配器内 + `DistributedStorageBackend:838-841`，返回 `FILE_READ_FAIL` | `GetBatch` 必须返回 **N**（= `object_size`）而非 `wire_len`，否则每次读取都误报 |
-| SFMEA-37/39 | 启用 string key 路径的连带风险：`Resolve()` 提交阶段失败，或共用配置写了 `inference.engine=vllm_ascend` | 前者让整批同步失败（`taskId` 无效、返回 `INVALID_ARGUMENT`）；后者把 `@...@<数字>` 结尾的 key 静默重解释为分层 key（identity 截断 + `baseOffset`），**读写落到错误的 key/offset 且不报错** | 本方案只传 `FromBytes`（解析直接返回原值、恒成功），并在 `Init` 前把 `keyResolution` 复位为 `GENERIC`；提交阶段同步失败统一 Release 全部 slot（与 SFMEA-16 同路） | 换用 `FromEngineKey` 前这两道必须保留，并补解析失败用例 |
+| SFMEA-37/39 | 启用 string key 路径的连带风险：`Resolve()` 提交阶段失败，或共用配置写了 `inference.engine=vllm_ascend` | 前者让整批同步失败（`taskId` 无效、返回 `INVALID_ARGUMENT`）；后者把 `@...@<数字>` 结尾的 key 静默重解释为分层 key（identity 截断 + `baseOffset`），**读写落到错误的 key/offset 且不报错** | 本方案只传 `FromBytes`（解析直接返回原值、恒成功），并在 `Init` 前把 `keyResolution` 复位为 `GENERIC`；提交阶段同步失败统一 `inflight--`（与 SFMEA-16 同路） | 换用 `FromEngineKey` 前这两道必须保留，并补解析失败用例 |
 | SFMEA-38 | 全零 `CacheKey` | 协议层 `INVALID_ARGUMENT`（`kv_protocol.cc` 的 `IsCacheKeyAllZero`），预发送失败会 abort 整个 transport task | `EncodeBinaryKey` 内把全零结果替换为非零常量（概率 2^-64，但不值得留窗口） | 与 SFMEA-05 同一 abort 机制 |
-| SFMEA-40 | 传输层 deadline 到期，以 **`PARTIAL_FAILED` + 逐条 `TIMEOUT`** 的形式返回（`trans_task_executor.cc:390-401` → `trans_task_manager.cc:35-41`）；`TransportTaskExecutor::Cancel` 同样只放弃任务、不停设备（`:258-275`） | 若按 **task status** 处置 slot（把 `PARTIAL_FAILED` 当「可安全归还」）→ 设备仍在写的内存被放回 free list → **静默数据损坏** | slot 处置只看 **entry status**：`TIMEOUT` / `CANCELED` / `IN_PROGRESS` → quarantine，其余 → release（§3.2.2 裁决表） | **承重**：`PARTIAL_FAILED` 既可能来自设备逐条报错（可归还），也可能来自 deadline（不可归还），二者在 task status 上无法区分。用例 T-57 |
-| SFMEA-41 | SDK 配置的 transport deadline 小于适配器 `Wait` 超时：`waitTimeoutMs` 同时写 `defaultWaitTimeoutMs` 与 `timeoutMs`（`config_utils.cc:183-186`），后者进 `transportConfig.timeoutMs`（`:273`）；默认 `timeoutMs` 仅 100 ms | 健康但较慢的写（尤其 16 MiB 大对象）在 `Wait` 到期前被判 `PARTIAL_FAILED` + `TIMEOUT`，故障现象由「超时」伪装成「设备错误」；叠加 SFMEA-40 时还会污染 slot | `Init` 内校验 `sdk_config.timeoutMs >= wait_timeout_ms`，不满足拒绝启动（§3.3）；生产配置须显式设置 `waitTimeoutMs` | 用例 T-58 |
-| SFMEA-42 | 512B 对齐契约被破坏：槽位起点未对齐、槽位容量 < `wire_len`、区间未注册或多段不连续 | 读会写出槽位边界；写会把槽位外的相邻内存发到 L3；或访问未注册内存 | 统一按 `wire_len = AlignUp(N,512)` 判定与提交；写路径清零 `[N, wire_len)`；`addr % 512 == 0` 且 `Find(addr, wire_len)` 整体包含，任一不满足回退 staging；逐原因计数 | 用例 T-59 / T-60 |
-| SFMEA-43 | LRU 淘汰与在途 I/O 竞争：缓存区间在 `inflight > 0` 时被选中淘汰 | 注销设备仍在写的内存 → **数据损坏** | 淘汰只选 `inflight == 0` 且未 tainted 的区间；无可淘汰项时本次回退 staging，不报错 | 用例 T-62 |
-| SFMEA-44 | tainted 区间被复用 | 设备迟到写入 → **静默数据损坏** | `Find` 拒绝与 tainted 重叠的请求；tainted 随区间淘汰、重新注册后自然清除；`TaintedBytes()` 告警 | 用例 T-61 |
-| SFMEA-45 | 惰性注册失败或缓存膨胀：`RegisterRegions` 失败、超出注册预算、同区间重复注册 | 快路径失效或注册开销失控 | 注册失败只降级 staging；按 `max_registered_bytes` 做 LRU 并按需注销；同区间请求复用同一 handle | 用例 T-63 |
+| SFMEA-40 | 传输层 deadline 到期，以 **`PARTIAL_FAILED` + 逐条 `TIMEOUT`** 的形式返回（`trans_task_executor.cc:390-401` → `trans_task_manager.cc:35-41`）；`TransportTaskExecutor::Cancel` 同样只放弃任务、不停设备（`:258-275`） | 若按 **task status** 处置区间（把 `PARTIAL_FAILED` 当「可安全复用」）→ 设备仍在写的内存被重新使用 → **静默数据损坏** | 区间处置只看 **entry status**：`TIMEOUT` / `CANCELED` / `IN_PROGRESS` → `Taint`，其余 → `inflight--`（§3.2.3 结果处置） | **承重**：`PARTIAL_FAILED` 既可能来自设备逐条报错（可复用），也可能来自 deadline（不可复用），二者在 task status 上无法区分。用例 T-57 |
+| SFMEA-41 | SDK 配置的 transport deadline 小于适配器 `Wait` 超时：`waitTimeoutMs` 同时写 `defaultWaitTimeoutMs` 与 `timeoutMs`（`config_utils.cc:183-186`），后者进 `transportConfig.timeoutMs`（`:273`）；默认 `timeoutMs` 仅 100 ms | 健康但较慢的写（尤其 16 MiB 大对象）在 `Wait` 到期前被判 `PARTIAL_FAILED` + `TIMEOUT`，故障现象由「超时」伪装成「设备错误」；叠加 SFMEA-40 时还会把区间 taint | `Init` 内校验 `sdk_config.timeoutMs >= wait_timeout_ms`，不满足拒绝启动（§3.3）；生产配置须显式设置 `waitTimeoutMs` | 用例 T-58 |
+| SFMEA-42 | 对齐契约被破坏：槽位起点未对齐、槽位容量 < `wire_len`、区间未注册或注册失败、多段不连续 | 读会写出槽位边界；写会把槽位外的相邻内存发到 L3；或访问未注册内存 | 统一按 `wire_len = AlignUp(N,512)` 判定与提交；写路径清零 `[N, wire_len)`；`addr % 512 == 0` 且 `FindPersistentHandle` 整体包含，**任一不满足返回错误，不回退** | 用例 T-59 / T-60 |
+| SFMEA-44 | tainted 区间被复用 | 设备迟到写入 → **静默数据损坏** | `FindPersistentHandle` 拒绝与 tainted 重叠的请求并返回错误；tainted 常驻到进程重启；`TaintedBytes()` 告警 | 用例 T-61 |
+| SFMEA-45 | 注册失败或注册表只增不减：`RegisterRegions` 失败、请求地址覆盖过多区间 | 该请求失败；长期运行句柄/注册内存持续增长 | 注册失败返回 `DFS_SERVICE_UNAVAILABLE`，不回退；同区间复用同一 handle；用 `kvclient_registered_bytes` 监控增长 | 用例 T-63 |
 
 ## 2.5 可定位设计
 
@@ -864,45 +839,41 @@ sequenceDiagram
 | `object_size` | descriptor | 对齐/上限问题定位 |
 | `task_id` | SDK | 跨 client/transport 层关联 SDK 内部日志 |
 | `replica_id` | descriptor | miss 清理 CAS 排查 |
-| `io_path` | 适配器 | `zero_copy` / `staging`，定位拷贝与降级 |
-| `region_id` | `RegionRegistry` | 快路径区间关联（注册、taint、inflight） |
+| `region_id` | `RegionRegistry` | 区间关联（注册、taint、inflight） |
 | `wire_len` | 适配器 | 线格式长度；与 `object_size` 的差值即补零量 |
-| `fallback_reason` | 适配器 | `noncontiguous` / `unaligned_addr` / `unregistered` / `tainted` / `disabled` |
-| `slot_index` | 适配器 staging 分配 | 泄漏与 quarantine 追踪 |
+| `tainted` | 适配器 | 该请求是否因区间已 tainted 被拒绝 |
 | `batch_index` / `original_index` | 适配器 | 批量结果错位排查 |
 
 ### 2.5.2 日志与指标
 
 | 级别 | 内容 |
 | --- | --- |
-| `ERROR` | Wait 超时（含 `task_id`、`op`、涉及 slot 数、**quarantine / tainted 字节数**）；`RegisterRegions` 失败；区间淘汰时注销失败；`Shutdown` 时 `InUseSlots() != 0` 或区间 `inflight != 0`；entryStatus 映射到未知 SDK 码 |
-| `WARNING` | staging 占用率 > 90%；`PreflightSharedProvider` 通过但 provider 类型非预期；单项 entryStatus 失败（非整 task）；L3 注册失败（快路径降级） |
-| `INFO` | `Init` 成功（含 SDK 版本、`sharedProviderMode`、region 大小、slot 数、`MaxValueSize`）；`Shutdown` 完成（含累计 quarantine / tainted 字节） |
-| `VLOG(1)` | 每次 `PutBatch` / `GetBatch` / `DeleteBatch` 的 key 数、总字节、切批数、`io_path` 分布、耗时分解 |
-| `VLOG(2)` | 逐 entry 的 `logical_key` → `cache_key` 映射、`io_path` 与 `region_id`、slot 分配 / 归还 / quarantine、区间 taint |
+| `ERROR` | Wait 超时（含 `task_id`、`op`、`region_id`、**tainted 字节数**）；`RegisterRegions` 失败；`Shutdown` 时区间 `inflight != 0`；entryStatus 映射到未知 SDK 码 |
+| `WARNING` | `PreflightSharedProvider` 通过但 provider 类型非预期；单项 entryStatus 失败（非整 task）；请求因不连续/未对齐被拒 |
+| `INFO` | `Init` 成功（含 SDK 版本、`sharedProviderMode`、`MaxValueSize`）；`Shutdown` 完成（含注册区间数与累计 tainted 字节） |
+| `VLOG(1)` | 每次 `PutBatch` / `GetBatch` / `DeleteBatch` 的 key 数、总字节、切批数、耗时分解 |
+| `VLOG(2)` | 逐 entry 的 `logical_key` → `cache_key`、`region_id`、`inflight`、区间 taint |
 
 | 指标 | 类型 | 说明 |
 | --- | --- | --- |
-| `kvclient_io_path_total{path,op,result}` | counter | 快/慢路径占比 |
-| `kvclient_zerocopy_fallback_total{reason}` | counter | 降级原因分布 |
-| `kvclient_registered_bytes` | gauge | 当前缓存区间总量，受 `max_registered_bytes` 约束 |
-| `kvclient_registration_total{result}` | counter | 惰性注册成功 / 失败 / 复用 |
-| `kvclient_tainted_bytes` | gauge | 当前被 taint 的区间字节数；随区间淘汰并重新注册而回落 |
-| `kvclient_staging_quarantined_bytes` | gauge | staging 侧泄漏指标 |
+| `kvclient_registered_bytes` | gauge | 已注册区间总量，**单调不减**（不淘汰） |
+| `kvclient_registration_total{result}` | counter | 注册成功 / 失败 / 复用 |
+| `kvclient_tainted_bytes` | gauge | 被 taint 的区间字节数，常驻到重启 |
 
 ### 2.5.3 定位手册
 
 | 症状 | 排查路径 |
 | --- | --- |
 | Init 失败 `DFS_SERVICE_UNAVAILABLE` | 查 `sharedProviderMode` 是否为 SHARED（SFMEA-07）；查 view service 可达性 |
-| Init 失败 `PARTIAL_FAILED` | 查 `RegisterRegions` 日志；AICPU provider 下确认 SHARED 模式 |
+| Init 失败 `PARTIAL_FAILED` | 查 SDK `Init` 日志；AICPU provider 下确认 SHARED 模式 |
 | Put 全部失败但 SDK 日志无异常 | 查是否读了超时后的 `entryStatus`（SFMEA-13）；查 `Wait` 超时日志里的 `task_id` 与 `task_status`（§2.5.2） |
 | 读到错误数据，无报错 | **优先怀疑 key 碰撞**（SFMEA-01）：grep VLOG(2) 日志，比对两个 logical_key 是否得到同一 `cache_key` |
 | 读取恒返回 `FILE_READ_FAIL`，但数据其实写对了 | 查 `GetBatch` 是否误返回 `aligned_size` 而非 N（§3.4）——后端比对的是 `desc.object_size` |
 | 读到的对象尾部有脏数据 | 查写路径是否漏了 `memset` 补零，或读路径 memcpy 是否误用了 `wire_len` 而非 N |
-| 内存持续增长不释放 | 查关闭日志输出的 `QuarantinedBytes()` / `TaintedBytes()`（§2.5.2）；非零说明有超时 slot 未排空或区间被降级（SFMEA-12/44） |
-| 零拷贝命中率低 | 查 `kvclient_zerocopy_fallback_total{reason}`：`unregistered` 说明惰性注册失败或缓存未命中；`noncontiguous` 说明多段未聚合；`unaligned_addr` 说明槽位起点未按 512B 对齐；`tainted` 说明此前超时把区间降级了（§3.2.3） |
-| 首次请求延迟偏高 | 惰性注册的固有成本；查 `kvclient_registration_total` 与 `kvclient_registered_bytes`，必要时调大缓存预算减少淘汰重注册 |
+| 内存/句柄持续增长 | 注册表**不淘汰**，`kvclient_registered_bytes` 单调上升属预期；关注增长速度与覆盖区间数。`TaintedBytes()` 非零说明有超时区间被永久标记（SFMEA-12/44） |
+| 请求返回 `INVALID_PARAMS` | 多数是 buffer 侧不满足契约：多段不连续、槽位起点未 512B 对齐、或区间未注册且注册失败（§3.2.3） |
+| 请求返回 `DFS_SERVICE_UNAVAILABLE` | 惰性注册失败（`kvclient_registration_total{result="failed"}`）；查 SDK 日志与 provider 状态 |
+| 首次请求延迟偏高 | 首次 I/O 注册的固有成本；同一区间后续请求复用 handle，不再注册 |
 | Remove 返回成功但存储侧仍有 value | 不可能——value-first 下成功即已删。若出现，查是否走了 `RemoveAll`/`RemoveByRegex`（SFMEA-25） |
 | Remove 返回错误且对象变为不可读 | 已知窗口（SFMEA-21）：value 已删但 `CheckRemovable` 拒绝。等待后续读取触发 miss 自愈 |
 | Get 持续 `OBJECT_NOT_FOUND` 但目录有记录 | 查 `EvictDiskReplicaIfCurrent` 是否返回 `INVALID_PARAMS`——说明 `use_kvclient_` 白名单漏改（§3.5） |
@@ -1003,11 +974,11 @@ inline std::string CacheKeyToLogString(const kv::BinaryKey& key) {
 
 ## 3.2 shard-2：适配器（`kvclient_object_storage_adapter`）
 
-**职责**：实现 `ObjectStorageAdapter`，承载 key 编码、staging（region 注册 + slot 分配 + quarantine）、提交/等待、结果映射。与 `KvcsObjectStorageAdapter` 平级，互不依赖。
+**职责**：实现 `ObjectStorageAdapter`，承载 key 编码、原 buffer 注册、零拷贝读写、提交/等待与结果映射。与 `KvcsObjectStorageAdapter` 平级，互不依赖。
 
 **文件**：`mooncake-store/include/storage/distributed/kvclient/kvclient_object_storage_adapter.h`、`src/storage/distributed/kvclient/kvclient_object_storage_adapter.cpp`
 
-**为什么 staging 不单独成类**：它只有一个消费者；注册与注销本就依赖 `kv::KvClient`，独立成类并不能隔离依赖，只是多一层转发和一个需要同步维护的头文件。故 region、slot 位图、canonical handle 直接作为适配器私有成员持有。
+**为什么注册表不单独成类**：它只有一个消费者，注册与注销本就依赖 `kv::KvClient`；故注册表、tainted 区间与在途计数直接作为适配器私有成员持有（`RegionRegistry` 仅为内部类型）。
 
 ### 3.2.1 类定义
 
@@ -1038,14 +1009,10 @@ inline constexpr uint64_t kKvClientMaxValueBytes = 16'776'704;
 
 struct KvClientAdapterConfig {
     std::string config_path;  // SDK client config
-    size_t staging_region_bytes = 128ULL * 1024 * 1024;
-    size_t max_slot_bytes = kKvClientMaxValueBytes;
     uint64_t wait_timeout_ms = 30'000;
-    // Zero-copy fast path. Disabling it restores exactly the v3.0 behaviour.
+    // Escape hatch: when false the adapter rejects DFS I/O instead of
+    // registering buffers. There is no staging fallback either way.
     bool zero_copy_enabled = true;
-    // Upper bound of lazily registered ranges. Exceeding it evicts LRU ranges
-    // that have no in-flight I/O (SFMEA-43/45).
-    size_t max_registered_bytes = 1ULL * 1024 * 1024 * 1024;
 };
 
 struct RegisteredRegion;  // §3.2.3
@@ -1078,76 +1045,39 @@ class KvClientObjectStorageAdapter final : public ObjectStorageAdapter {
     const char* GetName() const override { return kKvClientAdapterName; }
 
    private:
-    // One slot of the registered staging region; the SDK touches nothing else.
-    struct StagingSlot {
-        void* ptr = nullptr;
-        size_t size = 0;
-        size_t index = 0;
+    struct IoPlan {
+        std::shared_ptr<RegisteredRegion> region;
+        uintptr_t addr = 0;
+        size_t n = 0;
+        size_t wire_len = 0;
     };
-    enum class SlotState : uint8_t { kFree, kInUse, kQuarantined };
 
     // Delegates to kvclient_key_codec.h's EncodeBinaryKey and returns the
     // 8-byte wire identity. Wrap with kv::CacheKey::FromBytes at the call site
     // so the same value stays available for cache_key logging (§3.1).
     kv::BinaryKey EncodeKey(std::string_view logical_key) const;
-    // Registers the single contiguous HOST_PINNED region and records its handle
-    // as the canonical handle every submitted entry must carry.
-    tl::expected<void, ErrorCode> RegisterStagingRegion();
-    // bytes must be a multiple of 512. NO_AVAILABLE_HANDLE when exhausted;
-    // never blocks.
-    tl::expected<StagingSlot, ErrorCode> AcquireSlot(size_t bytes);
-    void ReleaseSlot(const StagingSlot& slot);
-    // Retires the slot permanently: the SDK cannot stop an in-flight device
-    // operation (TransportTaskExecutor::Cancel only abandons the task), so a
-    // timed-out slot can never be safely reused.
-    void QuarantineSlot(const StagingSlot& slot);
-    size_t InUseSlots() const;
-    size_t QuarantinedSlots() const;
-    uint64_t QuarantinedBytes() const;
-    uint64_t TaintedBytes() const;
-    // Retires one payload after the task reached (or failed to reach) a
-    // terminal state. taint=true for statuses where the device may still
-    // touch the memory.
-    void DisposeOwner(IoOwner& owner, bool taint);
-
-    // Where one submitted payload lives. Determines how to dispose of it after
-    // the task reaches a terminal state (§3.2.3).
-    struct IoOwner {
-        std::optional<StagingSlot> slot;             // staging fallback
-        std::shared_ptr<RegisteredRegion> region;    // zero-copy fast path
-        uintptr_t addr = 0;
-        size_t wire_len = 0;
-    };
-    struct FastPathPlan {
-        std::shared_ptr<RegisteredRegion> region;
-        uintptr_t addr = 0;
-        size_t wire_len = 0;
-    };
-    // Returns nullopt when any fast-path condition fails; every rejection is
-    // counted by reason so a falling hit rate stays diagnosable (§3.2.3).
-    std::optional<FastPathPlan> TryPlanFastPath(const iovec* iov, int iovcnt,
-                                                size_t object_size,
-                                                bool is_store);
-    // Looks up the cache first; on a miss registers the 512-rounded range with
-    // the SDK and inserts it. Returns nullopt when registration fails, in which
-    // case the caller takes the staging path (SFMEA-45).
-    std::shared_ptr<RegisteredRegion> AcquireHandle(uintptr_t addr, size_t len);
-    // Evicts LRU ranges until need_bytes fit under max_registered_bytes.
-    // Only chooses ranges with inflight == 0 (SFMEA-43).
-    void EvictRegistrations(size_t need_bytes);
-    // Retires [addr, addr + wire_len): the device may still write it. Cleared
-    // only when the range itself is evicted and re-registered (SFMEA-44).
+    // Validates contiguity and alignment, then registers the range on first
+    // use and keeps it for the adapter lifetime (ASUStore model). Returns
+    // nullopt and sets `error` on any contract violation; there is no staging
+    // fallback (SFMEA-42/45).
+    std::optional<IoPlan> PlanIo(const iovec* iov, int iovcnt,
+                                 size_t object_size, bool is_store,
+                                 ErrorCode& error);
+    // Retires [addr, addr + wire_len): the device may still write it. The mark
+    // is permanent for this process because ranges are never re-registered
+    // (SFMEA-44).
     void Taint(const std::shared_ptr<RegisteredRegion>& region, uintptr_t addr,
                size_t wire_len);
+    uint64_t TaintedBytes() const;
 
     // Kept as a bool because kv::AsuOpType lives in the SDK's private
     // src/common/utils/task_context.h; the public API exposes only
     // StoreAsync / LoadAsync and picks the batch flavour itself.
-    // Owners are parallel to entries; on a terminal state each is released,
-    // quarantined or tainted according to its own entry status.
+    // Plans are parallel to entries; on a terminal state each is marked or
+    // released according to its own entry status.
     void SubmitAndWait(bool is_store, std::vector<kv::KVBuffer>& entries,
                        const std::vector<size_t>& original_indices,
-                       std::vector<IoOwner>& owners, BatchResults& results);
+                       const std::vector<IoPlan>& plans, BatchResults& results);
     static ErrorCode MapEntryStatus(const kv::Status& status);
     bool PreflightSharedProvider(const kv::KvClientConfig& sdk_config) const;
     void Shutdown();
@@ -1156,350 +1086,18 @@ class KvClientObjectStorageAdapter final : public ObjectStorageAdapter {
     std::unique_ptr<kv::KvClient> kv_client_;
     std::unique_ptr<RegionRegistry> region_registry_;
     bool initialized_ = false;
-
-    // Staging: the only memory the SDK is allowed to touch.
-    mutable std::mutex staging_mu_;
-    void* staging_base_ = nullptr;
-    size_t staging_region_bytes_ = 0;
-    size_t staging_slot_stride_ = 0;  // max_slot_bytes, already 512-aligned
-    kv::MRHandle canonical_handle_ = kv::kInvalidMRHandle;
-    std::vector<SlotState> staging_states_;
-    std::vector<size_t> staging_free_list_;
-    size_t quarantined_slots_ = 0;
-    uint64_t quarantined_bytes_ = 0;
 };
 
 }  // namespace mooncake
 ```
 
-### 3.2.2 staging 兜底路径
+### 3.2.2 无 staging 路径
 
-staging 是适配器内唯一带状态机的部分：一个已注册 region + 512B 对齐变长子分配 + quarantine。
+本方案**不设 staging**：没有 slot 位图、没有补零缓冲、没有 quarantine。原 buffer 直接注册给 SDK，所有数据路径都走 §3.2.3。任何不满足注册或对齐契约的请求都以错误返回，而不是降级拷贝。
 
-```cpp
-tl::expected<KvClientObjectStorageAdapter::StagingSlot, ErrorCode>
-KvClientObjectStorageAdapter::AcquireSlot(size_t bytes) {
-    if (bytes == 0 || bytes % kv::kAlignmentBytes != 0 ||
-        bytes > staging_slot_stride_) {
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-    }
-    std::lock_guard<std::mutex> lock{staging_mu_};
-    if (staging_free_list_.empty()) {
-        return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
-    }
-    const size_t index = staging_free_list_.back();
-    staging_free_list_.pop_back();
-    staging_states_[index] = SlotState::kInUse;
-    return StagingSlot{static_cast<char*>(staging_base_) +
-                           index * staging_slot_stride_,
-                       bytes, index};
-}
+### 3.2.3 零拷贝数据路径
 
-void KvClientObjectStorageAdapter::QuarantineSlot(const StagingSlot& slot) {
-    std::lock_guard<std::mutex> lock{staging_mu_};
-    if (slot.index >= staging_states_.size() ||
-        staging_states_[slot.index] != SlotState::kInUse) {
-        return;
-    }
-    staging_states_[slot.index] = SlotState::kQuarantined;
-    ++quarantined_slots_;
-    quarantined_bytes_ += slot.size;
-    // Deliberately not pushed back to staging_free_list_: the device may still
-    // write into this slot after Wait returned TIMEOUT.
-}
-```
-
-**设计说明**：
-
-- **为什么是变长子分配而非固定 16,776,704B slot**：固定 slot 下 128 MiB region 只能开 8 个，批深度不足以兑现跨对象合批。变长子分配以 `max_slot_bytes` 为 stride，`AcquireSlot(bytes)` 只要求 `bytes <= staging_slot_stride_`，小对象不浪费批深度。
-- **`staging_slot_stride_` 必须 512 对齐**：SDK 只约束 `length`/`offset` 的 512 对齐，**不校验 `buffer_addr`**；region 起始地址与 stride 都对齐可让每个 slot 天然满足地址对齐，避免依赖 SDK 的未校验行为。
-- **quarantine 不注销**：quarantine 的 slot 仍属已注册 region，`Shutdown` 时随 region 统一注销。逐个注销会与 in-flight 设备操作竞争。
-- **`HOST_PINNED`**：SDK 把 `HOST` / `HOST_PINNED` 都折叠为 `MEM_HOST`（`kv_client_impl.cc:340-345`），pinned 不由 SDK 分配兑现。若需要真正的 pinned 内存，适配器需自行分配（后续优化项，V1 用普通 host 内存）。
-- **`tokenId` 只作诊断**：`RegisteredMemory.tokenId` 不入 `KVBuffer`、不当 handle 用；`mrKey` 必须留 `std::nullopt`（SDK 会按 `buffer.handle` 回填，见 SFMEA-11）。
-- **`SlotState` 三态**：`kFree` / `kInUse` / `kQuarantined`。`AcquireSlot` 只从 free list 取；`QuarantineSlot` 就地把状态改成 `kQuarantined` 且不回 free list——这是 SFMEA-12 的落点，不可裁剪。
-- **注册在适配器内部一次性完成**：`Init()` → `RegisterStagingRegion()` → `RegisterRegions(单个大 region)` → 记录 `canonical_handle_` → 按 `staging_slot_stride_` 初始化 slot 位图。slot 分配面不外露（不是 `ObjectStorageAdapter` 接口的一部分），外部只能通过 `Put*` / `Get*` 间接触发。
-- **注销只在 `Shutdown`**：见 §2.3.6；staging region 不逐个 `UnregisterRegions`，随 canonical handle 统一释放；`RegionRegistry` 中的缓存区间由适配器在 LRU 淘汰或 `Shutdown` 时注销。
-
-**未覆写的接口**（沿用 `ObjectStorageAdapter` 基类默认）：
-
-| 方法 | 基类默认 | 说明 |
-| --- | --- | --- |
-| `GetRange` | `NOT_SUPPORTED` | 范围读不支持（§1.2.2） |
-| `CheckHealth` | `NOT_SUPPORTED` | 需要真机连通性探测，V1 不做 |
-| `SupportsSinglePutAttempt` / `PutOnce` / `PutVOnce` | `false` / `NOT_SUPPORTED` | 仅 immutable-object backend 使用，KVClient 不走该路径 |
-
-`Exists` 与 `ListKeys` 显式覆写为 `NOT_SUPPORTED`（与 KVCS 一致，理由见 §2.1.2 设计要点 4）。
-
-**`Init` 实现**：
-
-```cpp
-tl::expected<void, ErrorCode> KvClientObjectStorageAdapter::Init() {
-    if (initialized_) return {};
-    kv_client_ = kv::CreateKvClient();
-    if (!kv_client_) return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
-
-    // Init takes the config struct, not a path. LoadFromFile also parses the
-    // inference-engine keys; keyResolution is reset so that a shared or
-    // misconfigured SDK config file cannot change how our keys are resolved.
-    kv::KvClientConfig sdk_config;
-    auto status = kv::KvClientConfig::LoadFromFile(config_.config_path, sdk_config);
-    if (!status.ok()) return tl::make_unexpected(MapStatus(status));
-    sdk_config.keyResolution = {};
-
-    // The SDK derives the transport-task deadline from the same config value:
-    // waitTimeoutMs sets both defaultWaitTimeoutMs and timeoutMs
-    // (config_utils.cc:183-186), and transportConfig.timeoutMs follows
-    // (config_utils.cc:273). If that deadline is shorter than our own Wait
-    // timeout, a healthy-but-slow write is reported as PARTIAL_FAILED with
-    // per-entry TIMEOUT long before Wait expires -- the failure looks like a
-    // device error instead of a timeout. Reject the mismatch at startup.
-    if (sdk_config.timeoutMs < config_.wait_timeout_ms) {
-        LOG(ERROR) << "action=kvclient_config_timeout_too_small"
-                   << ", sdk_timeout_ms=" << sdk_config.timeoutMs
-                   << ", wait_timeout_ms=" << config_.wait_timeout_ms;
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-    }
-
-    status = kv_client_->Init(sdk_config);
-    if (!status.ok()) return tl::make_unexpected(MapStatus(status));
-
-    // INDEPENDENT mode makes the SDK BindMemory every registered region on
-    // each per-node provider, and AICPU's BindMemory rejects non-device
-    // memory -> registration always fails PARTIAL_FAILED once the view is
-    // non-empty. Fail here rather than at first I/O.
-    if (!PreflightSharedProvider(sdk_config)) {
-        return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
-    }
-
-    const auto staging_init = RegisterStagingRegion();
-    if (!staging_init) return tl::make_unexpected(staging_init.error());
-
-    initialized_ = true;
-    LOG(INFO) << "action=kvclient_adapter_init"
-              << ", shared_provider_mode=" << static_cast<int>(sdk_config.sharedProviderMode)
-              << ", staging_region_bytes=" << config_.staging_region_bytes
-              << ", slot_stride=" << config_.max_slot_bytes
-              << ", max_value_bytes=" << kKvClientMaxValueBytes
-              << ", wait_timeout_ms=" << config_.wait_timeout_ms;
-    return {};
-}
-```
-
-> `PreflightSharedProvider` 读 `KvClientConfig::sharedProviderMode`（`kv_types.h:263`），因此必须接收**已加载的**配置而非重新解析路径。
-
-**批量提交与超时处理骨架**（承重逻辑）：
-
-```cpp
-// True when the device may still be reading or writing the staging slot, so
-// the slot must be retired instead of recycled. TIMEOUT comes from the
-// transport-layer deadline (trans_task_executor.cc:390-401); CANCELED is
-// produced both by the pre-send abort (never sent, actually safe) and by
-// TransportTaskExecutor::Cancel (abandoned in-flight, unsafe) -- the two are
-// indistinguishable here, so treat CANCELED conservatively. IN_PROGRESS means
-// the task never reached a terminal state at all.
-static bool EntryMayStillTouchMemory(kv::StatusCode code) {
-    return code == kv::StatusCode::TIMEOUT ||
-           code == kv::StatusCode::CANCELED ||
-           code == kv::StatusCode::IN_PROGRESS;
-}
-
-// Submits one sub-batch and maps results back through original_indices.
-// entryStatus is only consulted when the task reached a trustworthy terminal
-// state (OK / PARTIAL_FAILED); anything else retires every buffer, because
-// entryStatus still holds its initial OK. Trustworthy is not the same as
-// clean: PARTIAL_FAILED routinely carries per-entry TIMEOUT, so buffer
-// disposition follows the entry status, never the task status.
-// Retires one payload without asking the device again. taint=true means the
-// device may still touch it: staging slots are quarantined, registered ranges
-// are marked so later requests fall back (SFMEA-44).
-void KvClientObjectStorageAdapter::DisposeOwner(IoOwner& owner, bool taint) {
-    if (owner.slot) {
-        taint ? QuarantineSlot(*owner.slot) : ReleaseSlot(*owner.slot);
-        return;
-    }
-    if (owner.region) {
-        if (taint) Taint(owner.region, owner.addr, owner.wire_len);
-        owner.region->inflight.fetch_sub(1, std::memory_order_acq_rel);
-    }
-}
-
-void KvClientObjectStorageAdapter::SubmitAndWait(
-    bool is_store, std::vector<kv::KVBuffer>& entries,
-    const std::vector<size_t>& original_indices,
-    std::vector<IoOwner>& owners, BatchResults& results) {
-    // Every entry must carry the exact handle we assigned. A non-zero but
-    // unregistered handle is not rejected at submit time; it surfaces only at
-    // Wait as BUFFER_NOT_REGISTERED and poisons the whole task (SFMEA-10).
-    for (size_t i = 0; i < entries.size(); ++i) {
-        const auto expected =
-            owners[i].slot ? canonical_handle_ : owners[i].region->handle;
-        if (entries[i].buffer.handle != expected) {
-            for (auto& owner : owners) DisposeOwner(owner, /*taint=*/false);
-            FillError(results, original_indices, ErrorCode::INTERNAL_ERROR);
-            return;
-        }
-    }
-
-    kv::TaskId task_id = kv::kInvalidTaskId;
-    // Default IoOptions: no namespace (the SDK does not put gnsid on the wire
-    // yet) and no prerequisite (entries are plain host memory). The SDK picks
-    // BATCH_STORE / BATCH_LOAD internally from the entry count.
-    const auto submit = is_store ? kv_client_->StoreAsync(entries, task_id)
-                                 : kv_client_->LoadAsync(entries, task_id);
-    if (!submit.ok()) {
-        // Rejected before reaching the device: every payload is safe to reuse.
-        // This includes key-resolution failures, which fail the whole sub-batch
-        // synchronously with an invalid task id (SFMEA-37).
-        for (auto& owner : owners) DisposeOwner(owner, /*taint=*/false);
-        FillError(results, original_indices, MapStatus(submit));
-        return;
-    }
-
-    kv::TaskResult task_result;
-    const auto wait =
-        kv_client_->Wait(task_id, config_.wait_timeout_ms, task_result);
-
-    auto quarantine_and_fail = [&](kv::StatusCode code) {
-        // The device may still touch these buffers: retire, never release.
-        for (auto& owner : owners) DisposeOwner(owner, /*taint=*/true);
-        const auto err = (code == kv::StatusCode::TIMEOUT)
-                             ? ErrorCode::RPC_TIMEOUT
-                             : ErrorCode::INTERNAL_ERROR;
-        LOG(ERROR) << "action=kvclient_task_failed, op="
-                   << (is_store ? "store" : "load")
-                   << ", task_id=" << task_id
-                   << ", task_status=" << toString(code)
-                   << ", entries=" << entries.size()
-                   << ", retired_buffers=" << owners.size()
-                   << ", quarantined_bytes_total=" << QuarantinedBytes()
-                   << ", tainted_bytes_total=" << TaintedBytes()
-                   << ", code=" << toString(err);
-        FillError(results, original_indices, err);
-    };
-
-    // Local Wait timeout: the task never reached a terminal state, so
-    // entryStatus still holds its Status::OK() initial value
-    // (kv_client_impl.cc:476). Reading it would report success for data that
-    // never landed.
-    if (!wait.ok()) {
-        quarantine_and_fail(kv::StatusCode::TIMEOUT);
-        return;
-    }
-
-    // Only OK / PARTIAL_FAILED are trustworthy terminal states; only there is
-    // entryStatus guaranteed to map one-to-one onto the submitted entries.
-    const auto task_code = task_result.status.code;
-    if (task_code != kv::StatusCode::OK &&
-        task_code != kv::StatusCode::PARTIAL_FAILED) {
-        quarantine_and_fail(task_code);
-        return;
-    }
-
-    if (task_result.entryStatus.size() != entries.size()) {
-        // Protocol inconsistency: per-entry mapping is impossible.
-        quarantine_and_fail(task_code);
-        return;
-    }
-
-    // OK and PARTIAL_FAILED both mean the task is Done() and entryStatus maps
-    // one-to-one onto the submitted entries, so every entry is mapped. Buffer
-    // disposition is per entry: PARTIAL_FAILED is not "everything is fine" --
-    // when the transport-layer deadline expires it fills every unfinished
-    // sub-batch with TIMEOUT and only then reports PARTIAL_FAILED
-    // (trans_task_executor.cc:390-401 -> trans_task_manager.cc:35-41), and
-    // Cancel abandons in-flight work without stopping the device
-    // (trans_task_executor.cc:258-275). Reusing those buffers would let the
-    // device write into memory already handed to another I/O.
-    for (size_t i = 0; i < entries.size(); ++i) {
-        const auto& entry_status = task_result.entryStatus[i];
-        results.Set(original_indices[i], MapEntryStatus(entry_status));
-        DisposeOwner(owners[i], EntryMayStillTouchMemory(entry_status.code));
-    }
-}
-```
-
-**`task_result.status` 裁决**：
-
-| task status | 处理 | buffer |
-| --- | --- | --- |
-| `OK` | 逐条映射 `entryStatus` | **按 entry status 逐条处置**（下表） |
-| `PARTIAL_FAILED` | 逐条映射 `entryStatus`（**不要整批置错**） | **按 entry status 逐条处置**（下表） |
-| `TIMEOUT` / `CANCELED` / `IN_PROGRESS` | 整批置错，此时 `entryStatus` 不可信 | 全部 Quarantine / Taint |
-| 本地 `Wait` 返回非 OK | 整批置 `RPC_TIMEOUT` | 全部 Quarantine / Taint |
-
-**buffer 处置只看 entry status，不看 task status**：
-
-| entry status | staging slot | 快路径区间 | 理由 |
-| --- | --- | --- | --- |
-| `TIMEOUT` | Quarantine | Taint | 传输层 deadline 到期，设备可能仍在 DMA |
-| `CANCELED` | Quarantine | Taint | `Cancel` 只放弃任务、不停设备；与「预发送 abort」无法区分，保守处理 |
-| `IN_PROGRESS` | Quarantine | Taint | 任务未到终态 |
-| 其他（`OK` / 各类业务错误） | Release | `inflight--` | 设备已完成对这段内存的访问 |
-
-这是 `PARTIAL_FAILED` 最容易踩的坑：它既可能是「设备逐条报错」（可安全归还），也可能是「传输层 deadline 到期」（**不可**归还），两者在 task status 上一模一样。按 task status 处置，会在正常超时下把仍在被写入的 buffer 放回可用状态 —— 静默数据损坏（SFMEA-40）。
-
-`Wait` 返回 OK 但 task 仍是 `IN_PROGRESS` 属 SDK 协议异常，按非终态处理（quarantine + `INTERNAL_ERROR`），不读 `entryStatus`。
-
-**错误码映射**（对齐 KVCS 的 `CallError` / `ItemError`，`kvcs_capi_driver.cpp:77-123`）：
-
-```cpp
-ErrorCode KvClientObjectStorageAdapter::MapEntryStatus(const kv::Status& status) {
-    using SC = kv::StatusCode;
-    switch (status.code) {
-        case SC::OK:
-            return ErrorCode::OK;
-        case SC::ENTRY_KEY_NOT_FOUND:
-        case SC::ENTRY_DATA_NOT_EXIST:
-        case SC::CQE_KEY_NOT_EXIST:
-        case SC::NOT_FOUND:
-            return ErrorCode::OBJECT_NOT_FOUND;
-        case SC::CQE_OUT_OF_CREATE_SIZE:
-        case SC::RESOURCE_BUSY:
-            return ErrorCode::NO_AVAILABLE_HANDLE;
-        case SC::TIMEOUT:
-        case SC::CQE_IO_TIMEOUT:
-            return ErrorCode::RPC_TIMEOUT;
-        case SC::CONNECTION_ERROR:
-            return ErrorCode::DFS_SERVICE_UNAVAILABLE;
-        case SC::BUFFER_NOT_REGISTERED:
-        case SC::BUFFER_NOT_SUPPORTED:
-        case SC::INVALID_ARGUMENT:
-            return ErrorCode::INVALID_PARAMS;
-        case SC::CANCELED:
-            return ErrorCode::INTERNAL_ERROR;
-        default:
-            LOG(ERROR) << "action=kvclient_unmapped_status, code="
-                       << static_cast<int>(status.code);
-            return ErrorCode::INTERNAL_ERROR;
-    }
-}
-```
-
-⚠️ `OBJECT_NOT_FOUND` 与 `RPC_TIMEOUT` 的区分是**承重**的：只有前者触发 `ReconcileMissingKvReplica` 清理元数据，后者必须保留元数据（SFMEA-18）。
-
-**`DeleteBatch` 的幂等处理**：
-
-```cpp
-// ENTRY_KEY_NOT_EXIST is idempotent success, matching the KVCS adapter
-// (kvcs_capi_driver.cpp:358-366).
-const auto code = MapEntryStatus(task_result.entryStatus[i]);
-results[original_indices[i]] =
-    (code == ErrorCode::OK || code == ErrorCode::OBJECT_NOT_FOUND)
-        ? tl::expected<void, ErrorCode>()
-        : tl::make_unexpected(code);
-```
-
-删除路径**不使用 staging**（`DeleteAsync` 只传 key，无 buffer），故无 quarantine 风险。
-
-**切批上限**：`TransportConfig` 的 `batchLoadIoNum` / `batchStoreIoNum` = 110、`deleteIoNum` = 254、`queryIoNum` = 256（`kv_types.h:227-230`，均为**结构体成员字段**而非编译期常量，可被配置文件覆盖）。适配器不应硬编码这些值，而应：
-
-- 优先从 SDK 的 `TransportConfig` 读取实际生效值；若 SDK 不暴露读取入口，则用同值作为适配器侧的保守默认，并在 `Init` 日志中打印所用批上限，便于与 SDK 配置不一致时排查。
-- 三个上限不可统一成 110——那会让 Delete/Query 无谓降批；也不可放大，可能触发协议错误。
-- 切批按对象边界，绝不切开单个对象（§2.3.2）。
-
-## 3.2.3 零拷贝快路径
-
-**职责**：把调用方已注册的连续 CPU 内存直接交给设备，跳过 staging 的两次拷贝。未命中任何条件时回退 §3.2.2。
+**职责**：把调用方 buffer 注册给 SDK 并直接读写；**注册与读写都在适配器内完成**，与 ASUStore 的 `persistentRegions_` + `FindPersistentHandle` 模型一致。
 
 ### 注册表
 
@@ -1515,7 +1113,6 @@ struct RegisteredRegion {
     kv::MRHandle handle{kv::kInvalidMRHandle};
     uint64_t id{0};                      // 日志 / 指标关联
     std::atomic<uint32_t> inflight{0};   // 在途 I/O 数
-    bool retiring{false};
     std::vector<TaintedRange> tainted;   // 保序、合并
 };
 
@@ -1523,15 +1120,13 @@ class RegionRegistry {
    public:
     std::shared_ptr<RegisteredRegion> Add(uintptr_t base, size_t size,
                                           kv::MRHandle handle);
-    std::shared_ptr<RegisteredRegion> Find(uintptr_t addr, size_t len) const;
+    // Containment lookup, mirroring ASUStore::FindPersistentHandle.
+    std::shared_ptr<RegisteredRegion> FindPersistentHandle(uintptr_t addr,
+                                                          size_t len) const;
     bool IsTainted(const RegisteredRegion& r, uintptr_t addr, size_t len) const;
     void Taint(const std::shared_ptr<RegisteredRegion>& r, uintptr_t addr,
                size_t len);
-    // Evicts LRU ranges with inflight == 0 until need_bytes fit; returns the
-    // handles the caller must unregister (SFMEA-43).
-    std::vector<kv::MRHandle> EvictLru(size_t need_bytes);
     std::vector<kv::MRHandle> ReleaseAll();
-    size_t Inflight() const;
     uint64_t TaintedBytes() const;
 
    private:
@@ -1540,111 +1135,90 @@ class RegionRegistry {
 };
 ```
 
-- **惰性注册**：缓存未命中时由 `AcquireHandle` 把 `[addr, AlignUp(addr + len, 512))` 交给 SDK `RegisterRegions`，成功即插入缓存；失败返回空并回退 staging，不影响功能。
-- **查找语义**：`Find` 返回第一个满足 `addr >= base && addr - base <= size - len` 的区间，即 `[addr, addr+len)` 整体落在同一区间内；跨区间一律回退。同区间重复请求直接复用 handle。
-- **淘汰**：`kvclient_registered_bytes` 超过 `max_registered_bytes` 时按 LRU 淘汰，且只选 `inflight == 0` 的区间；没有可淘汰项时本次请求回退 staging，**不**阻塞也不报错。
-- **tainted**：随所属区间一起淘汰；重新注册后是全新记录，taint 自然清除。
+- **注册一次常驻**：首次 I/O 注册 `[addr, AlignUp(len, 512))` 并插入；此后同区间请求直接复用 handle，**不淘汰**，直到 `Shutdown` 统一注销。这是 ASUStore 的持久注册语义。
+- **查找语义**：`[addr, addr + len)` 必须整体落在一个已注册区间内（`addr >= base && addr - base <= size - len`），否则视为未注册。
+- **重复请求**：同 `base` 复用；不同 `base` 但包含关系成立时，返回第一个匹配。
+- **tainted 常驻**：超时把 `[addr, addr + wire_len)` 标为 tainted，重叠请求一律失败，常驻到进程重启。
 
-### 快路径判定
+### 建 plan 与注册
 
 ```cpp
-// Fallback(reason) counts kvclient_zerocopy_fallback_total{reason} and returns
-// nullopt so the caller takes the staging path.
-std::optional<FastPathPlan> KvClientObjectStorageAdapter::TryPlanFastPath(
-    const iovec* iov, int iovcnt, size_t object_size, bool is_store) {
-    if (!config_.zero_copy_enabled) return Fallback("disabled");
-
+// IoPlan 定义见 §3.2.1。
+// Returns nullopt and fills `error` when the request violates the contract.
+std::optional<IoPlan> KvClientObjectStorageAdapter::PlanIo(
+    const iovec* iov, int iovcnt, size_t object_size, bool is_store,
+    ErrorCode& error) {
     const size_t n = is_store ? SumIov(iov, iovcnt) : object_size;
+    if (n == 0) { error = ErrorCode::INVALID_PARAMS; return std::nullopt; }
     const size_t wire_len = AlignUp(n, kv::kAlignmentBytes);
-    if (n == 0) return std::nullopt;                     // 交由参数校验拒绝
-    if (wire_len > kKvClientMaxValueBytes) return std::nullopt;
-    if (!IsContiguous(iov, iovcnt)) return Fallback("noncontiguous");
-
-    // 512B 对齐契约：对象从自己槽位的起点开始，槽位容量 >= wire_len。
-    // 写路径由适配器把 [n, wire_len) 补零（<=511 字节）；读路径该尾部仍落在
-    // 同一槽位内，调用方忽略。因此 N 本身不必是 512 的倍数。
+    if (wire_len > kKvClientMaxValueBytes) {
+        error = ErrorCode::INVALID_PARAMS;
+        return std::nullopt;
+    }
+    if (!IsContiguous(iov, iovcnt)) {
+        error = ErrorCode::INVALID_PARAMS;   // 不连续即失败，不拷入 staging
+        return std::nullopt;
+    }
     const auto addr = reinterpret_cast<uintptr_t>(iov[0].iov_base);
-    if (addr % kv::kAlignmentBytes != 0) return Fallback("unaligned_addr");
+    if (addr % kv::kAlignmentBytes != 0) {
+        error = ErrorCode::INVALID_PARAMS;   // 槽位起点未对齐即失败
+        return std::nullopt;
+    }
 
-    // 先查缓存；未命中时惰性注册（按 512B 取整），失败即回退。
-    // 包含关系按补齐后的长度判断：设备会访问整个 wire_len。
-    auto region = AcquireHandle(addr, wire_len);
-    if (!region) return Fallback("unregistered");
-    if (region_registry_->IsTainted(*region, addr, wire_len))
-        return Fallback("tainted");
-
-    return FastPathPlan{std::move(region), addr, wire_len};
+    auto region = region_registry_->FindPersistentHandle(addr, wire_len);
+    if (!region) {
+        // Register once and keep it for the adapter lifetime (ASUStore model).
+        std::vector<kv::MemoryRegion> regions{
+            {kv::MemoryType::HOST, addr, wire_len, /*deviceId=*/-1,
+             /*numaNode=*/-1}};
+        std::vector<kv::RegisteredMemory> out;
+        if (!kv_client_->RegisterRegions(regions, out).ok()) {
+            error = ErrorCode::DFS_SERVICE_UNAVAILABLE;  // 注册失败即失败
+            return std::nullopt;
+        }
+        region = region_registry_->Add(addr, wire_len, out.front().handle);
+    }
+    if (region_registry_->IsTainted(*region, addr, wire_len)) {
+        error = ErrorCode::INVALID_PARAMS;
+        return std::nullopt;
+    }
+    return IoPlan{region, addr, n, wire_len};
 }
 ```
 
-每次回退按 `reason` 计数（`kvclient_zerocopy_fallback_total`），否则命中率下滑无法定位。
-
-### 惰性注册与淘汰
-
-```cpp
-// Cache hit first; on a miss register the 512B-rounded range with the SDK.
-// Returns nullptr on failure so the caller falls back to staging.
-std::shared_ptr<RegisteredRegion>
-KvClientObjectStorageAdapter::AcquireHandle(uintptr_t addr, size_t len) {
-    if (auto hit = region_registry_->Find(addr, len)) return hit;
-
-    const size_t size = AlignUp(len, kv::kAlignmentBytes);
-    EvictRegistrations(size);                       // LRU, inflight == 0 only
-
-    std::vector<kv::MemoryRegion> regions{
-        {kv::MemoryType::HOST, addr, size, /*deviceId=*/-1, /*numaNode=*/-1}};
-    std::vector<kv::RegisteredMemory> out;
-    if (!kv_client_->RegisterRegions(regions, out).ok()) return nullptr;
-    return region_registry_->Add(addr, size, out.front().handle);
-}
-
-void KvClientObjectStorageAdapter::EvictRegistrations(size_t need_bytes) {
-    const auto handles = region_registry_->EvictLru(need_bytes);
-    if (!handles.empty()) kv_client_->UnregisterRegions(handles);
-}
-```
-
-`EvictLru` 只返回 `inflight == 0` 的区间，因此注销时设备一定已停止访问（SFMEA-43）。缓存不足以腾出空间时跳过淘汰，本次请求回退 staging，不阻塞、不报错。
-
-**对齐契约（对调用方）**：L3 对象必须在 buffer 中占用一个 **512B 对齐、容量 `AlignUp(N,512)`** 的槽位。适配器从 `iov` / `size` 只能看到 N，无法自行验证槽位容量，这一条由上层分配保证；写路径清零的 `[N, wire_len)` 与读路径设备写入的尾部都落在该槽位内。不满足时只能回退 staging 或由上层修正分配（§5）。
+**三条失败路径一律返回错误，不回退**：多段不连续 → `INVALID_PARAMS`；槽位起点未 512B 对齐 → `INVALID_PARAMS`；`RegisterRegions` 失败 → `DFS_SERVICE_UNAVAILABLE`。
 
 ### 构造与提交
 
 ```cpp
-// 512B 对齐契约：设备会读满 wire_len，写路径必须先清掉尾部，否则会把槽位
-// 里上一次的残留字节发到共享 L3。最多 511 字节，不触碰 payload 本身。
+// 512B 契约：写路径清零尾部，读路径的尾部由设备写在同一区间内。
 if (is_store && wire_len > n) {
-    std::memset(reinterpret_cast<char*>(addr) + n, 0, wire_len - n);
+    std::memset(reinterpret_cast<char*>(plan.addr) + n, 0, wire_len - n);
 }
 
-// 快路径：地址直接来自调用方，注册表提供 handle。
 kv::KVBuffer entry;
 entry.key = kv::CacheKey::FromBytes(EncodeKey(logical_key));
 entry.buffer.region = {kv::MemoryType::HOST, plan.addr,
-                       static_cast<uint64_t>(plan.wire_len), /*deviceId=*/-1,
-                       /*numaNode=*/-1};
+                       static_cast<uint64_t>(plan.wire_len),
+                       /*deviceId=*/-1, /*numaNode=*/-1};
 entry.buffer.handle = plan.region->handle;
 entry.offset = 0;            // 512 对齐；本方案不做分层聚合
 entry.mrKey = std::nullopt;  // SDK 按 handle 回填
 
-region->inflight.fetch_add(1);
-owners.push_back(IoOwner{std::nullopt, plan.region, plan.addr, plan.wire_len});
+plan.region->inflight.fetch_add(1, std::memory_order_acq_rel);
 ```
 
-**`entry.buffer.region.size` 必须等于 `wire_len`**：SDK 没有独立的 KV 长度字段，线格式长度就是它（§3.4）。
+`entry.buffer.region.size` 必须等于 `wire_len`：SDK 没有独立的 KV 长度字段（§3.4）。
 
 ### 结果处置
 
-`SubmitAndWait` 对每条 entry 按 `entryStatus` 处置对应的 `IoOwner`：
+| entry 状态 | 区间处置 |
+| --- | --- |
+| `OK` / 业务错误 | `inflight--` |
+| `TIMEOUT` / `CANCELED` / `IN_PROGRESS` | `Taint(range)` + `inflight--` |
+| task 非终态 / 提交失败 | 全部 `Taint` / 全部 `inflight--` |
 
-| entry 状态 | `slot`（兜底） | `region`（快路径） |
-| --- | --- | --- |
-| `OK` / 业务错误 | `ReleaseSlot` | `inflight--` |
-| `TIMEOUT` / `CANCELED` / `IN_PROGRESS` | `QuarantineSlot` | `Taint(range)` + `inflight--` |
-| task 非终态 / 提交失败 | 全部 `QuarantineSlot` / `ReleaseSlot` | 全部 `Taint` / 全部 `inflight--` |
-
-`Taint` 把 `[addr, addr + wire_len)` 并入区间的 tainted 列表；之后重叠请求回退 staging，区间其余部分仍可走快路径。tainted 随所属区间被淘汰并重新注册后自然清除（SFMEA-44）。
-
+`Taint` 把 `[addr, addr + wire_len)` 并入区间的 tainted 列表。区间不会被重新注册，因此该地址在进程生命周期内不可再用于快路径（SFMEA-44）。
 ## 3.3 shard-3：配置（`kvclient_config`）
 
 **环境变量**（沿用 `Environ::ReadOr` 模式，`kvcs_capi_driver.cpp:39-75`）：
@@ -1652,13 +1226,10 @@ owners.push_back(IoOwner{std::nullopt, plan.region, plan.addr, plan.wire_len});
 | 变量 | 默认 | 说明 |
 | --- | --- | --- |
 | `MOONCAKE_KVCLIENT_CONFIG` | 无（必填） | SDK client 配置路径 |
-| `MOONCAKE_KVCLIENT_STAGING_BYTES` | 128 MiB | staging region 大小 |
-| `MOONCAKE_KVCLIENT_MAX_SLOT_BYTES` | 16,776,704 | 单 slot 上限，须 512 对齐 |
 | `MOONCAKE_KVCLIENT_WAIT_TIMEOUT_MS` | 30000 | `Wait` 超时 |
-| `MOONCAKE_KVCLIENT_ZERO_COPY` | true | 是否启用零拷贝快路径；关闭后行为与 v3.0 完全一致 |
-| `MOONCAKE_KVCLIENT_MAX_REGISTERED_BYTES` | 1 GiB | 惰性注册缓存的上限，超出按 LRU 淘汰 |
+| `MOONCAKE_KVCLIENT_ZERO_COPY` | true | 关闭后适配器拒绝 DFS I/O（没有 staging 可退） |
 
-**校验**（`ReadConfig`）：`config_path` 非空；`staging_bytes >= max_slot_bytes`；`max_slot_bytes % 512 == 0 && <= 16776704`；`wait_timeout_ms > 0`；`max_registered_bytes > 0`。
+**校验**（`ReadConfig`）：`config_path` 非空；`wait_timeout_ms > 0`。
 
 **跨配置校验**（`Init` 内，需先 `LoadFromFile` 才能拿到值）：`sdk_config.timeoutMs >= wait_timeout_ms`。SDK 的 `waitTimeoutMs` 配置键同时写 `defaultWaitTimeoutMs` 与 `timeoutMs`（`config_utils.cc:183-186`），后者成为 transport task 的 deadline（`:273`）；若它小于适配器自己的 `Wait` 超时，健康但较慢的写会在 `Wait` 到期前就被判成 `PARTIAL_FAILED` + 逐条 `TIMEOUT`，故障现象从「超时」变成「设备报错」。不满足即拒绝启动（`INVALID_PARAMS`）。
 
@@ -1692,96 +1263,66 @@ bool UsesKvClient() const { return fs_adapter_type == "kvclient"; }
 
 ## 3.4 shard-4：padding 与长度语义
 
-512 对齐裁决下 `object_size = N`，`wire_len = AlignUp(N, 512)` 是唯一的线格式长度（SDK 没有独立的 KV 长度字段，§3.2.3）。**对齐是全局契约，不是分支条件**：对象在 buffer 中占 `wire_len` 字节，起点 512B 对齐。
+`object_size = N`，`wire_len = AlignUp(N, 512)` 是唯一的线格式长度（SDK 没有独立的 KV 长度字段，§3.2.3）。**512B 对齐是全局契约**：对象在 buffer 中占 `wire_len` 字节，起点 512B 对齐。
 
-- **快路径**：仍按 `wire_len` 提交。写路径把槽位尾部 `[N, wire_len)` 清零（≤511 字节）；读路径该尾部留在同一槽位内，调用方只取前 N 字节。payload 本身不复制。
-- **兜底路径**：未注册或不连续时，在 staging slot 内完成同样的补零与截取，差值**上层不可见**。
+- **写路径**：设备读满 `wire_len`，适配器先清零尾部 `[N, wire_len)`（≤511 字节），不复制 payload。
+- **读路径**：设备写满 `wire_len`，尾部落在同一槽位内，调用方只取前 N 字节。
+- 不满足对齐契约的请求直接失败（§3.2.3），**没有 staging 分支**。
 
-两条路径的线格式、上限与返回值完全一致，区别只在 buffer 来源与是否需要 memcpy。
-
-**写路径（兜底分支）**：
+**写路径**：
 
 ```cpp
 // PutBatch: 后端传来的 ObjectPutRequest{logical_key, iov, iovcnt}
-// 仅当 TryPlanFastPath 未命中时走到这里；快路径直接使用调用方地址（§3.2.3）。
-const size_t n = SumIovecBytes(request.iov, request.iovcnt);
-const size_t wire_len = AlignUp(n, kv::kAlignmentBytes);   // 512
-if (wire_len > kKvClientMaxValueBytes) {
-    results[i] = tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-    continue;
-}
-auto slot = AcquireSlot(wire_len);             // 按补零后的长度分配
-if (!slot) { results[i] = tl::make_unexpected(slot.error()); continue; }
+auto plan = PlanIo(request.iov, request.iovcnt, /*object_size=*/0,
+                   /*is_store=*/true, error);
+if (!plan) { results[i] = tl::make_unexpected(error); continue; }
 
-// 多段 iov 依次拷入连续 slot；尾部 [n, wire_len) 补零
-size_t written = 0;
-for (int j = 0; j < request.iovcnt; ++j) {
-    std::memcpy(static_cast<char*>(slot->ptr) + written,
-                request.iov[j].iov_base, request.iov[j].iov_len);
-    written += request.iov[j].iov_len;
+// 512B 契约：清零尾部，避免把槽位里的残留字节发到 L3。
+if (plan->wire_len > plan->n) {
+    std::memset(reinterpret_cast<char*>(plan->addr) + plan->n, 0,
+                plan->wire_len - plan->n);
 }
-std::memset(static_cast<char*>(slot->ptr) + written, 0, wire_len - written);
 
-// kv::KVBuffer has no standalone length field. The SDK derives the wire length
-// from buffer.region.size (sqe_request.cc:190 / :251) and applies the 24-bit
-// check to it, so every field below is load-bearing -- an unset region.size
-// makes the SQE length 0 and the failure only surfaces on the device.
 kv::KVBuffer entry;
 entry.key = kv::CacheKey::FromBytes(cache_key);
 entry.buffer.region = kv::MemoryRegion{
-    kv::MemoryType::HOST_PINNED,                   // folded to MEM_HOST by the SDK
-    reinterpret_cast<std::uint64_t>(slot->ptr),    // staging address
-    static_cast<std::uint64_t>(wire_len),          // ← 线格式长度就在这里
+    kv::MemoryType::HOST,
+    static_cast<std::uint64_t>(plan->addr),
+    static_cast<std::uint64_t>(plan->wire_len),   // 线格式长度就是它
     /*deviceId=*/-1,
     /*numaNode=*/-1,
 };
-entry.buffer.handle = canonical_handle_;           // 提交前预检精确相等（SFMEA-10）
-entry.offset = 0;                                  // 512 对齐；本方案不做分层聚合
-entry.mrKey = std::nullopt;                        // SDK 按 handle 回填（SFMEA-11）
-entries.push_back(std::move(entry));
+entry.buffer.handle = plan->region->handle;
+entry.offset = 0;
+entry.mrKey = std::nullopt;
 ```
 
-**`KVBuffer` 的四个必填项**（漏任何一个都会让失败点漂到设备侧）：
-
-| 字段 | 取值 | 作用 |
-| --- | --- | --- |
-| `buffer.region.{memoryType,addr,size}` | `HOST_PINNED` / slot 指针 / `wire_len` | `size` 是**唯一**的线格式长度来源，24-bit 上限校验也读它 |
-| `buffer.handle` | `canonical_handle_` | SDK 精确查表得 `tokenId`；非 canonical 非零值只会在 `ValidateSqeMrKeys` 暴露，并 abort 整个 transport task |
-| `offset` | `0` | 协议要求 512 对齐；本方案一个对象一段，不做层聚合 |
-| `mrKey` | `std::nullopt` | SDK 无条件 `reset()` 后按 handle 回填，调用方填了也会被覆盖 |
-
-补零是**必需的**，不是可选优化：slot 复用时残留上一次 I/O 的数据，若不显式清零，尾部会把旧数据发到设备。同一 key 的后续读取只取前 N 字节，故残留不影响正确性，但会泄漏无关数据到存储侧——清零同时解决这两点。
-
-**读路径（兜底分支）**：
+**读路径**：
 
 ```cpp
 // GetBatch: 后端传来的 ObjectGetRequest{logical_key, buffer, size = object_size}
-// 快路径命中时设备直接写调用方 buffer，无需下面的 memcpy（§3.2.3）。
-const size_t n = request.size;                  // == desc.object_size
-const size_t wire_len = AlignUp(n, kv::kAlignmentBytes);
-auto slot = AcquireSlot(wire_len);
-// 按上文「四个必填项」填 KVBuffer：buffer.region.size = wire_len，设备写入 wire_len 字节。
-// buffer 的归还 / quarantine / taint 由 SubmitAndWait 按 entry status 逐条处置（§3.2.2）。
-...
-// Wait 成功后逐条：只把前 n 字节 memcpy 回调用者 buffer，尾部 padding 丢弃
-std::memcpy(request.buffer, slot->ptr, n);
-return n;                                        // 返回 n，不是 wire_len
+auto plan = PlanIo(request.iov, request.iovcnt, request.size, /*is_store=*/false,
+                   error);
+if (!plan) { results[i] = tl::make_unexpected(error); continue; }
+// 设备直接把 wire_len 字节写入调用方 buffer，调用方只消费前 N 字节。
+return request.size;                              // 返回 N，不是 wire_len
 ```
 
 ⚠️ **返回值必须是 `n` 而非 `wire_len`**。`DistributedStorageBackend::BatchRead` 会比对 `*object_results[i] != object_requests[i].size`（`:838-841`），而 `request.size` 是 `desc.object_size` = N。返回 `wire_len` 会让每次读取都误报 `FILE_READ_FAIL`。
 
-**`aligned_size` 在读路径不直接使用**：后端传给 `GetBatch` 的 `size` 取 `desc.object_size`（`:817-818`），不取 `aligned_size`。故 `aligned_size` 目前只是元数据记录（供诊断与未来扩展），适配器自行用 `AlignUp(object_size, 512)` 重算线格式长度。这样即使 `aligned_size` 字段缺失或为 0（旧记录），读路径仍能工作。
+**`aligned_size` 在读路径不直接使用**：后端传给 `GetBatch` 的 `size` 取 `desc.object_size`（`:817-818`），不取 `aligned_size`。故 `aligned_size` 目前只是元数据记录（供诊断与未来扩展），适配器自行用 `AlignUp(object_size, 512)` 重算线格式长度。
 
-**长度校验清单**（三道，缺一不可）：
+**注册粒度**：首次请求按 `[addr, AlignUp(N,512))` 注册并常驻。同一对象重复读写命中同一区间；对象长度变化会注册新区间，注册表只增不减（§5）。
+
+**长度校验清单**（三道）：
 
 | 层 | 校验 | 位置 |
 | --- | --- | --- |
 | Master | `value_length <= 16,776,704` | `PrepareWriteStart`（§3.5） |
-| 适配器写 | `AlignUp(n,512) <= kKvClientMaxValueBytes` | `PutBatch` 逐请求 |
-| 适配器读 | slot 容量 >= `AlignUp(n,512)`，返回长度 == n | `GetBatch` 逐请求 |
+| 适配器写 / 读 | `AlignUp(N,512) <= kKvClientMaxValueBytes` | `PlanIo` |
+| 适配器读 | 返回长度 == `request.size`（N） | `GetBatch` |
 
 Master 那道必需，因为 `kMaxSliceSize`（16,777,200）比 SDK 上限宽 496 字节，且只在 CACHELIB 分配器下生效（`master_service.cpp:5287-5293`）。
-
 ## 3.5 shard-5：Master 集成
 
 **文件**：`master_service.{h,cpp}`
@@ -1830,7 +1371,7 @@ if (dfs_config.UsesKvClient()) {
 // (master_service.cpp:5225), not value_length.
 if (config.dfs_replica_num > 0 && use_kvclient_) {
     // 512-alignment ruling: the wire format needs a 512B-aligned length, but N
-    // itself may be arbitrary -- the adapter pads the staging slot, it does not
+    // itself may be arbitrary -- the adapter clears the slot tail, it does not
     // reject the object. The bound is on the padded length:
     //     AlignUp(slice_length, 512) <= 16'776'704
     // which is equivalent to slice_length <= 16'776'704 (the limit is itself a
@@ -2060,24 +1601,23 @@ endif()
 | T-01 / T-02 | 单元 | `EncodeBinaryKey` 幂等与单射：同 key 多次调用、10^5 个不同 key 抽样 | 逐字节相同 / 互不相同 | §3.1 纯函数约束 |
 | T-03 | 单元 | 缩小 seed 空间强制构造碰撞，先写 k1 再写 k2 | k2 覆盖 k1，读 k1 得到 k2 的数据；默认配置（checksum 关闭）下**无错误返回**，开启 `MOONCAKE_STORE_CHECKSUM` 时返回 `CHECKSUM_MISMATCH` | SFMEA-01（验证碰撞后果与检测边界） |
 | T-04 / T-05 | 单元 | 空 logical key；同批两个相同 logical key | 前者 `INVALID_PARAMS`；后者第二个 `INVALID_PARAMS` | SFMEA-02/03 |
-| T-06 / T-25 / T-25b / T-09b | 单元 | N=513 写读；A(513)→B(1024) 复用同一 slot 后再读 A | 成功，`buffer.region.size == 1024`，`[0,513)` 为原始数据、`[513,1024)` 全 0；复用后 A 不含 B 残留 | SFMEA-04、512 对齐裁决（N 任意是合法输入，不是拒绝条件） |
+| T-06 / T-25 / T-25b / T-09b | 单元 | N=513 写读；A(513)→B(1024) 复用同一槽位后再读 A | 成功，`buffer.region.size == 1024`，`[0,513)` 为原始数据、`[513,1024)` 全 0；复用后 A 不含 B 残留 | SFMEA-04、512 对齐裁决（N 任意是合法输入，不是拒绝条件） |
 | T-07 | 单元 | N = 16,776,704（上限，本身 512 对齐） | 成功，`buffer.region.size == 16776704`，无补零 | §3.5 上限 |
 | T-08 / T-08b | 单元 | N = 16,777,000（能过 `kMaxSliceSize`=16,777,200，但 `AlignUp` 后为 16,777,216 超上限）；N = 16,777,216 | Master `PrepareWriteStart` → `INVALID_PARAMS` 且适配器未被调用；绕过 Master 时适配器预检拒绝且**不提交 SDK** | SFMEA-05 双层防护（**关键**：Master 那道校验存在的理由） |
 | T-09 | 单元 | N = 0 | `INVALID_PARAMS` | SFMEA-05/06 |
 | T-09c / T-25c / T-27 | 单元 | `GetBatch` 对 N=513 对象的返回值；构造读回长度 != 请求长度 | 返回 **513**（不是 1024）；长度不符 → `FILE_READ_FAIL` | §3.4、SFMEA-33（返回 wire_len 会让每次读都误报） |
 | T-10 / T-11 | 单元 | `sharedProviderMode = 0` 时 `Init()`；`RegisterRegions` 返回 PARTIAL_FAILED | 前者 `DFS_SERVICE_UNAVAILABLE` 且不进入 `RegisterRegions`；后者 `Init()` / `FileStorage::Init` 明确失败 | SFMEA-07/08 |
-| T-12 | 单元 | staging region 配 1 slot，并发 2 个请求 | 第 2 个立即 `NO_AVAILABLE_HANDLE`，**不阻塞** | SFMEA-09 |
-| T-13 | 单元 | 篡改 entry 的 `buffer.handle` 为非 canonical 的非 0 值 | 提交前预检拒绝，不到 Wait | SFMEA-10 |
-| T-14 | 单元 | fake SDK 让 `Wait` 返回 TIMEOUT 且 task 保持 in-flight | slot 进 quarantine：`InUseSlots()` 归零、`QuarantinedSlots()==1`、`QuarantinedBytes()` 增加、后续 `Acquire` 拿不到该 slot | SFMEA-12 |
+| T-13 | 单元 | 篡改 entry 的 `buffer.handle` 为非注册表内的非 0 值 | 提交前预检拒绝，不到 Wait | SFMEA-10 |
+| T-14 | 单元 | fake SDK 让 `Wait` 返回 TIMEOUT 且 task 保持 in-flight | 区间被 taint：`TaintedBytes()` 增加，同区间后续请求返回 `INVALID_PARAMS` | SFMEA-12/44 |
 | T-15 | 单元 | fake SDK 让 `Wait` 超时且 `entryStatus` 保持初值 `OK` | 逐项结果为 `RPC_TIMEOUT`，**绝不为 OK** | SFMEA-13（回归防护，必须有） |
-| T-16 | 单元 | fake SDK 返回 task status=`PARTIAL_FAILED`，第 2 项 entryStatus 为业务错误，其余 OK | 按 `originalIndices` 回填原下标 2、其余成功；slot 按 entry status 处置（本例全为业务错误 → 全部 Release），`InUseSlots()` 归零 | SFMEA-14（终态：逐条映射 + 按 entry 处置） |
-| T-17 | 单元 | fake SDK 让整个 task 返回 `CANCELED`；另跑 `TIMEOUT` / `IN_PROGRESS` | 全部 slot quarantine，逐项 `INTERNAL_ERROR`（`TIMEOUT` 为 `RPC_TIMEOUT`） | SFMEA-15/13 |
-| T-18 | 单元 | fake SDK 让 `StoreAsync` 提交阶段失败 | slot 全部 **Release**（非 quarantine），`InUseSlots()` 归零 | SFMEA-16 |
+| T-16 | 单元 | fake SDK 返回 task status=`PARTIAL_FAILED`，第 2 项 entryStatus 为业务错误，其余 OK | 按 `originalIndices` 回填原下标 2、其余成功；区间按 entry status 处置（本例为业务错误 → `inflight--`） | SFMEA-14 |
+| T-17 | 单元 | fake SDK 让整个 task 返回 `CANCELED`；另跑 `TIMEOUT` / `IN_PROGRESS` | 全部区间 `Taint`，逐项 `INTERNAL_ERROR`（`TIMEOUT` 为 `RPC_TIMEOUT`） | SFMEA-15/13 |
+| T-18 | 单元 | fake SDK 让 `StoreAsync` 提交阶段失败 | 区间 `inflight--`（不 taint） | SFMEA-16/17 |
 | T-19 | 单元 | fake SDK 返回 `CQE_OUT_OF_CREATE_SIZE` | 映射 `NO_AVAILABLE_HANDLE` | SFMEA-17 |
 | T-20 / T-21 | 单元 | fake SDK 读时返回 `ENTRY_KEY_NOT_FOUND`；读时返回 `TIMEOUT` | 前者 `OBJECT_NOT_FOUND`；后者 `RPC_TIMEOUT` 且**不触发** `ReconcileMissingKvReplica` | SFMEA-18 正向 / 反向 |
 | T-22 | 单元 | 跨对象合批：3 个对象共 250 entry，批上限 110 | 切成 3 批（110/110/30），无对象被切开，结果下标正确 | §2.3.2 |
 | T-23 | 单元 | `DeleteBatch` 遇 `ENTRY_KEY_NOT_EXIST` | 视为幂等成功 | §3.2 |
-| T-24 | 单元 | `Shutdown` 时仍有 in-flight | 先 Drain；若 `InUseSlots() != 0` 则 `LOG(ERROR)` 且输出 `QuarantinedBytes()` | SFMEA-32 |
+| T-24 | 单元 | `Shutdown` 时仍有 in-flight | 先 Drain；若区间 `inflight != 0` 则 `LOG(ERROR)` 并输出 `TaintedBytes()`；随后注销全部注册区间 | SFMEA-32 |
 | T-26 | 单元 | `Exists()` / `ListKeys()` / `GetRange()` | 均 `NOT_SUPPORTED` | §1.2.2 |
 | T-29 | 集成 | 两副本 Put 成功 → 淘汰 memory → 另一 Client Get | 读到原始数据，逐字节相同 | S1 |
 | T-30 | 集成 | DFS-only Put / Get / Remove | 全流程成功 | S2 |
@@ -2094,24 +1634,24 @@ endif()
 | T-46 | 集成 | 无 KVClient SDK 时构建 | 全部目标构建成功；显式初始化 KVClient 后端返回 `NOT_SUPPORTED`；KVCS/oss/s3 后端功能不受影响 | §3.7 |
 | T-47 | 集成 | 既有 KVCS 回归 | `kvcs_object_storage_adapter_test`、`object_storage_adapter_test`、`distributed_storage_config_test` 全部通过 | 平级架构下 **KVCS 代码零改动**；失败即说明改动越界 |
 | T-48 | 真机 | ASU `Store` 是否支持**覆盖写**：同 CacheKey 连续两次 Store 不同 value | 读回应为第二次 | **阻塞**：决定 `PutBatch` 是否需先 Delete（KVCS 因 insert-only 必须这么做）。不支持则 Upsert 与同 key 重写都会失败 |
-| T-49 | 真机 | `Wait` 超时后设备是否仍访问 buffer | 超时后立即用哨兵值覆写 staging slot，检查是否被设备改写 | **阻塞**：验证 quarantine 的必要性边界 |
+| T-49 | 真机 | `Wait` 超时后设备是否仍访问 buffer | 超时后立即用哨兵值覆写已注册区间，检查是否被设备改写 | **阻塞**：验证 taint 的必要性边界 |
 | T-50 / T-51 | 真机 | 设备侧 `singleValueMaxBytes` 实际值；多节点部署下跨节点合批路由 | 读 SDK `Init` 日志（只打日志、不 clamp entry 长度）；`originalIndices` 回填正确 | 高：若上限 < 16,776,704 则实际上限更低；SDK 自动拆分未经真机验证 |
 | T-55 | 单元 | 配置文件写入 `inference.engine=vllm_ascend` + `aggregation.layer_count/layer_slot_bytes`，Init 后对逻辑 key `model@hash@3` 做 Put | 写入的 entry `offset == 0`，`cache_key` 等于 `EncodeBinaryKey(logical_key)`——未被重解释为分层 key | §2.3.1 `keyResolution` 复位、SFMEA-39 |
 | T-56 | 单元 | 注入返回 0 的 hasher 调 `EncodeBinaryKey` | 输出 `BinaryKey` 非全零（不触发协议层 all-zero 拒绝） | SFMEA-38 |
-| T-57 | 单元 | fake SDK 让 transport task 到 deadline：`Wait` 返回 OK、`task_result.status == PARTIAL_FAILED`、部分 `entryStatus == TIMEOUT`，其余为 OK | 只有 TIMEOUT 那几条的 slot 进 quarantine；OK 那几条正常 Release；**不得**因 task status 是 PARTIAL_FAILED 就整批 Release | SFMEA-40（**关键**：PARTIAL_FAILED 不等于可安全归还） |
-| T-58 | 单元 | SDK 配置 `waitTimeoutMs=100`（或任意 < `MOONCAKE_KVCLIENT_WAIT_TIMEOUT_MS`），调 `Init` | `Init` 返回 `INVALID_PARAMS`，不进入 `RegisterRegions`；错误日志同时打印两个超时值 | SFMEA-41 |
-| T-59 | 单元 | 已注册、单段连续、槽位 512B 对齐；分别用 `N % 512 == 0` 与 `N % 512 != 0` 两种对象走 Put/Get | 均走快路径（`io_path=zero_copy`，不占 slot、不 memcpy）；写路径尾部被清零，读路径只返回前 N 字节，数据正确 | SFMEA-42 |
-| T-60 | 单元 | 回退矩阵：多段不连续、区间未注册、`addr` 未对齐、跨注册区间 | 均回退 staging，数据正确，`zerocopy_fallback_total{reason}` 对应递增 | SFMEA-42 |
-| T-61 | 单元 | 快路径 `Wait` 超时 | 区间进入 tainted；同区间后续请求回退；`tainted_bytes` 增加；该区间被淘汰并重新注册后恢复快路径 | SFMEA-44 |
-| T-62 | 单元 | LRU 淘汰时目标区间仍有在途 I/O | 跳过该区间（不注销），改选其他可淘汰区间；无候选时本次请求回退 staging | SFMEA-43 |
-| T-63 | 单元 | `RegisterRegions` 失败后 Put/Get | 功能正确，仅快路径禁用（`fallback_reason=disabled/unregistered`） | SFMEA-45 |
+| T-57 | 单元 | fake SDK 让 transport task 到 deadline：`Wait` 返回 OK、`task_result.status == PARTIAL_FAILED`、部分 `entryStatus == TIMEOUT`，其余为 OK | 只有 TIMEOUT 那几条的区间被 `Taint`；OK 那几条 `inflight--`；**不得**因 task status 是 PARTIAL_FAILED 就整批 taint | SFMEA-40（**关键**：PARTIAL_FAILED 不等于可安全复用） |
+| T-58 | 单元 | SDK 配置 `waitTimeoutMs=100`（或任意 < `MOONCAKE_KVCLIENT_WAIT_TIMEOUT_MS`），调 `Init` | `Init` 返回 `INVALID_PARAMS`，不调用 SDK `Init`；错误日志同时打印两个超时值 | SFMEA-41 |
+| T-59 | 单元 | 已注册、单段连续、槽位 512B 对齐；分别用 `N % 512 == 0` 与 `N % 512 != 0` 两种对象走 Put/Get | 均成功；写路径尾部被清零，读路径只返回前 N 字节，数据正确 | SFMEA-42 |
+| T-60 | 单元 | 违约输入：多段不连续、槽位起点未 512B 对齐 | 均返回 `INVALID_PARAMS`，**不回退、不提交 SDK** | SFMEA-42 |
+| T-61 | 单元 | 区间已 tainted 时再次发起重叠请求 | 返回 `INVALID_PARAMS`；tainted 常驻到进程重启 | SFMEA-44 |
+| T-62 | 单元 | 同一区间连续发起两次 I/O | 第二次命中注册表、复用同一 handle，不重复调用 `RegisterRegions` | SFMEA-45 |
+| T-63 | 单元 | `RegisterRegions` 失败后 Put/Get | 返回 `DFS_SERVICE_UNAVAILABLE`；不降级、不写半份数据 | SFMEA-45 |
 
 ## 4.1 验收标准
 
 - 上表全部「单元」「集成」用例通过（fake SDK / 集成环境）。
 - T-48 ~ T-51 真机验证通过后方可进入生产部署。
-- 24 小时压测后 `QuarantinedBytes()` 与 `TaintedBytes()` 均为 0（无超时泄漏或区间降级）。
-- 关闭 `MOONCAKE_KVCLIENT_ZERO_COPY` 时全部用例同样通过：兜底路径不依赖快路径的可用性。
+- 24 小时压测后 `TaintedBytes()` 为 0（无区间降级）。
+- 关闭 `MOONCAKE_KVCLIENT_ZERO_COPY` 时 DFS I/O 明确失败（不降级），KVCS / oss / s3 / hf3fs / posix 后端不受影响。
 - 既有 KVCS / oss / s3 / hf3fs / posix 后端回归全部通过（T-47）。
 
 ---
@@ -2126,11 +1666,12 @@ endif()
 | 不支持元数据恢复 | Master 重启即目录全丢，L3 数据不可发现 | 启动期显式拒绝 `enable_oplog`；运维需知晓 |
 | 不支持 key 枚举 | `ListKeys` / `RemoveAll` / `RemoveByRegex` 返回 `NOT_SUPPORTED` | 同 key 重写时覆盖 |
 | 不支持范围读 | `BatchRead` 对象分支忽略 `range_read`（`:802-818`） | 上层回退整对象读后截取 |
-| 适配器内 memcpy + 补零 | **兜底路径**需要完整 memcpy + 补零；**快路径**只清零尾部 `[N, wire_len)`（≤511 字节），不拷贝 payload | 零拷贝已消掉 payload 的两份复制；残余成本只落在未注册/不连续对象上 |
+| 适配器内 memcpy + 补零 | 已**取消 staging**：只清零槽位尾部 `[N, wire_len)`（≤511 字节），payload 不复制 | 尾部清零是 512B 契约的一部分，无法省去 |
+| **无降级路径** | 不连续、槽位未 512B 对齐、区间已 tainted、注册失败都直接返回错误 | 上层需保证单段连续、512B 对齐的槽位；这是与 v3.0 的主要行为差异 |
 | **零拷贝要求 512B 槽位** | 对象必须在 buffer 中占一个 512B 对齐、容量 `AlignUp(N,512)` 的槽位；适配器只能看到 N，无法验证槽位容量 | 由上层分配保证（§3.2.3）；未遵守时读会覆盖相邻数据、写会发出相邻数据。这是本方案唯一无法在适配器内自证的前提 |
-| **零拷贝快路径的命中条件** | 要求单段连续、槽位 512B 对齐、区间已注册且未 tainted；未注册或不连续即回退 staging。对象长度本身不受 512 限制（尾部由补零/忽略处理） | 用 `kvclient_io_path_total` / `zerocopy_fallback_total` 观察命中率 |
-| **惰性注册带来首次 I/O 延迟** | 缓存未命中时该次请求多一次 `RegisterRegions`；命中后不再重复 | 调大 `max_registered_bytes` 减少淘汰；用 `kvclient_registration_total` 观察 |
-| **tainted 区间随缓存淘汰恢复** | 一次超时会把该区间降级，直到它被 LRU 淘汰并重新注册 | 已知窗口：安全优先；`TaintedBytes()` 告警提示 |
+| **首次 I/O 多一次注册** | 区间首次使用时调用 `RegisterRegions`，之后复用 handle | 用 `kvclient_registration_total` 观察 |
+| **注册表只增不减** | 区间注册后常驻到关闭，不淘汰；不同对象长度会产生新区间 | 用 `kvclient_registered_bytes` 监控增长 |
+| **tainted 常驻到重启** | 一次超时会把该区间永久标记，重叠请求一律失败 | 已知窗口：安全优先；`TaintedBytes()` 告警提示 |
 | **小对象补零放大** | N < 512 时线格式长度仍是 512，放大最高 512 倍（N=1）；带宽与存储双浪费 | 上层聚合小对象；补零开销可由 §2.5.1 的 `object_size` 与实际线格式长度对比估算 |
 | 单对象上限 16,776,704 B | SDK 线格式 24-bit length + 512 对齐。比 Mooncake 的 `kMaxSliceSize`（16,777,200）窄 496 字节 | `PrepareWriteStart` 显式校验（§3.5）；无其他缓解 |
 | Upsert 无法为仅 MEMORY 对象补 DFS 副本 | `master_service.cpp:6146-6181` 拓扑不符 | 先 Remove 再 Put |
