@@ -19,7 +19,7 @@ L3 当前的 `DistributedStorageBackend` 已支持 `hf3fs` / `posix` / `oss` / `
 | 内容 | 落地位置 |
 | --- | --- |
 | key 映射：XXH64 单 seed → 8B `kv::BinaryKey`，再包成 `kv::CacheKey::FromBytes(...)`；value 就是原始 N 字节。`EncodeKey` 作为 `KvClientObjectStorageAdapter` 的私有方法 | §3.1（§3.4） |
-| 数据面**只有零拷贝一条路径**，且按 512B 对齐：注册区间、对象槽位、线格式长度全部 512B 对齐（对象在 buffer 中占 `AlignUp(N,512)`，写路径尾部补零、读路径尾部忽略）。**原 buffer 的注册与读写全部在 `KvClientObjectStorageAdapter` 内完成**：首次 I/O 惰性注册后常驻、不淘汰，按地址包含关系查句柄（同步 ASUStore 的持久注册模型）；不连续、未对齐或注册失败一律**返回错误**，不回退 staging | §3.2.3（§3.4） |
+| 数据面按 512B 对齐：注册区间、对象槽位、线格式长度全部 512B 对齐（对象在 buffer 中占 `AlignUp(N,512)`，写路径尾部补零、读路径尾部忽略）。 | §3.2.3（§3.4） |
 | SDK 侧 string key 哈希（`CacheKey::FromEngineKey`）**为预留能力，本方案不使用**。key 由 Mooncake 侧 XXH64 算好后以 `FromBytes` 传入。 | §3.1（SFMEA-26、SFMEA-39） |
 | 只增加 `UsesKvClient()`，与 `UsesKvcs()` **平级**；不引入 `UsesManagedKvStorage()`。 | §3.3（§3.5、§3.6） |
 | 双副本（memory + ASU）硬逻辑：ASU 写失败 → 整个 Put 失败 + memory 副本一起 revoke。 | §3.5 |
@@ -75,8 +75,7 @@ flowchart TB
         TE["TransferWrite / TransferRead<br/>Transfer Engine / memcpy"]
         B["DistributedStorageBackend<br/>BatchWrite / BatchRead / BatchDeleteObjects<br/>长度校验"]
         O["ObjectStorageAdapter<br/>按逻辑 key 读写"]
-        K["KvClientObjectStorageAdapter<br/>key 编码、注册与零拷贝读写<br/>提交与完成等待、结果转换"]
-        REG["持久注册表（适配器内）<br/>addr → MRHandle<br/>地址包含查找"]
+        K["KvClientObjectStorageAdapter<br/>key 编码、持久注册表、零拷贝读写<br/>提交与完成等待、结果转换"]
         SDK["KVClient<br/>CacheKey 路由、Host RDMA"]
 
         A <-->|"Put / Get / Remove"| R
@@ -86,7 +85,6 @@ flowchart TB
         C <-->|"读写：key + 描述符 + CPU slices<br/>删除：key"| B
         B <-->|"PutBatch / GetBatch / DeleteBatch"| O
         O <--> K
-        K <-->|"查表 / 首次 I/O 注册"| REG
         K <-->|"内存注册 / 批量提交 / 完成等待"| SDK
     end
 
@@ -110,7 +108,7 @@ flowchart TB
     classDef added fill:#e3f5e8,stroke:#28864b,color:#111827;
     class A,R,RPC,TE,B,O,META,RAM,S existing;
     class C,SDK,M changed;
-    class K,REG added;
+    class K added;
 ```
 
 **分层职责**：
@@ -121,8 +119,7 @@ flowchart TB
 | `DistributedStorageBackend` | slices → 对象请求转换、长度校验 | 仅新增 `UsesKvClient()` 组合判断 |
 | `ObjectStorageAdapter` | 对象存储统一契约 | **零改动**（接口不变） |
 | `KvcsObjectStorageAdapter` | KVCS 后端实现 | **零改动**（与 KVClient 平级，互不影响） |
-| `KvClientObjectStorageAdapter` | KVClient 后端实现：key 编码、原 buffer 注册、零拷贝读写、提交与完成等待 | **新增**；注册与读写都在适配器内完成（§3.2.3） |
-| `RegionRegistry` | 适配器内的**持久**注册表：`addr → MRHandle` 的地址包含查找，注册一次常驻至关闭 | **新增** |
+| `KvClientObjectStorageAdapter` | KVClient 后端实现：key 编码、原 buffer 注册与注册表、零拷贝读写、提交与完成等待 | **新增**；注册与读写都在适配器内完成（§3.2.3） |
 
 ### 2.1.2 Client 侧类图
 
@@ -180,7 +177,8 @@ classDiagram
    
     class KvClientObjectStorageAdapter["KvClientObjectStorageAdapter（新增）"] {
         -kv_client_
-        -region_registry_
+        -regions_
+        -regions_mu_
         +Init()
         +PutV(key, iov, iovcnt)
         +PutBatch(requests)
@@ -188,17 +186,12 @@ classDiagram
         +DeleteBatch(keys)
         -EncodeKey(logical_key)
         -PlanIo(iov, object_size, is_store)
+        -FindPersistentHandle(addr, len)
+        -AddRegion(base, size, handle)
+        -IsTainted(region, addr, len)
+        -Taint(region, addr, len)
+        -ReleaseAllRegions()
         -SubmitAndWait(is_store, entries, plans, results)
-    }
-
-    class RegionRegistry["RegionRegistry（新增，适配器私有）"] {
-        -regions_
-        +FindPersistentHandle(addr, len)
-        +Add(region, handle)
-        +ReleaseAll()
-        +IsTainted(region, addr, len)
-        +Taint(region, addr, len)
-        +Taint(region, addr, len)
     }
 
     class SdkKvClient["kv::KvClient"] {
@@ -218,14 +211,12 @@ classDiagram
     DistributedStorageBackend *-- ObjectStorageAdapter : "持有对象适配器"
     ObjectStorageAdapter <|-- KvClientObjectStorageAdapter
     KvClientObjectStorageAdapter *-- SdkKvClient : "持有 SDK 实例"
-    KvClientObjectStorageAdapter *-- RegionRegistry : "持有注册表"
     DistributedStorageConfig ..> KvClientObjectStorageAdapter : "工厂按配置创建"
 
     style DistributedStorageConfig fill:#fff4cc,stroke:#b58105,color:#111827
     style FileStorage fill:#fff4cc,stroke:#b58105,color:#111827
     style Client fill:#fff4cc,stroke:#b58105,color:#111827
     style KvClientObjectStorageAdapter fill:#e3f5e8,stroke:#28864b,color:#111827
-    style RegionRegistry fill:#e3f5e8,stroke:#28864b,color:#111827
     style DistributedStorageBackend fill:#f3f4f6,stroke:#6b7280,color:#111827
     style ObjectStorageAdapter fill:#f3f4f6,stroke:#6b7280,color:#111827
     style SdkKvClient fill:#f3f4f6,stroke:#6b7280,color:#111827
@@ -239,7 +230,6 @@ classDiagram
 | `Client` | `ReconcileMissingKvcsReplica()` 推广为图中的 `ReconcileMissingKvReplica()`；**内存注册不经过 Client** |
 | `DistributedStorageBackend` | 读写路径已由 `UsesObjectStorage()` 抽象化；仅新增 `UsesKvClient()` 组合判断，不参与注册 |
 | `ObjectStorageAdapter` | **零改动**。同步契约（payload 须在返回前保持有效）是零拷贝路径成立的前提 |
-| `RegionRegistry` | **新增，适配器私有**。注册一次常驻的 `addr → MRHandle` 地址包含查找（同 ASUStore `FindPersistentHandle`）；不暴露到任何接口（§3.2.3） |
 | `kv::KvClient` | **SDK 不改**。只用 `StoreAsync` / `LoadAsync` / `DeleteAsync` / `QueryAsync` 四个公共方法——SDK 不暴露 `Batch*Async`；`StoreAsync` / `LoadAsync` 按 `entries.size() > 1 \|\| useBatchIoForSingleKey`（默认 true，故单条也走 `BATCH_*`）内部选择 opcode，适配器无需关心。四个方法均带 `const kv::IoOptions& options = {}`；本方案不填 `kvns`、不用 `prerequisite`（见 §3.2.1） |
 
 ### 2.1.3 Master 侧类图
@@ -589,7 +579,7 @@ sequenceDiagram
     FS->>RC: Client::SetDfsStorageBackend(backend)
 ```
 
-**注册表初始为空**：`RegionRegistry` 不参与 `Init`，由适配器在首次 I/O 时注册并**常驻到关闭**（同步 ASUStore 的 `persistentRegions_` 模型，不淘汰）。首次请求因此多一次 `RegisterRegions` 开销；注册失败则该请求**直接失败**，不回退 staging（§3.2.3）。
+**注册表初始为空**：适配器内的注册表不参与 `Init`，由适配器在首次 I/O 时注册并**常驻到关闭**（同步 ASUStore 的 `persistentRegions_` 模型，不淘汰）。首次请求因此多一次 `RegisterRegions` 开销；注册失败则该请求**直接失败**，不回退 staging（§3.2.3）。
 
 ### 2.3.2 写入阶段
 
@@ -802,7 +792,7 @@ sequenceDiagram
 | SFMEA-04 | 未按 `AlignUp(N,512)` 补零：直接把 N 当作线格式长度，且未清零尾部 | 提交被拒或行为未定义；槽位里上一次 I/O 的残留字节会被发到存储侧 | `wire_len = AlignUp(n, 512)`；写路径显式 `memset` 尾部 `[n, wire_len)` | 写 513 字节对象，断言 `buffer.region.size == 1024` 且尾部全 0。N 非 512 倍数是**合法输入**，故障在补零遗漏 |
 | SFMEA-05/06 | 长度非法：N > 16,776,704，或 N == 0 | 超限会被 `PackSqe` 本地拒绝，预发送失败 **abort 整个 transport task**（`trans_task_executor.cc:227-232`）；N == 0 不被 SDK 接受 | 适配器逐请求预检 `wire_len <= kKvClientMaxValueBytes` 且 `n > 0`；Master `PrepareWriteStart` 第一道校验 | 不能指望「只失败超限那条」。Master 那道必需：`kMaxSliceSize`（16,777,200）更宽且只在 CACHELIB 下生效 |
 | SFMEA-07/08 | 初始化门禁失败：`sharedProviderMode != SHARED`，或 SDK `Init` 失败 | 前者在 INDEPENDENT 下 SDK 会为每个 ASU 节点 `BindMemory` 全部已注册区域，而 AICPU 的 `BindMemory` 只接受 `MEM_DEVICE` → **非空 view 下注册必然 PARTIAL_FAILED**；后者适配器不可用 | `Init()` 中 `PreflightSharedProvider` 硬门禁（缺省或为 0 直接 `DFS_SERVICE_UNAVAILABLE`）；SDK `Init` 失败则适配器 `Init` 失败 | 必须在 Init 阶段失败而非运行期 |
-| SFMEA-10/11 | 提交前 buffer 元数据不合法：`buffer.handle` 为空或与注册表不符，调用方自填 `mrKey`，或区间未注册 | 非 0 但未注册的 handle 在提交阶段**不报错**，到 Wait 才以 `BUFFER_NOT_REGISTERED` 暴露且**连坐整 task**；`mrKey` 由 SDK 回填，自填值无效 | handle 一律取自 `RegionRegistry`，提交前预检非空且属于本适配器；未注册区间直接在建 plan 阶段失败；`mrKey` 一律留 `std::nullopt` | 注册经 SDK 完成，不接受调用方传入的 handle |
+| SFMEA-10/11 | 提交前 buffer 元数据不合法：`buffer.handle` 为空或与注册表不符，调用方自填 `mrKey`，或区间未注册 | 非 0 但未注册的 handle 在提交阶段**不报错**，到 Wait 才以 `BUFFER_NOT_REGISTERED` 暴露且**连坐整 task**；`mrKey` 由 SDK 回填，自填值无效 | handle 一律取自适配器内的注册表，提交前预检非空且属于本适配器；未注册区间直接在建 plan 阶段失败；`mrKey` 一律留 `std::nullopt` | 注册经 SDK 完成，不接受调用方传入的 handle |
 | SFMEA-12 | `Wait` 超时，设备仍在访问调用方 buffer | 缓冲区被复用 → 设备写入新数据 = **数据损坏** | 该区间标记为 tainted，后续重叠请求**直接失败**；tainted 常驻到进程重启（注册不淘汰） | **承重**。SDK 无面向业务的中止能力：`Cancel` 只由 `Shutdown` 调用，且只放弃任务、不停设备（`kv_transport_impl.cc:196-201`） |
 | SFMEA-13 | 超时后读 `entryStatus` | 初值是 `Status::OK()`，`BuildResult` 在 `!Done()` 时原样返回 → **假成功**，数据未落盘却报成功 | 仅 `OK` / `PARTIAL_FAILED` 两个可信终态下映射 `entryStatus`；`TIMEOUT` / `CANCELED` / `IN_PROGRESS` 或本地 `Wait` 非 OK 时**不读**，整批置错 | 必须有专门用例覆盖，否则极易回归 |
 | SFMEA-14 | task 级 `PARTIAL_FAILED`，逐项 entryStatus 部分失败 | 部分 key 成功部分失败 | 逐项映射 entryStatus → ErrorCode 并按 `originalIndices` 回填；区间按 **entry status** 处置：业务错误 → `inflight--`，`TIMEOUT` / `CANCELED` / `IN_PROGRESS` → `Taint` | entryStatus 与输入严格一一对应；task 终态**不等于**可安全复用（SFMEA-40） |
@@ -839,7 +829,7 @@ sequenceDiagram
 | `object_size` | descriptor | 对齐/上限问题定位 |
 | `task_id` | SDK | 跨 client/transport 层关联 SDK 内部日志 |
 | `replica_id` | descriptor | miss 清理 CAS 排查 |
-| `region_id` | `RegionRegistry` | 区间关联（注册、taint、inflight） |
+| `region_id` | 适配器注册表 | 区间关联（注册、taint、inflight） |
 | `wire_len` | 适配器 | 线格式长度；与 `object_size` 的差值即补零量 |
 | `tainted` | 适配器 | 该请求是否因区间已 tainted 被拒绝 |
 | `batch_index` / `original_index` | 适配器 | 批量结果错位排查 |
@@ -890,8 +880,6 @@ sequenceDiagram
 **职责**：logical key → 8 字节 `kv::BinaryKey` 的确定性映射，并包装成 SDK 的 `kv::CacheKey`。
 
 **文件**：`mooncake-store/include/storage/distributed/kvclient/kvclient_key_codec.h`（header-only）
-
-> **SDK 类型约束**：SDK 的 `kv::CacheKey` 已不是裸的 `std::array<std::byte,8>`，而是一个持有 `std::variant<BinaryKey, std::string>` 的类，只能通过 `kv::CacheKey::FromBytes(BinaryKey)` / `kv::CacheKey::FromEngineKey(std::string)` 构造，对外只暴露 `TryGetBinaryKey()` / `TryGetEngineKey()`。它没有 `data()` / `size()` / 迭代器，也不是聚合体。本 shard 因此把 **8 字节身份**收敛在 `kv::BinaryKey` 上，只在最后一步包成 `CacheKey`。
 
 ```cpp
 #pragma once
@@ -978,7 +966,7 @@ inline std::string CacheKeyToLogString(const kv::BinaryKey& key) {
 
 **文件**：`mooncake-store/include/storage/distributed/kvclient/kvclient_object_storage_adapter.h`、`src/storage/distributed/kvclient/kvclient_object_storage_adapter.cpp`
 
-**为什么注册表不单独成类**：它只有一个消费者，注册与注销本就依赖 `kv::KvClient`；故注册表、tainted 区间与在途计数直接作为适配器私有成员持有（`RegionRegistry` 仅为内部类型）。
+**注册表不单独成类**：它只有一个消费者，注册与注销本就依赖 `kv::KvClient`；故注册表、tainted 区间与在途计数直接作为适配器私有成员持有。
 
 ### 3.2.1 类定义
 
@@ -1016,8 +1004,6 @@ struct KvClientAdapterConfig {
 };
 
 struct RegisteredRegion;  // §3.2.3
-
-class RegionRegistry;     // §3.2.3
 
 class KvClientObjectStorageAdapter final : public ObjectStorageAdapter {
    public:
@@ -1063,12 +1049,24 @@ class KvClientObjectStorageAdapter final : public ObjectStorageAdapter {
     std::optional<IoPlan> PlanIo(const iovec* iov, int iovcnt,
                                  size_t object_size, bool is_store,
                                  ErrorCode& error);
+    // Address-containment lookup, mirroring ASUStore::FindPersistentHandle.
+    // Runs under a shared lock; returns nullptr when no range contains
+    // [addr, addr + len).
+    std::shared_ptr<RegisteredRegion> FindPersistentHandle(uintptr_t addr,
+                                                           size_t len) const;
+    // Inserts a freshly registered range. Ranges are never evicted.
+    std::shared_ptr<RegisteredRegion> AddRegion(uintptr_t base, size_t size,
+                                                kv::MRHandle handle);
+    bool IsTainted(const RegisteredRegion& region, uintptr_t addr,
+                   size_t len) const;
     // Retires [addr, addr + wire_len): the device may still write it. The mark
     // is permanent for this process because ranges are never re-registered
     // (SFMEA-44).
     void Taint(const std::shared_ptr<RegisteredRegion>& region, uintptr_t addr,
                size_t wire_len);
     uint64_t TaintedBytes() const;
+    // Collects every handle for the final UnregisterRegions at shutdown.
+    std::vector<kv::MRHandle> ReleaseAllRegions();
 
     // Kept as a bool because kv::AsuOpType lives in the SDK's private
     // src/common/utils/task_context.h; the public API exposes only
@@ -1084,8 +1082,13 @@ class KvClientObjectStorageAdapter final : public ObjectStorageAdapter {
 
     KvClientAdapterConfig config_;
     std::unique_ptr<kv::KvClient> kv_client_;
-    std::unique_ptr<RegionRegistry> region_registry_;
     bool initialized_ = false;
+
+    // Persistent registrations: one entry per range, registered on first use
+    // and kept until Shutdown (ASUStore model).
+    mutable std::shared_mutex regions_mu_;
+    std::unordered_map<uintptr_t, std::shared_ptr<RegisteredRegion>> regions_;
+    std::atomic<uint64_t> next_region_id_{1};
 };
 
 }  // namespace mooncake
@@ -1116,23 +1119,11 @@ struct RegisteredRegion {
     std::vector<TaintedRange> tainted;   // 保序、合并
 };
 
-class RegionRegistry {
-   public:
-    std::shared_ptr<RegisteredRegion> Add(uintptr_t base, size_t size,
-                                          kv::MRHandle handle);
-    // Containment lookup, mirroring ASUStore::FindPersistentHandle.
-    std::shared_ptr<RegisteredRegion> FindPersistentHandle(uintptr_t addr,
-                                                          size_t len) const;
-    bool IsTainted(const RegisteredRegion& r, uintptr_t addr, size_t len) const;
-    void Taint(const std::shared_ptr<RegisteredRegion>& r, uintptr_t addr,
-               size_t len);
-    std::vector<kv::MRHandle> ReleaseAll();
-    uint64_t TaintedBytes() const;
-
-   private:
-    mutable std::shared_mutex mu_;
-    std::unordered_map<uintptr_t, std::shared_ptr<RegisteredRegion>> regions_;
-};
+// 注册表是适配器的私有成员，不单独成类（§3.2.1）：
+//   mutable std::shared_mutex regions_mu_;
+//   std::unordered_map<uintptr_t, std::shared_ptr<RegisteredRegion>> regions_;
+//   std::atomic<uint64_t> next_region_id_{1};
+// 方法：FindPersistentHandle / AddRegion / IsTainted / Taint / ReleaseAllRegions
 ```
 
 - **注册一次常驻**：首次 I/O 注册 `[addr, AlignUp(len, 512))` 并插入；此后同区间请求直接复用 handle，**不淘汰**，直到 `Shutdown` 统一注销。这是 ASUStore 的持久注册语义。
@@ -1165,7 +1156,7 @@ std::optional<IoPlan> KvClientObjectStorageAdapter::PlanIo(
         return std::nullopt;
     }
 
-    auto region = region_registry_->FindPersistentHandle(addr, wire_len);
+    auto region = FindPersistentHandle(addr, wire_len);
     if (!region) {
         // Register once and keep it for the adapter lifetime (ASUStore model).
         std::vector<kv::MemoryRegion> regions{
@@ -1176,9 +1167,9 @@ std::optional<IoPlan> KvClientObjectStorageAdapter::PlanIo(
             error = ErrorCode::DFS_SERVICE_UNAVAILABLE;  // 注册失败即失败
             return std::nullopt;
         }
-        region = region_registry_->Add(addr, wire_len, out.front().handle);
+        region = AddRegion(addr, wire_len, out.front().handle);
     }
-    if (region_registry_->IsTainted(*region, addr, wire_len)) {
+    if (IsTainted(*region, addr, wire_len)) {
         error = ErrorCode::INVALID_PARAMS;
         return std::nullopt;
     }
