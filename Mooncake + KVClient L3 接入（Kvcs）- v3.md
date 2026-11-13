@@ -190,7 +190,6 @@ classDiagram
         -AddPersistentRegion(base, size, handle)
         -IsUnsafe(region, addr, len)
         -MarkUnsafe(region, addr, len)
-        -ReleaseAllPersistentRegions()
         -SubmitAndWait(is_store, entries, plans, results)
     }
 
@@ -920,12 +919,6 @@ inline kv::BinaryKey EncodeBinaryKey(std::string_view logical_key) {
     return raw;
 }
 
-// The only form handed to the SDK. Binary keys are passed through unchanged
-// by the SDK's key resolver, so the wire identity is exactly what we hashed.
-inline kv::CacheKey EncodeCacheKey(std::string_view logical_key) {
-    return kv::CacheKey::FromBytes(EncodeBinaryKey(logical_key));
-}
-
 // 16 hex chars. This is the only observable handle for collision diagnosis,
 // so it must be logged unconditionally at VLOG(2). It takes BinaryKey rather
 // than CacheKey because CacheKeyView/CacheKeyToHex live in the SDK's private
@@ -1058,8 +1051,6 @@ class KvClientObjectStorageAdapter final : public ObjectStorageAdapter {
     void MarkUnsafe(const std::shared_ptr<RegisteredPersistentRegion>& region, uintptr_t addr,
                size_t wire_len);
     uint64_t UnsafeBytes() const;
-    // Collects every handle for the final UnregisterRegions at shutdown.
-    std::vector<kv::MRHandle> ReleaseAllPersistentRegions();
 
     // Kept as a bool because kv::AsuOpType lives in the SDK's private
     // src/common/utils/task_context.h; the public API exposes only
@@ -1116,8 +1107,7 @@ struct RegisteredPersistentRegion {
 //   mutable std::shared_mutex persistentRegionsMu_;
 //   std::unordered_map<uintptr_t, std::shared_ptr<RegisteredPersistentRegion>> persistentRegions_;
 //   std::atomic<uint64_t> nextPersistentRegionId_{1};
-// 方法：FindPersistentHandle / AddPersistentRegion / IsUnsafe / MarkUnsafe /
-//       ReleaseAllPersistentRegions
+// 方法：FindPersistentHandle / AddPersistentRegion / IsUnsafe / MarkUnsafe
 ```
 
 - **注册一次常驻**：首次 I/O 注册 `[addr, AlignUp(len, 512))` 并插入；此后同区间请求直接复用 handle，**不淘汰**，直到 `Shutdown` 统一注销。这是 ASUStore 的持久注册语义。
