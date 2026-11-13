@@ -181,7 +181,7 @@ classDiagram
         +DeleteBatch(keys)
         -MakeCacheKey(logical_key)
         -PlanBuffer(iov, object_size, is_store)
-        -RegisterBatchBuffers(plans)
+        -RegisterBuffers(plans)
         -ReleaseBatchBuffers(registered)
         -FindHandle(registered, addr, len)
         -waitForCompletion(task_id)
@@ -223,7 +223,7 @@ classDiagram
 | `Client` | `ReconcileMissingKvcsReplica()` 推广为图中的 `ReconcileMissingKvReplica()`；**内存注册不经过 Client** |
 | `DistributedStorageBackend` | 新增 `UsesKvClient()` 判断与注册转发；**读写分支透传调用方 buffer**（读分支去掉多切片 staging，校验 `capacity >= AlignUp(N,512)`） |
 | `ObjectStorageAdapter` | **零改动**。同步契约（payload 须在返回前保持有效）是零拷贝路径成立的前提 |
-| `KvClientObjectStorageAdapter` | **新增**。实现 `ObjectStorageAdapter`：`MakeCacheKey`、`PlanBuffer`、`RegisterBatchBuffers` / `ReleaseBatchBuffers`、`waitForCompletion`；数据面见 §3.2.3 |
+| `KvClientObjectStorageAdapter` | **新增**。实现 `ObjectStorageAdapter`：`MakeCacheKey`、`PlanBuffer`、`RegisterBuffers` / `ReleaseBatchBuffers`、`waitForCompletion`；数据面见 §3.2.3 |
 | `kv::KvClient` | **SDK 不改**。提交面只用 `StoreAsync` / `LoadAsync` / `DeleteAsync` / `QueryAsync`，另用 `Wait` / `RegisterRegions` / `UnregisterRegions` 完成等待与注册——SDK 不暴露 `Batch*Async`；`StoreAsync` / `LoadAsync` 按 `entries.size() > 1 \|\| useBatchIoForSingleKey`（默认 true，故单条也走 `BATCH_*`）内部选择 opcode，适配器无需关心。四个方法均带 `const kv::IoOptions& options = {}`；本方案不填 `kvns`、不用 `prerequisite`（见 §3.2.3、§5） |
 
 ### 2.1.3 Master 侧类图
@@ -782,7 +782,7 @@ sequenceDiagram
 | SFMEA-02 | 非法 key / 长度：空 key、同批重复、N == 0、N > 16,776,704、全零 CacheKey | 编码失败；协议层拒绝，预发送失败会 **abort 整个 transport task** | `MakeCacheKey` 拒空并把全零映射为非零常量；写侧拒绝同批重复；逐请求预检 `n > 0` 且 `wire_len <= max_object_bytes`；Master `PrepareWriteStart` 第一道校验 | 不能指望「只失败越界那条」 |
 | SFMEA-03 | 写路径未按 `AlignUp(N,512)` 补零或未清零尾部 | 提交被拒；调用方 buffer 尾部的残留字节被当成 padding 发到存储侧 | `wire_len = AlignUp(N,512)`；`PlanBuffer` 清零尾部 `[N, wire_len)` | 写 513 字节对象，断言尾部全 0 |
 | SFMEA-04 | 初始化门禁失败：`sharedProviderMode != SHARED`、SDK `Init` 失败、transport deadline < `Wait` 超时 | 适配器不可用；或健康但较慢的写被判 `PARTIAL_FAILED` + `TIMEOUT` | `CheckSharedProviderMode` 硬门禁；`Init` 失败即失败；校验 `cfg.timeoutMs >= wait_timeout_ms` | 全部在 `Init` 阶段失败 |
-| SFMEA-05 | 提交的 handle 与本批注册结果不一致，或 `mrKey` 被误填 | 到 `Wait` 才以 `BUFFER_NOT_REGISTERED` 暴露且**连坐整 task** | handle 一律取自本批 `RegisterBatchBuffers` 的结果；`mrKey` 留 `std::nullopt` | 注册只在批内产生，生命周期与 batch 相同 |
+| SFMEA-05 | 提交的 handle 与本批注册结果不一致，或 `mrKey` 被误填 | 到 `Wait` 才以 `BUFFER_NOT_REGISTERED` 暴露且**连坐整 task** | handle 一律取自本批 `RegisterBuffers` 的结果；`mrKey` 留 `std::nullopt` | 注册只在批内产生，生命周期与 batch 相同 |
 | SFMEA-06 | `Wait` 超时 / 取消：调用方 buffer 可能被迟到写覆盖，且 `entryStatus` 仍停留在初值 `OK` | 读到错数据；或把未落盘的数据报成功 | 非终态**不读** `entryStatus`，整批置错；**buffer 复用由调用方保证**（依赖 T-19） | SDK 无面向业务的中止能力 |
 | SFMEA-07 | task 级 `PARTIAL_FAILED`、派发后 `CANCELED`、或路由失败 | 部分 key 成功、部分失败；`CANCELED` 时设备可能已访问调用方 buffer | 逐项映射 `entryStatus` 并按 `originalIndices` 回填；适配器不持有 buffer，无需处置 | entryStatus 与输入严格一一对应 |
 | SFMEA-08 | 设备侧资源 / 连接错误：`CQE_OUT_OF_CREATE_SIZE`、`CONNECTION_ERROR`、存储空间耗尽 | 写或读失败；无容量查询与自动回收 | 分别映射为 `NO_AVAILABLE_HANDLE` / `DFS_SERVICE_UNAVAILABLE`；Master 不建 capacity provider | 容量管理留待 SDK |
@@ -795,7 +795,7 @@ sequenceDiagram
 | SFMEA-15 | 析构时仍有 in-flight batch | 注销注册会让设备访问已注销内存 | 先排空在途 batch；仍有在途则 `LOG(ERROR)` | 每批注册在 `Wait` 后已注销，析构不持有 handle |
 | SFMEA-16 | 读回长度 != `object_size` | 数据不完整 | 双层校验：适配器内 + `DistributedStorageBackend:838-841`，返回 `FILE_READ_FAIL` | `GetBatch` 必须返回 **N** 而非 `wire_len` |
 | SFMEA-17 | 启用 string key 路径的连带风险：`Resolve()` 提交阶段失败，或配置写了 `inference.engine=vllm_ascend` | 整批同步失败；或 `@...@<数字>` key 被重解释为分层 key，读写落到错误的 key/offset | 本方案只传 `FromBytes`，并在 `Init` 前把 `keyResolution` 复位为 `GENERIC` | 换用 `FromEngineKey` 前必须保留这两道 |
-| SFMEA-18 | 批注册失败、`wire_len` 超上限、iov 不连续或未对齐 | 整批请求失败（注册失败时未触达设备） | `RegisterBatchBuffers` 失败 → 全部 `DFS_SERVICE_UNAVAILABLE`；`PlanBuffer` 拒绝越界/不对齐 | 调用方需保证单段连续、512B 对齐与补齐容量 |
+| SFMEA-18 | 批注册失败、`wire_len` 超上限、iov 不连续或未对齐 | 整批请求失败（注册失败时未触达设备） | `RegisterBuffers` 失败 → 全部 `DFS_SERVICE_UNAVAILABLE`；`PlanBuffer` 拒绝越界/不对齐 | 调用方需保证单段连续、512B 对齐与补齐容量 |
 
 ## 2.5 可定位设计
 
@@ -1009,7 +1009,7 @@ class KvClientObjectStorageAdapter final : public ObjectStorageAdapter {
                                          size_t object_size, bool is_store,
                                          ErrorCode& error);
     // Registers every distinct buffer of this batch with one RegisterRegions.
-    tl::expected<std::vector<RegisteredBuffer>, ErrorCode> RegisterBatchBuffers(
+    tl::expected<std::vector<RegisteredBuffer>, ErrorCode> RegisterBuffers(
         std::span<const BufferPlan> plans);
     // Unregisters the batch's handles. Called once, after Wait returns.
     void ReleaseBatchBuffers(std::span<const RegisteredBuffer> registered);
@@ -1035,7 +1035,7 @@ class KvClientObjectStorageAdapter final : public ObjectStorageAdapter {
 
 ```cpp
 tl::expected<std::vector<KvClientObjectStorageAdapter::RegisteredBuffer>, ErrorCode>
-KvClientObjectStorageAdapter::RegisterBatchBuffers(
+KvClientObjectStorageAdapter::RegisterBuffers(
     std::span<const BufferPlan> plans) {
     std::vector<RegisteredBuffer> registered;
     std::vector<kv::MemoryRegion> regions;
@@ -1101,7 +1101,7 @@ for (size_t i = 0; i < requests.size(); ++i) {
 }
 
 // 2) 本批 buffer 一次注册
-auto registered = RegisterBatchBuffers(valid_plans);
+auto registered = RegisterBuffers(valid_plans);
 if (!registered) {
     FillError(results, ToErrorCode(registered.error()));
     return results;
