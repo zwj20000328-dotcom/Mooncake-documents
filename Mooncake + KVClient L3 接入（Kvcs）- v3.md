@@ -1,6 +1,6 @@
 # Mooncake + KVClient L3 接入设计方案
 
-版本：v4.4　更新日期：2026-11-13
+版本：v4.5　更新日期：2026-11-13
 
 ---
 
@@ -19,7 +19,7 @@ L3 当前的 `DistributedStorageBackend` 已支持 `hf3fs` / `posix` / `oss` / `
 | 内容 | 落地位置 |
 | --- | --- |
 | key 映射：XXH64 单 seed → 8B `kv::BinaryKey`，再包成 `kv::CacheKey::FromBytes(...)`；value 就是原始 N 字节。`MakeCacheKey` 作为 `KvClientObjectStorageAdapter` 的私有方法 | §3.1（§3.4） |
-| 数据面：**零拷贝 + 按批注册**。每个 batch 由适配器把该批涉及的原 buffer 一次性 `RegisterRegions`，`Wait` 后一次性 `UnregisterRegions`；I/O 直接在调用方 buffer 上读写。对象须占 `AlignUp(N,512)`、起点 512B 对齐 | §3.2.2（§3.4） |
+| 数据面：**零拷贝快路径 + 暂存兜底 + 按批注册**。适配器对本批 buffer 一次 `RegisterRegions`；调用方声明 `capacity >= wire_len` 且起点 512B 对齐时直接在原 buffer 读写，否则分配 `wire_len`、512B 对齐的 staging 并拷贝；终态后注销 | §3.2.2（§3.4） |
 | SDK 侧 string key 哈希（`CacheKey::FromEngineKey`）**为预留能力，本方案不使用**。key 由 Mooncake 侧 XXH64 算好后以 `FromBytes` 传入。 | §3.1（SFMEA-17） |
 | 只增加 `UsesKvClient()`，与 `UsesKvcs()` **平级**；不引入 `UsesManagedKvStorage()`。 | §3.3（§3.5、§3.6） |
 | 双副本（memory + ASU）硬逻辑：ASU 写失败 → 整个 Put 失败 + memory 副本一起 revoke。 | §3.5 |
@@ -117,7 +117,7 @@ flowchart TB
 | 层 | 职责 | 本方案改动 |
 | --- | --- | --- |
 | `Client` | 副本编排、逐 key 收尾、删除路由、miss 清理 | 删除顺序改 value-first；miss 清理门控放宽 |
-| `DistributedStorageBackend` | slices → 对象请求转换、长度校验 | 新增 `UsesKvClient()` 判断；**仅 KVClient 子分支**的读路径不做多切片 staging，校验补齐容量后把调用方 buffer 直传适配器（oss / s3 / kvcs-lowlevel 共用分支保持原样） |
+| `DistributedStorageBackend` | slices → 对象请求转换、长度校验 | 新增 `UsesKvClient()` 判断；**仅 KVClient 子分支**的读路径不做多切片 staging，切片只需覆盖 object_size，`capacity` 由上层声明并随请求透传，由适配器决定直传或暂存（oss / s3 / kvcs-lowlevel 共用分支保持原样） |
 | `ObjectStorageAdapter` | 对象存储统一契约 | **零改动**（接口不变） |
 | `KvClientObjectStorageAdapter` | KVClient 后端实现：key 编码、按批注册、零拷贝 I/O、提交与完成等待 | **新增**；注册与 I/O 都在适配器内完成，每 batch 注册一次（§3.2.2） |
 
@@ -231,7 +231,7 @@ classDiagram
 | `CreateStorageBackend(config)` | 修改现有工厂函数，在 distributed 分支新增 `UsesKvClient()` case，转调厂商无关的 `CreateKvClientObjectStorageAdapter()` |
 | `FileStorage` | 修改构造时的 DFS 启用判断，将 KVClient 后端注入 Client；沿用现有初始化入口 |
 | `Client` | `ReconcileMissingKvcsReplica()` 推广为图中的 `ReconcileMissingKvReplica()`；**内存注册不经过 Client** |
-| `DistributedStorageBackend` | 新增 `UsesKvClient()` 判断；**读写分支透传调用方 buffer**（仅 KVClient 子分支的读路径去掉多切片 staging，校验 `capacity >= AlignUp(N,512)`；oss / s3 / kvcs-lowlevel 分支不变）；注册在适配器内按批完成，不经后端 |
+| `DistributedStorageBackend` | 新增 `UsesKvClient()` 判断；**读写分支透传调用方 buffer**（仅 KVClient 子分支的读路径去掉多切片 staging，切片只需覆盖 object_size，`capacity` 由上层声明并透传；oss / s3 / kvcs-lowlevel 分支不变）；注册与直传/暂存都在适配器内完成，不经后端 |
 | `ObjectStorageAdapter` | **零改动**。同步契约（payload 须在返回前保持有效）是零拷贝路径成立的前提 |
 | `KvClientObjectStorageAdapter` | **新增**。实现 `ObjectStorageAdapter`：`MakeCacheKey`、`RegisterBuffers` / `ReleaseBuffers`、`waitForCompletion`；数据面见 §3.2.3 |
 | `kv::KvClient` | **SDK 不改**。提交面只用 `StoreAsync` / `LoadAsync` / `DeleteAsync` / `QueryAsync`，另用 `Wait` / `RegisterRegions` / `UnregisterRegions` 完成等待与注册——SDK 不暴露 `Batch*Async`；`StoreAsync` / `LoadAsync` 按 `entries.size() > 1 \|\| useBatchIoForSingleKey`（默认 true，故单条也走 `BATCH_*`）内部选择 opcode，适配器无需关心。四个方法均带 `const kv::IoOptions& options = {}`；本方案不填 `kvns`、不用 `prerequisite`（见 §3.2.3、§5） |
@@ -342,7 +342,7 @@ flowchart TB
         GATE{"⑤ NonDfsTransfersSucceeded?"}
         W["⑥ WriteDfsReplicas<br/>构造 key + 描述符 + CPU slices"]
         B["DistributedStorageBackend::BatchWrite<br/>校验总长度等于 object_size"]
-        O["KvClientObjectStorageAdapter::PutBatch<br/>MakeCacheKey + RegisterBuffers（校验 / 清零 / 注册）"]
+        O["KvClientObjectStorageAdapter::PutBatch<br/>MakeCacheKey + RegisterBuffers（校验 / 直传或暂存 / 注册）"]
         D["⑦ StoreAsync → waitForCompletion<br/>→ ReleaseBuffers（终态或提交失败时注销）"]
         J{"⑧ Client 逐 key 汇总<br/>HasExpectedReplicaAllocation &&<br/>AllAllocatedTransfersSucceeded?<br/>memory 与 dfs 均成功且零失败"}
         END["⑨ MasterClient::PutEnd<br/>key、对象校验和、ALL"]
@@ -376,7 +376,7 @@ flowchart TB
     START -->|"申请失败"| REJECT
     META -->|"ReplicaID、PROCESSING、对象长度<br/>及 MEMORY 副本描述符"| C2
     T <-->|"写入并等待传输结果"| RAM
-    D <-->|"StoreAsync 直接读调用方 buffer，返回逐项结果"| S
+    D <-->|"StoreAsync 读提交 buffer（直传或 staging），返回逐项结果"| S
     END --> COMMIT
     COMMIT -->|"提交成功"| OK
     COMMIT -->|"提交错误或响应未知"| FAIL
@@ -407,8 +407,8 @@ flowchart TB
         QR["③ QueryResult<br/>可读副本、租约截止时间、可选校验和"]
         SELECT["④ Client 按入口策略选择副本<br/>本图选中 COMPLETE DFS"]
         READ["⑤ ReadDfsReplica<br/>key + DFS 描述符 + CPU 目标 slices"]
-        B["DistributedStorageBackend::BatchRead<br/>（仅 UsesKvClient 子分支）校验切片连续且容量 >= AlignUp(N,512)<br/>直传调用方 buffer（无 staging）"]
-        D["⑥ KvClientObjectStorageAdapter::GetBatch<br/>校验并注册 → LoadAsync → waitForCompletion<br/>→ ReleaseBuffers（终态或提交失败时注销）<br/>设备直接写入调用方 buffer"]
+        B["DistributedStorageBackend::BatchRead<br/>（仅 UsesKvClient 子分支）校验切片覆盖 object_size<br/>透传调用方 buffer 与 capacity 声明（无 staging）"]
+        D["⑥ KvClientObjectStorageAdapter::GetBatch<br/>校验并注册（直传或暂存）→ LoadAsync → 拷回 → waitForCompletion<br/>→ ReleaseBuffers（终态或提交失败时注销）<br/>设备写入提交 buffer（直传或 staging）"]
         VERIFY["⑦ 确认完整读取 object_size 字节<br/>数据已写入原目标 buffer"]
         CHECK["⑧ Client 检查结果<br/>对象校验和、IsLeaseExpired"]
         MISS["⑨ 明确 NotFound<br/>携带本次观察到的 ReplicaID<br/>请求条件清理 DFS 记录"]
@@ -435,7 +435,7 @@ flowchart TB
     Q -->|"MasterClient RPC：GetReplicaList(key)"| GET
     GET -->|"OBJECT_NOT_FOUND / REPLICA_IS_NOT_READY 等"| QUERY_FAIL
     LEASE -->|"描述符、lease_ttl_ms、可选校验和"| QR
-    D <-->|"Load 直接写入调用方 buffer，返回逐项结果"| S
+    D <-->|"Load 写提交 buffer（直传或 staging），返回逐项结果"| S
     MISS -->|"MasterClient：条件清理请求"| EVICT
     EVICT --> MISS_RETURN
     CHECK --> RETURN
@@ -588,7 +588,7 @@ sequenceDiagram
 
 ### 2.3.2 写入阶段
 
-写路径只有一条：`RegisterBuffers` 校验长度、连续性与 512B 对齐、清零尾部 `[N, wire_len)`，并一次注册本批 buffer、回填 handle，一次 `StoreAsync` 提交整批（SDK 内部按 `batchStoreIoNum`（默认 110）在对象边界切分 transport 子批），再用 `waitForCompletion` 映射逐条结果，终态后注销本批注册。不满足契约的请求直接返回错误，不回退。
+写路径只有一条：`RegisterBuffers` 校验长度与连续性、按 `capacity` 声明选择直传或暂存、清零尾部 `[N, wire_len)`，一次注册本批 buffer 并回填 handle；一次 `StoreAsync` 提交整批（SDK 内部按 `batchStoreIoNum`（默认 110）在对象边界切分 transport 子批），再用 `waitForCompletion` 映射逐条结果，终态后注销本批注册。几何不合法（`n == 0`、超上限、iov 不连续）只失败该条，不回退。
 
 ```mermaid
 sequenceDiagram
@@ -606,8 +606,8 @@ sequenceDiagram
     alt 注册失败（RegisterRegions）
         AD-->>BE: 逐项 DFS_SERVICE_UNAVAILABLE（整批，不提交 SDK）
     else 注册成功
-        Note over AD: 违约请求的 plan 为空、errors[i] = INVALID_PARAMS<br/>其余请求照常提交
-        AD->>AD: 按请求下标构造 KVBuffer{key, 调用方 addr, wire_len, plans[i].handle, offset=0}
+        Note over AD: capacity>=wire_len 且 512 对齐 → 直传；否则暂存<br/>违约请求的 plan 为空、errors[i] = INVALID_PARAMS
+        AD->>AD: 按请求下标构造 KVBuffer{key, plans[i].addr, wire_len, plans[i].handle, offset=0}
         AD->>SDK: StoreAsync(entries, taskId)（整批一次提交）
         SDK->>SDK: 按 nodeId 路由拆分 transport task<br/>按 batchStoreIoNum（默认 110）在对象边界切分子批
         SDK->>S: Host RDMA write（buffer.region.size = wire_len）
@@ -624,7 +624,7 @@ sequenceDiagram
                 AD->>AD: 逐项置 RPC_TIMEOUT / INTERNAL_ERROR
             end
         end
-        AD->>AD: ReleaseBuffers(plans)<br/>终态或提交失败：去重后一次 UnregisterRegions<br/>非终态：保留 handle 直到确认完成或 Shutdown
+        AD->>AD: ReleaseBuffers(plans)<br/>终态或提交失败：去重后注销，staging 随 plan 释放<br/>非终态：handle 与 staging 一并保留到 Shutdown
         AD-->>BE: 逐项 expected
     end
     BE-->>C: results[index]
@@ -633,7 +633,7 @@ sequenceDiagram
 
 ### 2.3.3 读取阶段
 
-读路径与写路径对称：`RegisterBuffers` 校验并注册调用方 buffer 后，设备直接把 `wire_len` 字节写入其中；调用方只消费前 N 字节。明确 `NOT_FOUND` 触发 miss 清理，超时**不**触发清理。
+读路径与写路径对称：`RegisterBuffers` 校验并注册缓冲区后，设备把 `wire_len` 字节写入直传 buffer 或 staging（暂存时再拷回前 N 字节）；调用方只消费前 N 字节。明确 `NOT_FOUND` 触发 miss 清理，超时**不**触发清理。
 
 ```mermaid
 sequenceDiagram
@@ -646,14 +646,14 @@ sequenceDiagram
 
     C->>C: GetReplicaList → descriptor + lease
     C->>BE: BatchRead(key + descriptor + slices)
-    BE->>BE: 校验切片连续、容量 >= AlignUp(N,512)<br/>size = desc.object_size = N
+    BE->>BE: 校验切片覆盖 object_size<br/>size = desc.object_size = N；capacity 由上层声明（默认 0）
     BE->>AD: GetBatch(ObjectGetRequest{logical_key, buffer, N})
     AD->>AD: RegisterBuffers(requests, plans, errors)<br/>逐条校验 buffer + 按 (addr, wire_len) 去重注册<br/>handle 回填各自的 plan
     alt 注册失败（RegisterRegions）
         AD-->>BE: 逐项 DFS_SERVICE_UNAVAILABLE（整批，不提交 SDK）
     else 注册成功
-        Note over AD: 违约请求的 plan 为空、errors[i] = INVALID_PARAMS<br/>其余请求照常提交
-        AD->>AD: 按请求下标构造 KVBuffer{key, 调用方 addr, wire_len, plans[i].handle, offset=0}
+        Note over AD: capacity>=wire_len 且 512 对齐 → 直传；否则暂存<br/>违约请求的 plan 为空、errors[i] = INVALID_PARAMS
+        AD->>AD: 按请求下标构造 KVBuffer{key, plans[i].addr, wire_len, plans[i].handle, offset=0}
         AD->>SDK: LoadAsync(entries, taskId)<br/>buffer.region.size = wire_len
         SDK->>S: Host RDMA read
         SDK-->>AD: 提交结果
@@ -663,7 +663,7 @@ sequenceDiagram
             AD->>SDK: Wait(taskId, timeoutMs, result)
             alt task status = OK / PARTIAL_FAILED（终态，entryStatus 逐条可信）
                 SDK-->>AD: entryStatus[]（逐 key）
-                AD->>AD: 逐项映射：OK → results[i] = N<br/>ENTRY_KEY_NOT_FOUND → OBJECT_NOT_FOUND<br/>TIMEOUT / CANCELED → RPC_TIMEOUT / INTERNAL_ERROR
+                AD->>AD: 逐项映射：OK → 暂存则拷回 N 字节、results[i] = N<br/>ENTRY_KEY_NOT_FOUND → OBJECT_NOT_FOUND<br/>TIMEOUT / CANCELED → RPC_TIMEOUT / INTERNAL_ERROR
                 Note over AD: BE 另校验读取长度 == request.size(=N)<br/>（双层：BE :838-841 + 适配器）
                 Note over C: OBJECT_NOT_FOUND 触发 miss 清理<br/>超时不触发清理；buffer 复用由调用方保证
             else TIMEOUT / CANCELED / IN_PROGRESS
@@ -672,7 +672,7 @@ sequenceDiagram
                 Note over C: 元数据保留，不触发清理
             end
         end
-        AD->>AD: ReleaseBuffers(plans)<br/>终态或提交失败：去重后一次 UnregisterRegions<br/>非终态：保留 handle 直到确认完成或 Shutdown
+        AD->>AD: ReleaseBuffers(plans)<br/>终态或提交失败：去重后注销，staging 随 plan 释放<br/>非终态：handle 与 staging 一并保留到 Shutdown
         AD-->>BE: 逐 key expected
     end
     BE-->>C: 逐 key 结果
@@ -759,7 +759,7 @@ sequenceDiagram
 
 ### 2.3.6 关闭阶段
 
-关闭逻辑在析构函数内完成，没有独立的 `Shutdown()` 方法：适配器停止接受新提交后调用 SDK 的 `Shutdown()`，由 SDK 停止受理请求并排空 pending task。终态或提交失败的 batch 已在 `Wait` 后注销；非终态保留的 handle 随 `Shutdown()` 一并释放。
+关闭逻辑在析构函数内完成，没有独立的 `Shutdown()` 方法：适配器停止接受新提交后调用 SDK 的 `Shutdown()`，由 SDK 停止受理请求并排空 pending task。终态或提交失败的 batch 已在 `Wait` 后注销；非终态保留的 handle 与 staging 随 `Shutdown()` 一并释放，随后清空 `orphans_`。
 
 ```mermaid
 sequenceDiagram
@@ -788,11 +788,11 @@ sequenceDiagram
 | --- | --- | --- | --- | --- |
 | SFMEA-01 | logical key XXH64 碰撞：两个不同 key 映射到同一 CacheKey | **数据损坏**：后写覆盖先写，读到错 value。默认（`MOONCAKE_STORE_CHECKSUM` 关闭）无从发现；开启后 Get 端以 `CHECKSUM_MISMATCH` 暴露，但 Put 侧仍是覆盖写 | 不做 fingerprint（默许碰撞）；可复用既有 object checksum 作为检测手段；部署须限定 key 数量级 | 概率 ≈ n²/2^65：10^8 key → 2.7e-4 |
 | SFMEA-02 | 非法 key / 长度：空 key、同批重复、N == 0、N > 16,776,704、全零 CacheKey | 编码失败；协议层拒绝，预发送失败会 **abort 整个 transport task** | `MakeCacheKey` 拒空并把全零映射为非零常量；写侧拒绝同批重复；逐请求预检 `n > 0` 且 `wire_len <= max_object_bytes`；Master `PrepareWriteStart` 第一道校验 | 不能指望「只失败越界那条」 |
-| SFMEA-03 | 写路径未按 `AlignUp(N,512)` 补零或未清零尾部 | 提交被拒；调用方 buffer 尾部的残留字节被当成 padding 发到存储侧 | `wire_len = AlignUp(N,512)`；`RegisterBuffers` 清零尾部 `[N, wire_len)` | 写 513 字节对象，断言尾部全 0 |
+| SFMEA-03 | 写路径未按 `AlignUp(N,512)` 补零 / 未清零尾部，或直传时越界写 | 提交被拒；残留字节被当成 padding 发到存储侧；越界写破坏相邻内存 | 直传要求 `capacity >= wire_len`；暂存由适配器分配 `wire_len` 并对 `[N, wire_len)` 清零 | 写 513 字节对象断言尾部全 0；未声明容量时走暂存 |
 | SFMEA-04 | 初始化门禁失败：`sharedProviderMode != SHARED`、SDK `Init` 失败、transport deadline < `Wait` 超时 | 适配器不可用；或健康但较慢的写被判 `PARTIAL_FAILED` + `TIMEOUT` | `CheckSharedProviderMode` 硬门禁；`Init` 失败即失败；校验 `cfg.timeoutMs >= wait_timeout_ms` | 全部在 `Init` 阶段失败 |
 | SFMEA-05 | 提交的 handle 未被本批注册覆盖（取自他批、已注销或拼错） | 到 `Wait` 才以 `BUFFER_NOT_REGISTERED` 暴露且**连坐整 task** | handle 由本批 `RegisterBuffers` 直接回填进 `BufferPlan`，构造 `KVBuffer` 时按下标取；`mrKey` 由 SDK 按 handle 解析，适配器留 `std::nullopt` | 注册只在批内产生，生命周期与 batch 相同 |
-| SFMEA-06 | `Wait` 超时 / 取消：调用方 buffer 可能被迟到写覆盖，且 `entryStatus` 仍停留在初值 `OK` | 读到错数据；或把未落盘的数据报成功 | 非终态**不读** `entryStatus`，整批置错；**不注销**本批 handle（保留到 `Shutdown()`）；**buffer 复用由调用方保证**（依赖 T-19） | SDK 无面向业务的中止能力 |
-| SFMEA-07 | task 级 `PARTIAL_FAILED`、派发后 `CANCELED`、或路由失败 | 部分 key 成功、部分失败；`CANCELED` 时设备可能已访问调用方 buffer | 逐项映射 `entryStatus` 并按 `originalIndices` 回填；适配器不持有 buffer，无需处置 | entryStatus 与输入严格一一对应 |
+| SFMEA-06 | `Wait` 超时 / 取消：**直传**路径的调用方 buffer 可能被迟到写覆盖；`entryStatus` 仍停留在初值 `OK` | 读到错数据；或把未落盘的数据报成功 | 非终态**不读** `entryStatus`，整批置错；直传保留 handle，暂存把 staging + handle 转入 `orphans_`；暂存路径调用方 buffer 不受影响 | SDK 无面向业务的中止能力 |
+| SFMEA-07 | task 级 `PARTIAL_FAILED`、派发后 `CANCELED`、或路由失败 | 部分 key 成功、部分失败；`CANCELED` 时设备可能已访问 buffer | 逐项映射 `entryStatus` 并按 `originalIndices` 回填；直传无自有 buffer，暂存 buffer 随 plan 释放（非终态转 `orphans_`） | entryStatus 与输入严格一一对应 |
 | SFMEA-08 | 设备侧资源 / 连接错误：`CQE_OUT_OF_CREATE_SIZE`、`CONNECTION_ERROR`、存储空间耗尽 | 写或读失败；无容量查询与自动回收 | 分别映射为 `NO_AVAILABLE_HANDLE` / `DFS_SERVICE_UNAVAILABLE`；Master 不建 capacity provider | 容量管理留待 SDK |
 | SFMEA-09 | `CQE_KEY_NOT_EXIST` / `ENTRY_KEY_NOT_FOUND`（读时） | 对象在存储侧不存在 | 映射为 `OBJECT_NOT_FOUND` → 触发 `ReconcileMissingKvReplica` 条件清理 | **必须与超时严格区分**：超时**不**触发清理 |
 | SFMEA-10 | 删除中间态：value 已删而元数据残留（`BatchRemove` 失败 / `CheckRemovable` 拒绝 / Client 崩溃），或 value 删除失败 | 已发布对象不可读；或两者同时保留 | 失败项不进元数据删除集合 → 可安全重试；残留由读取 miss 自愈 | value-first 依赖 miss 清理，二者必须同时落地 |
@@ -800,10 +800,11 @@ sequenceDiagram
 | SFMEA-12 | `RemoveAll` / `RemoveByRegex` 被调用 | 若只删元数据不删 value → **一次性泄漏整个 L3** | 门控放宽到 KVClient，返回 `NOT_SUPPORTED` 且**不删元数据** | value-first 删除的连带必改项 |
 | SFMEA-13 | 不支持的配置：Master 重启无恢复、误配 `enable_oplog=true`、三副本 `memory + nof + ASU` | 目录全丢且不可恢复；或 nof 变为必需导致整 Put 失败 | 恢复门保持 `use_kvcs_` only，误配即启动期 `LOG(FATAL)`；`PrepareWriteStart` 拒绝 `nof_replica_num > 0` | 把运行期失效提前到启动期 |
 | SFMEA-14 | miss 清理 CAS 不匹配（读到 R1，目录已是 R2） | 无 | `EvictDiskReplicaIfCurrent` 返回 false，R2 原样保留 | 既有 CAS 语义，仅需放宽白名单 |
-| SFMEA-15 | 析构时仍有 in-flight batch 或非终态保留的 handle | 注销注册会让设备访问已注销内存 | 非终态不注销，保留 handle；析构只调用 SDK `Shutdown()`（停止受理并排空 pending task），由它释放客户端资源 | 终态 batch 已在 `Wait` 后注销 |
+| SFMEA-15 | 析构时仍有 in-flight batch、非终态保留的 handle 或 staging | 注销注册会让设备访问已注销内存；提前释放 staging 会 use-after-free | 非终态保留 handle + staging（`orphans_`）；析构只调用 SDK `Shutdown()`（停止受理并排空 pending task），随后清空 `orphans_` | 终态 batch 已在 `Wait` 后注销 |
 | SFMEA-16 | 读回长度 != `object_size` | 数据不完整 | 双层校验：适配器内 + `DistributedStorageBackend:838-841`，返回 `FILE_READ_FAIL` | `GetBatch` 必须返回 **N** 而非 `wire_len` |
 | SFMEA-17 | 启用 string key 路径的连带风险：`Resolve()` 提交阶段失败，或配置写了 `inference.engine=vllm_ascend` | 整批同步失败；或 `@...@<数字>` key 被重解释为分层 key，读写落到错误的 key/offset | 本方案只传 `FromBytes`，并在 `Init` 前把 `keyResolution` 复位为 `GENERIC` | 换用 `FromEngineKey` 前必须保留这两道 |
-| SFMEA-18 | 批注册失败、`wire_len` 超上限、iov 不连续或未对齐 | 整批请求失败（注册失败时未触达设备） | `RegisterBuffers` 失败 → 全部 `DFS_SERVICE_UNAVAILABLE`；单条越界/不对齐只拒绝该条 | 调用方需保证单段连续、512B 对齐与补齐容量 |
+| SFMEA-18 | 批注册失败、`wire_len` 超上限、iov 不连续、staging 分配失败 | 整批请求失败（注册失败时未触达设备）；或单条失败 | `RegisterBuffers` 失败 → 全部 `DFS_SERVICE_UNAVAILABLE`；单条越界 / 不连续 / 分配失败只拒绝该条 | 未对齐或未声明容量走暂存，不再作为拒绝条件 |
+| SFMEA-19 | 暂存内存放大或未释放：staging 分配失败、`orphans_` 持续增长 | 单条请求失败；或进程内存随超时次数增长 | staging 大小恒为 `wire_len`（≤ N+511）；终态随 plan 释放；非终态转 `orphans_`，下批开始与析构时统计并 `LOG(ERROR)` | 默认路径即暂存，需暴露 `orphans_` 指标 |
 
 ## 2.5 可定位设计
 
@@ -818,7 +819,7 @@ sequenceDiagram
 | `object_size` | descriptor | 对齐/上限问题定位 |
 | `task_id` | SDK | 跨 client/transport 层关联 SDK 内部日志 |
 | `replica_id` | descriptor | miss 清理 CAS 排查 |
-| `buffer_addr` | 适配器 | 定位使用的调用方 buffer |
+| `buffer_addr` | 适配器 | 定位提交 buffer（调用方 buffer 或 staging） |
 | `wire_len` | 适配器 | 线格式长度；与 `object_size` 的差值即补零量 |
 | `batch_index` / `original_index` | 适配器 | 批量结果错位排查 |
 
@@ -848,7 +849,7 @@ sequenceDiagram
 | 读取恒返回 `FILE_READ_FAIL`，但数据其实写对了 | 查 `GetBatch` 是否误返回 `aligned_size` 而非 N（§3.4）——后端比对的是 `desc.object_size` |
 | 读到的对象尾部有脏数据 | 查写路径是否漏了 `memset` 补零，或 `GetBatch` 是否误返回了 `wire_len` |
 | 请求返回 `NO_AVAILABLE_HANDLE` | 设备侧空间不足（`CQE_OUT_OF_CREATE_SIZE`）或资源忙，见 SFMEA-08 |
-| 请求返回 `INVALID_PARAMS` | `n == 0`、`AlignUp(N,512) > max_object_bytes`、iov 不连续、起点未 512B 对齐，或写侧同批重复 key（§3.2.3） |
+| 请求返回 `INVALID_PARAMS` | `n == 0`、`AlignUp(N,512) > max_object_bytes`、iov 不连续，或写侧同批重复 key（§3.2.3） |
 | 请求返回 `DFS_SERVICE_UNAVAILABLE` | 本批 `RegisterRegions` 失败；查 SDK 日志与 provider 状态 |
 | 每批延迟偏高 | 批内 buffer 越分散，每批注册开销越大；查批大小与 buffer 连续性 |
 | Remove 返回成功但存储侧仍有 value | 不可能——value-first 下成功即已删。若出现，查是否走了 `RemoveAll`/`RemoveByRegex`（SFMEA-12） |
@@ -936,11 +937,11 @@ inline std::string CacheKeyToLogString(const kv::BinaryKey& key) {
 
 ## 3.2 shard-2：适配器（`kvclient_object_storage_adapter`）
 
-**职责**：实现 `ObjectStorageAdapter`，承载 key 编码、按批注册调用方 buffer、零拷贝 I/O、提交/等待与结果映射。与 `KvcsObjectStorageAdapter` 平级，互不依赖。
+**职责**：实现 `ObjectStorageAdapter`，承载 key 编码、按批注册（直传或暂存）、提交/等待与结果映射。与 `KvcsObjectStorageAdapter` 平级，互不依赖。
 
 **文件**：`mooncake-store/include/storage/distributed/kvclient/kvclient_object_storage_adapter.h`、`src/storage/distributed/kvclient/kvclient_object_storage_adapter.cpp`
 
-**按批注册**：每个 batch 开始时，把该批涉及的调用方 buffer 一次性 `RegisterRegions`；`Wait` 返回终态（或提交被拒）后一次性 `UnregisterRegions`，非终态保留 handle 至 `Shutdown()`。注册只在批内有效，不跨批保留，适配器不持有常驻注册表。
+**按批注册**：每个 batch 开始时，把该批涉及的 buffer（调用方 buffer 或适配器 staging）一次性 `RegisterRegions`；`Wait` 返回终态（或提交被拒）后一次性 `UnregisterRegions`，非终态保留 handle 至 `Shutdown()`。注册只在批内有效，不跨批保留，适配器不持有常驻注册表。
 
 ### 3.2.1 类定义
 
@@ -949,6 +950,7 @@ inline std::string CacheKeyToLogString(const kv::BinaryKey& key) {
 
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <string>
@@ -1001,11 +1003,15 @@ class KvClientObjectStorageAdapter final : public ObjectStorageAdapter {
     const char* GetName() const override { return kKvClientAdapterName; }
 
    private:
-    // One request's geometry, computed before any registration happens.
+    // One request's wire layout. `addr` is either the caller buffer (direct
+    // path) or the adapter-owned staging buffer (staged path).
     struct BufferPlan {
         uintptr_t addr = 0;
         size_t n = 0;
         size_t wire_len = 0;
+        bool staged = false;
+        // Keeps the staging buffer alive until release/orphan retention.
+        std::shared_ptr<char[]> staging;
         // Filled by RegisterBuffers; buffers sharing (addr, wire_len) share it.
         kv::MRHandle handle = kv::kInvalidMRHandle;
     };
@@ -1029,6 +1035,14 @@ class KvClientObjectStorageAdapter final : public ObjectStorageAdapter {
     // Unregisters the distinct handles carried by this batch's plans.
     void ReleaseBuffers(std::span<const std::optional<BufferPlan>> plans);
 
+    // Shared body of the two RegisterBuffers overloads; `extract` fills the
+    // per-request BufferView. Defined in the .cpp, instantiated there only.
+    template <typename RequestT, typename Extract>
+    tl::expected<void, ErrorCode> RegisterBatchImpl(
+        std::span<const RequestT> requests,
+        std::vector<std::optional<BufferPlan>>& plans,
+        std::span<ErrorCode> errors, bool is_store, Extract&& extract);
+
     // Waits for a submitted task. When the task is terminal, `entryStatus` has
     // one Status per input entry. When it is not (TIMEOUT / CANCELED /
     // IN_PROGRESS), `terminal` is false and `entryStatus` is filled with the
@@ -1042,9 +1056,15 @@ class KvClientObjectStorageAdapter final : public ObjectStorageAdapter {
     static ErrorCode ToErrorCode(const kv::Status& status);
     bool CheckSharedProviderMode(const kv::KvClientConfig& sdk_config) const;
 
+    // Non-terminal Wait: the device may still touch these buffers, so keep the
+    // staging memory and handles alive until Shutdown().
+    void RetainOrphans(std::span<std::optional<BufferPlan>> plans);
+
     KvClientAdapterConfig config_;
     std::unique_ptr<kv::KvClient> kv_client_;
     bool initialized_ = false;
+    std::mutex orphan_mu_;
+    std::vector<std::pair<std::shared_ptr<char[]>, kv::MRHandle>> orphans_;
 };
 
 }  // namespace mooncake
@@ -1052,59 +1072,100 @@ class KvClientObjectStorageAdapter final : public ObjectStorageAdapter {
 
 ### 3.2.2 按批校验、注册与释放
 
-`RegisterBuffers` 是唯一的批级入口：校验每个请求的 buffer、清零写尾部、按 `(addr, wire_len)` 去重注册、回填 handle。校验不通过的请求只影响自己（`plans[i]` 为空、`errors[i]` 给出原因），不进入本批注册与提交。
+`RegisterBuffers` 是唯一的批级入口：校验每个请求的 buffer、按 `capacity` 声明选择直传或暂存、清零写尾部、按 `(addr, wire_len)` 去重注册、回填 handle。校验不通过的请求只影响自己（`plans[i]` 为空、`errors[i]` 给出原因），不进入本批注册与提交。
 
 ```cpp
 namespace {
-// 单请求几何校验 + 写侧补零；文件内辅助，不属于适配器接口。
-std::optional<BufferPlan> MakePlan(const iovec* iov, int iovcnt,
-                                   size_t object_size, bool is_store,
-                                   uint64_t max_object_bytes,
-                                   ErrorCode& error) {
-    if (iov == nullptr || iovcnt <= 0) {
-        error = ErrorCode::INVALID_PARAMS;
-        return std::nullopt;
+struct BufferView {
+    iovec single{};          // 读路径的单段 view 落在自身，指针不会悬空
+    const iovec* iov = nullptr;
+    int iovcnt = 0;
+    size_t n = 0;            // 逻辑对象长度
+    size_t capacity = 0;     // 调用方声明的可写容量；0 = 未声明
+};
+
+// 512B 对齐的 staging；shared_ptr 保证 plan 被保留时内存不释放。
+std::shared_ptr<char[]> AllocateStaging(size_t wire_len) {
+    auto* raw = static_cast<char*>(
+        ::operator new(wire_len, std::align_val_t(kv::kAlignmentBytes)));
+    return std::shared_ptr<char[]>(raw, [](char* p) {
+        ::operator delete(p, std::align_val_t(kv::kAlignmentBytes));
+    });
+}
+
+void CopyIovTo(char* dst, const iovec* iov, int iovcnt) {
+    for (int j = 0; j < iovcnt; ++j) {
+        std::memcpy(dst, iov[j].iov_base, iov[j].iov_len);
+        dst += iov[j].iov_len;
     }
-    const size_t n = is_store ? SumIov(iov, iovcnt) : object_size;
-    if (n == 0) { error = ErrorCode::INVALID_PARAMS; return std::nullopt; }
-    const size_t wire_len = AlignUp(n, kv::kAlignmentBytes);
-    if (wire_len > max_object_bytes) {
-        error = ErrorCode::INVALID_PARAMS;
-        return std::nullopt;
-    }
-    if (!IsContiguous(iov, iovcnt)) {
-        error = ErrorCode::INVALID_PARAMS;
-        return std::nullopt;
-    }
-    const auto addr = reinterpret_cast<uintptr_t>(iov[0].iov_base);
-    if (addr % kv::kAlignmentBytes != 0) {
-        error = ErrorCode::INVALID_PARAMS;
-        return std::nullopt;
-    }
-    if (is_store && wire_len > n) {
-        std::memset(reinterpret_cast<char*>(addr) + n, 0, wire_len - n);
-    }
-    return BufferPlan{addr, n, wire_len};
 }
 }  // namespace
 
-tl::expected<void, ErrorCode> KvClientObjectStorageAdapter::RegisterBuffers(
-    std::span<const ObjectPutRequest> requests,
+// 两个 RegisterBuffers 重载共用的实现；差异只在 extract 如何取 buffer。
+template <typename RequestT, typename Extract>
+tl::expected<void, ErrorCode>
+KvClientObjectStorageAdapter::RegisterBatchImpl(
+    std::span<const RequestT> requests,
     std::vector<std::optional<BufferPlan>>& plans,
-    std::span<ErrorCode> errors) {
+    std::span<ErrorCode> errors, bool is_store, Extract&& extract) {
     plans.assign(requests.size(), std::nullopt);
-    std::set<kv::BinaryKey> seen_keys;          // 同批重复 key 只受理第一条
 
+    // 几何校验 + 直传/暂存判定 + 写侧补零；内联实现，不再单独暴露接口。
+    auto make_plan = [&](const BufferView& view,
+                         ErrorCode& error) -> std::optional<BufferPlan> {
+        if (view.iov == nullptr || view.iovcnt <= 0 || view.n == 0) {
+            error = ErrorCode::INVALID_PARAMS;
+            return std::nullopt;
+        }
+        const size_t wire_len = AlignUp(view.n, kv::kAlignmentBytes);
+        if (wire_len > config_.max_object_bytes) {
+            error = ErrorCode::INVALID_PARAMS;
+            return std::nullopt;
+        }
+        if (!IsContiguous(view.iov, view.iovcnt)) {
+            error = ErrorCode::INVALID_PARAMS;
+            return std::nullopt;
+        }
+
+        BufferPlan plan;
+        plan.n = view.n;
+        plan.wire_len = wire_len;
+        plan.addr = reinterpret_cast<uintptr_t>(view.iov[0].iov_base);
+
+        // 直传要求调用方声明容量且起点对齐；否则一律走 staging。
+        const bool direct = view.capacity >= wire_len &&
+                            plan.addr % kv::kAlignmentBytes == 0;
+        if (!direct) {
+            plan.staging = AllocateStaging(wire_len);
+            if (!plan.staging) {
+                error = ErrorCode::NO_AVAILABLE_HANDLE;
+                return std::nullopt;
+            }
+            plan.addr = reinterpret_cast<uintptr_t>(plan.staging.get());
+            plan.staged = true;
+            if (is_store) {
+                CopyIovTo(plan.staging.get(), view.iov, view.iovcnt);
+            }
+        }
+        if (is_store && wire_len > view.n) {
+            std::memset(reinterpret_cast<char*>(plan.addr) + view.n, 0,
+                        wire_len - view.n);
+        }
+        return plan;
+    };
+
+    std::set<kv::BinaryKey> seen_keys;   // 仅写侧：同批重复 key 只受理第一条
     std::vector<kv::MemoryRegion> regions;
     std::vector<size_t> plan_to_region(requests.size(), SIZE_MAX);
     for (size_t i = 0; i < requests.size(); ++i) {
-        if (!seen_keys.insert(MakeCacheKey(requests[i].logical_key)).second) {
+        if (is_store &&
+            !seen_keys.insert(MakeCacheKey(requests[i].logical_key)).second) {
             errors[i] = ErrorCode::INVALID_PARAMS;
             continue;
         }
-        auto plan = MakePlan(requests[i].iov, requests[i].iovcnt,
-                             /*object_size=*/0, /*is_store=*/true,
-                             config_.max_object_bytes, errors[i]);
+        BufferView view;
+        extract(requests[i], view);
+        auto plan = make_plan(view, errors[i]);
         if (!plan) continue;
 
         size_t region_index = regions.size();
@@ -1120,7 +1181,7 @@ tl::expected<void, ErrorCode> KvClientObjectStorageAdapter::RegisterBuffers(
                                plan->wire_len, /*deviceId=*/-1,
                                /*numaNode=*/-1});
         }
-        plans[i] = *plan;
+        plans[i] = std::move(*plan);
         plan_to_region[i] = region_index;
     }
     if (regions.empty()) return {};
@@ -1136,9 +1197,36 @@ tl::expected<void, ErrorCode> KvClientObjectStorageAdapter::RegisterBuffers(
     }
     return {};
 }
+
+tl::expected<void, ErrorCode> KvClientObjectStorageAdapter::RegisterBuffers(
+    std::span<const ObjectPutRequest> requests,
+    std::vector<std::optional<BufferPlan>>& plans,
+    std::span<ErrorCode> errors) {
+    return RegisterBatchImpl(requests, plans, errors, /*is_store=*/true,
+                             [](const ObjectPutRequest& request, BufferView& v) {
+                                 v.iov = request.iov;
+                                 v.iovcnt = request.iovcnt;
+                                 v.n = SumIov(request.iov, request.iovcnt);
+                                 v.capacity = request.capacity;
+                             });
+}
+
+tl::expected<void, ErrorCode> KvClientObjectStorageAdapter::RegisterBuffers(
+    std::span<const ObjectGetRequest> requests,
+    std::vector<std::optional<BufferPlan>>& plans,
+    std::span<ErrorCode> errors) {
+    return RegisterBatchImpl(requests, plans, errors, /*is_store=*/false,
+                             [](const ObjectGetRequest& request, BufferView& v) {
+                                 v.single = iovec{request.buffer, request.size};
+                                 v.iov = &v.single;
+                                 v.iovcnt = 1;
+                                 v.n = request.size;
+                                 v.capacity = request.capacity;
+                             });
+}
 ```
 
-读重载与写重载同构：把每个 `ObjectGetRequest` 视作单段 `iovec{request.buffer, request.size}`，`object_size = request.size`、`is_store = false`，不做同批重复 key 拒绝（同一 key 可以读多次），其余去重、一次注册、回填 handle 完全相同；实现上抽成同一个文件内模板。
+读请求的 staging 在 `LoadAsync` 前不拷贝内容，设备写满后在结果映射时把前 N 字节拷回调用方。
 
 ```cpp
 void KvClientObjectStorageAdapter::ReleaseBuffers(
@@ -1157,9 +1245,21 @@ void KvClientObjectStorageAdapter::ReleaseBuffers(
                    << ", handles=" << unique.size();
     }
 }
+
+void KvClientObjectStorageAdapter::RetainOrphans(
+    std::span<std::optional<BufferPlan>> plans) {
+    std::lock_guard<std::mutex> lock(orphan_mu_);
+    for (auto& plan : plans) {
+        if (!plan || plan->handle == kv::kInvalidMRHandle) continue;
+        // 直传 plan 的 staging 为空，只保留 handle 记录；暂存 plan 连同内存。
+        orphans_.emplace_back(std::move(plan->staging), plan->handle);
+    }
+}
 ```
 
-- **校验与注册同源**：`wire_len` 由同一处计算，注册区间与提交区间不可能不一致；单条违约只拒绝该条，不连坐整批。
+- **校验与注册同源**：`wire_len`、直传判定（`capacity >= wire_len && addr % 512 == 0`）与注册区间在同一处产生；单条违约只拒绝该条，不连坐整批。
+- **直传与暂存同构**：暂存 buffer 也是 512B 对齐、`wire_len` 长度，同样走本批 `RegisterRegions`；上层只看到 `plan.addr`，不区分来源。
+- **暂存生命周期**：`BufferPlan` 持有 `shared_ptr<char[]>`，终态后随 plan 析构释放；非终态转入 `orphans_`，与 handle 一起保留到 `Shutdown()`。
 - **一次注册**：同一批内相同 `(addr, wire_len)` 只注册一次；handle 回填进各自的 `BufferPlan`，重复 buffer 拿到同一个 handle，构造 `KVBuffer` 时按请求下标取，无需查表。
 - **按终态注销**：`Wait` 返回终态（`OK` / `PARTIAL_FAILED`）或提交被拒时，对 plan 中出现的 handle 去重后一次注销。**`TIMEOUT` / `CANCELED` / `IN_PROGRESS` 不注销**：SDK 要求 queued / in-flight task 引用的 handle 保持注册（`kv_client.h:65-68`），此时保留 handle，记 `ERROR`，由后续确认完成或 `Shutdown()` 释放。
 - **不跨批保留**：适配器没有常驻注册表；下一批重新注册。代价是每批一次注册开销；非终态残留是唯一例外，且只保留到进程退出。
@@ -1170,7 +1270,7 @@ void KvClientObjectStorageAdapter::ReleaseBuffers(
 **Batch 流程**（`PutBatch` / `GetBatch` 相同，仅方向不同）。读路径把 requests（`ObjectGetRequest`）交给 `RegisterBuffers` 的读重载；其余步骤相同。
 
 ```cpp
-// 1) 校验 + 注册：每个请求的 buffer 在这里校验、清零写尾部、去重注册
+// 1) 校验 + 注册：按 capacity 选择直传/暂存，清零写尾部并去重注册
 std::vector<std::optional<BufferPlan>> plans;
 std::vector<ErrorCode> errors(requests.size(), ErrorCode::INVALID_PARAMS);
 auto registered = RegisterBuffers(requests, plans, errors);  // 读：GetRequest 重载
@@ -1186,7 +1286,8 @@ if (std::none_of(plans.begin(), plans.end(),
     return results;                              // 没有可提交的请求
 }
 
-// 2) 按请求下标取 plan 中的 handle，构造 KVBuffer
+// 2) 按请求下标取 plan 中的 handle，构造 KVBuffer（addr 可能是调用方 buffer
+//    或适配器 staging，二者对提交路径同构）
 for (size_t i = 0; i < requests.size(); ++i) {
     if (!plans[i]) continue;
     kv::KVBuffer entry;
@@ -1219,6 +1320,10 @@ if (status.ok()) {
         } else if (is_store) {
             results[index] = {};                       // 写成功
         } else {
+            if (plans[index]->staged) {                // 暂存读：拷回调用方
+                std::memcpy(requests[index].buffer,
+                            plans[index]->staging.get(), plans[index]->n);
+            }
             results[index] = requests[index].size;     // 读成功返回 N
         }
     }
@@ -1226,11 +1331,11 @@ if (status.ok()) {
     FillError(results, ToErrorCode(status));
 }
 
-// 4) 终态或提交被拒才注销；非终态保留 handle（SDK 要求 in-flight task
-//    引用的 handle 保持注册，见 kv_client.h）
+// 4) 终态或提交被拒才注销；非终态把 handle 与 staging 一起保留到 Shutdown
 if (terminal) {
     ReleaseBuffers(plans);
 } else {
+    RetainOrphans(plans);
     LOG(ERROR) << "action=kvclient_batch_release_skipped, task_id=" << task_id;
 }
 return results;
@@ -1238,7 +1343,7 @@ return results;
 
 `SumIov` 与 `IsContiguous` 是文件内静态辅助：前者累加 `iov_len`，后者校验 `iov[j].iov_base + iov[j].iov_len == iov[j+1].iov_base`。
 
-**结果处置**：适配器不持有 buffer，也没有跨批状态。所有 entry 状态只做错误映射；超时/取消后 **buffer 是否可复用由调用方保证**（T-19）。注册的释放跟随 task 状态：终态或提交被拒时注销本批 handle；非终态保留 handle，记 `action=kvclient_batch_release_skipped`，由 `Shutdown()` 兜底。
+**结果处置**：所有 entry 状态只做错误映射。注销跟随 task 状态：终态或提交被拒时注销本批 handle（staging 随 plan 析构释放）；非终态保留 handle 与 staging，记 `action=kvclient_batch_release_skipped`，由 `Shutdown()` 兜底。buffer 复用分两种模式：**直传**下设备可能仍在访问调用方 buffer，复用由调用方保证（T-19）；**暂存**下设备只访问适配器 staging，调用方 buffer 在 `PutBatch` / `GetBatch` 返回后即可复用。
 
 | task / entry 状态 | 动作 |
 | --- | --- |
@@ -1290,27 +1395,33 @@ bool UsesKvClient() const { return fs_adapter_type == "kvclient"; }
 
 ## 3.4 shard-4：padding 与长度语义
 
-`object_size = N`，`wire_len = AlignUp(N, 512)` 是唯一的线格式长度（SDK 没有独立的 KV 长度字段，§3.2.3）。**512B 对齐是调用方契约**：对象在调用方 buffer 中占 `wire_len` 字节、起点 512B 对齐。
+`object_size = N`，`wire_len = AlignUp(N, 512)` 是唯一的线格式长度（SDK 没有独立的 KV 长度字段，§3.2.3）。适配器对每条请求在两种模式中二选一：
 
-- **写路径**：适配器清零尾部 `[N, wire_len)`（≤511 字节），设备读满 `wire_len`。
-- **读路径**：设备写满 `wire_len` 到调用方 buffer，调用方只消费前 N 字节。
-- buffer 在每个 batch 内由适配器注册，`[addr, addr + wire_len)` 必须被本批注册覆盖。
+| 模式 | 条件 | 数据路径 |
+| --- | --- | --- |
+| **直传（零拷贝）** | 调用方显式声明 `capacity >= wire_len`，且 iov 连续、起点 `addr % 512 == 0` | 写：适配器原地清零 `[N, wire_len)`；读：设备直接写调用方 buffer，调用方只消费前 N 字节 |
+| **暂存（默认）** | 未声明 `capacity`、声明不足、iov 不连续或起点未对齐 | 适配器分配 `wire_len`、512B 对齐的 staging：写前逐 iov memcpy 并补零，读后把前 N 字节拷回调用方 |
+
+**为什么必须显式声明容量**：`N` 决定 `wire_len`，但不决定调用方 buffer 实际可写多少字节。现有调用方的分配恰好是 N 字节（`client_buffer_allocator->allocate(N)`、`PutStart` 分配的 slice、用户 `batch_put_from` / `batch_get_into` 的 buffer），直接按 `wire_len` 读写会越过分配边界最多 511 字节。适配器无法从指针推断容量，只能由调用方声明；未声明一律走 staging。
+
+**声明通道**：`DfsWriteRequest` / `DfsReadRequest` 增加 `size_t capacity = 0`（0 = 未声明），`DistributedStorageBackend` 透传为 `ObjectPutRequest::capacity` / `ObjectGetRequest::capacity`。`Client` 只有在自己按 `wire_len` 分配且起点 512B 对齐时才填 `wire_len`；所有外部 buffer 路径（`batch_put_from`、`batch_get_into`、设备 D2H staging 后的 host slice）保持 0。
 
 **写路径**：
 
 ```cpp
-// PutBatch: iov 必须连续、addr 512B 对齐。RegisterBuffers 负责计算
-// wire_len、把尾部 [n, wire_len) 清零，并在本批注册该区间。
-// 违约时该请求的 plan 为空、errors[i] = INVALID_PARAMS，其余请求照常提交。
+// 直传：RegisterBuffers 计算 wire_len、清零尾部 [N, wire_len)，注册调用方区间。
+// 暂存：分配 wire_len/512B 对齐的 staging → 逐 iov memcpy → 清零尾部 → 注册 staging；
+//       调用方 buffer 只读，返回后即可复用。
 ```
 
 **读路径**：
 
 ```cpp
-// GetBatch: ObjectGetRequest{logical_key, buffer, size} 只有一个目标区间。
-// RegisterBuffers 把 buffer 视作单段 iovec，wire_len = AlignUp(size,512)，
-// 设备直接写入调用方 buffer；成功后 results[i] = request.size。
+// 直传：设备写满 wire_len 到调用方 buffer，调用方只消费前 N 字节。
+// 暂存：设备写满 staging → 前 N 字节拷回调用方各 slice；设备迟到写只落在 staging 上。
 ```
+
+**注册粒度**：每批一次。直传区间与 staging 区间都在本批 `RegisterBuffers` 中去重后一次注册；`wire_len` 超过 `max_object_bytes` 直接拒绝。
 
 ⚠️ **返回值必须是 `n` 而非 `wire_len`**。`DistributedStorageBackend::BatchRead` 会比对 `*object_results[i] != object_requests[i].size`（`:838-841`），而 `request.size` 是 `desc.object_size` = N。返回 `wire_len` 会让每次读取都误报 `FILE_READ_FAIL`。
 
@@ -1640,12 +1751,12 @@ endif()
 | --- | --- | --- | --- | --- |
 | T-01 | 单元 | key codec：幂等、单射、强制碰撞、全零 hash | 同 key 逐字节一致；不同 key 不碰撞；碰撞时后写覆盖；全零被映射为非零 | SFMEA-01/02 |
 | T-02 | 单元 | 空 logical key、同批重复 key、N=0 | 均 `INVALID_PARAMS` | SFMEA-02 |
-| T-03 | 单元 | N=513 写读；两个对象共用同一注册区间；`wire_len` 超 `max_object_bytes` | 尾部补零且无残留；越界 / 不连续 / 未 512B 对齐时拒绝且不提交 SDK | SFMEA-03/18 |
+| T-03 | 单元 | N=513 写读；直传（声明 `capacity`、512 对齐）与暂存（`capacity=0`、未对齐）两条路径；`wire_len` 超 `max_object_bytes` | 尾部补零无残留；暂存时调用方 buffer 不被写、读后拷回 N 字节正确；超上限拒绝 | SFMEA-03/18 |
 | T-04 | 单元 | N = 16,776,704 与越界值（16,777,000 / 16,777,216） | 上限成功；越界由 Master 与适配器双层拒绝 | SFMEA-02 |
 | T-05 | 单元 | `GetBatch` 对 N=513 的返回值；构造读回长度不符 | 返回 **513** 而非 1024；长度不符 → `FILE_READ_FAIL` | SFMEA-16 |
 | T-06 | 单元 | `sharedProvider=0`；`timeoutMs < wait_timeout_ms` | 前者 `Init` 失败；后者 `INVALID_PARAMS` 且不调用 SDK `Init` | SFMEA-04 |
 | T-07 | 单元 | fake SDK 让 `Wait` 返回 `BUFFER_NOT_REGISTERED` | 该 task / sub-batch 内 key 全部映射为 `INVALID_PARAMS`；其他 sub-batch 不受影响 | SFMEA-05 |
-| T-08 | 单元 | fake SDK 让 `Wait` 超时且 task 保持 in-flight；`entryStatus` 初值 `OK` | 逐项 `RPC_TIMEOUT`；**绝不为 OK**；适配器不动调用方 buffer，且**不注销**本批 handle（`kvclient_batch_release_skipped`） | SFMEA-06 |
+| T-08 | 单元 | fake SDK 让 `Wait` 超时且 task 保持 in-flight；直传 / 暂存各一批；`entryStatus` 初值 `OK` | 逐项 `RPC_TIMEOUT`；**绝不为 OK**；直传不注销 handle，暂存把 staging + handle 转入 `orphans_`；暂存不改调用方 buffer | SFMEA-06/19 |
 | T-09 | 单元 | task 级 `PARTIAL_FAILED`（第 2 项业务错误）；整个 task `CANCELED` | 按原下标回填、其余成功；只做错误映射 | SFMEA-07 |
 | T-10 | 单元 | 读时返回 `ENTRY_KEY_NOT_FOUND`；读时返回 `TIMEOUT` | 前者 `OBJECT_NOT_FOUND` 并触发清理；后者 `RPC_TIMEOUT` **不**触发 | SFMEA-09 |
 | T-11 | 单元 | 跨对象合批：3 对象 250 entry，SDK 子批上限 110 | 适配器一次 `StoreAsync` 提交全部 entry；SDK 内部切 3 个 transport 子批（110/110/30），不切开对象；结果按原下标回填 | §3.2.3 |
@@ -1656,8 +1767,8 @@ endif()
 | T-16 | 集成 | 同尺寸 Upsert；仅 MEMORY 对象请求 dfs=1 | 原地复用并读到新值；后者拓扑不符失败 | §2.2.4 |
 | T-17 | 集成 | 删除：元数据失败 / lease 保护 / value 删除失败 / 部分成功；删除幂等 | 失败项两者保留可重试；成功项元数据删除；miss 自愈 | SFMEA-10 |
 | T-18 | 集成 | `RemoveAll()` / `RemoveByRegex()` | `NOT_SUPPORTED`，**且 Master 侧元数据完全未变** | SFMEA-12 |
-| T-19 | 真机 | 覆盖写；超时后设备是否仍写 buffer；设备侧上限；跨节点合批路由 | 分别确认 | **阻塞**：前两项决定 Put 语义与超时后 buffer 复用结论 |
-| T-20 | 单元 | 批内两个对象共用同一 buffer；批注册失败；批结束后再次 I/O | 同 buffer 只注册一次；注册失败整批报错；下一批重新注册后成功 | SFMEA-18 |
+| T-19 | 真机 | 覆盖写；**直传**超时后设备是否仍写调用方 buffer；暂存超时后 staging 是否被迟到写；设备侧上限；跨节点合批路由 | 分别确认 | **阻塞**：前两项决定直传 buffer 复用时点与 `orphans_` 保留时长 |
+| T-20 | 单元 | 批内两个对象共用同一 buffer（直传）；批注册失败；批结束后再次 I/O | 直传同 buffer 只注册一次；暂存各对象独立注册；注册失败整批报错；下一批重新注册后成功 | SFMEA-18 |
 
 ## 4.1 验收标准
 
@@ -1677,8 +1788,8 @@ endif()
 | 不支持元数据恢复 | Master 重启即目录全丢，L3 数据不可发现 | 启动期显式拒绝 `enable_oplog`；运维需知晓 |
 | 不支持 key 枚举 | `ListKeys` / `RemoveAll` / `RemoveByRegex` 返回 `NOT_SUPPORTED` | 同 key 重写时覆盖 |
 | 不支持范围读 | `BatchRead` 对象分支忽略 `range_read`（`:802-818`） | 上层回退整对象读后截取 |
-| **调用方必须提供 512B 对齐且补齐容量的 buffer** | 对象在 buffer 中占 `AlignUp(N,512)`、起点 512B 对齐；注册由适配器按批完成 | 由上层分配保证；未满足时 `RegisterBuffers` 直接拒绝 |
-| **超时后 buffer 可能被迟到写** | 适配器返回错误后不再跟踪设备；若设备在 deadline 后仍写，会覆盖调用方 buffer | 无运行时缓解，**部署前必须完成 T-19**；调用方在确认设备停手前不得复用该 buffer |
+| **直传需调用方显式声明容量** | 只有 `capacity >= wire_len` 且起点 512B 对齐时才零拷贝；未声明（含 `put_from` / `get_into` / 设备 D2H staging 后的 host slice）一律走适配器暂存 | 暂存多一次 memcpy（N + ≤511B padding）；注册与提交路径不变，两种模式对上层同构 |
+| **直传超时后调用方 buffer 可能被迟到写** | 暂存路径设备只访问 staging，调用方 buffer 在返回后即可复用；直传路径无运行时缓解 | 部署前完成 T-19；直传调用方在确认设备停手前不得复用 buffer；暂存的 staging + handle 转入 `orphans_` 直到 `Shutdown()` |
 | **每批一次注册开销** | 同一批内 buffer 越分散，注册/注销往返越多 | 上层尽量让一批对象落在相邻 buffer；用批大小与 buffer 连续性评估 |
 | **小对象补零放大** | N < 512 时线格式长度仍是 512，放大最高 512 倍（N=1）；带宽与存储双浪费 | 上层聚合小对象；补零开销可由 §2.5.1 的 `object_size` 与实际线格式长度对比估算 |
 | 单对象上限 16,776,704 B | SDK 线格式 24-bit length + 512 对齐。比 Mooncake 的 `kMaxSliceSize`（16,777,200）窄 496 字节 | `PrepareWriteStart` 显式校验（§3.5）；无其他缓解 |
