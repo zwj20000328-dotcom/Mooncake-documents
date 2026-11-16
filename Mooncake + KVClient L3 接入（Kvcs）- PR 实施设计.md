@@ -18,7 +18,7 @@
 
 ### 1.1 目标
 
-让 `fs_adapter_type=kvclient` 在运行时可达：配置能解析、工厂能创建适配器、FileStorage/RealClient 能注入 DFS 后端、SDK 缺失时走 stub。适配器只落地控制面（`Init`、等待、错误映射、删除），读写方法以 `NOT_SUPPORTED` 占位，PR2 替换。
+让 `fs_adapter_type=kvclient` 在运行时可达：配置能解析、工厂能创建适配器、FileStorage/RealClient 能注入 DFS 后端、SDK 缺失失败。适配器只落地控制面（`Init`、等待、错误映射、删除），读写方法以 `NOT_SUPPORTED` 占位，PR2 替换。
 
 ### 1.2 改动文件
 
@@ -60,7 +60,7 @@ classDiagram
 
     class KvClientObjectStorageAdapter {
         -KvClientAdapterConfig config_
-        -unique_ptr~kv::KvClient~ kv_client_
+        -unique_ptr~KvClient~ kv_client_
         -bool initialized_
         +Init() expected
         +GetName() char*
@@ -94,13 +94,15 @@ classDiagram
     }
 
     class Factory["CreateKvClientObjectStorageAdapter()"] {
-        +returns tl::expected~unique_ptr~ObjectStorageAdapter~~, ErrorCode~
+        +returns expected~ObjectStorageAdapter~
     }
+
+    class Stub["kvclient_backend_stub.cpp"]
 
     KvClientObjectStorageAdapter *-- SdkKvClient : 持有
     KvClientObjectStorageAdapter ..> KvClientAdapterConfig : 读取
     Factory ..> KvClientObjectStorageAdapter : 创建（SDK 存在）
-    Factory ..> Stub["kvclient_backend_stub.cpp"] : NOT_SUPPORTED（SDK 缺失）
+    Factory ..> Stub : NOT_SUPPORTED（SDK 缺失）
 ```
 
 ### 1.4 流程图
@@ -409,7 +411,7 @@ classDiagram
         +size_t n
         +size_t wire_len
         +bool staged
-        +shared_ptr~char[]~ staging
+        +shared_ptr~char~ staging
         +uint64 handle
     }
 
@@ -422,7 +424,7 @@ classDiagram
         -KvClientAdapterConfig config_
         -unique_ptr~KvClient~ kv_client_
         -mutex orphan_mu_
-        -vector~pair~ orphans_
+        -vector~Orphan~ orphans_
         +PutBatch(requests) results
         +GetBatch(requests) results
         -RegisterBatchImpl(requests, plans, errors, is_store, extract)
