@@ -1,6 +1,6 @@
 # Mooncake + KVClient L3 接入设计方案
 
-版本：v4.7（文件名沿用 v3）　更新日期：2026-11-13
+版本：v4.8（文件名沿用 v3）　更新日期：2026-11-13
 
 代码核对基线：`Mooncake` main `46c5eca8`（2026-11-13）；下文源码行号均以该提交为准，升级基线后需重新锚定。
 
@@ -990,6 +990,8 @@ class KvClientObjectStorageAdapter final : public ObjectStorageAdapter {
                                  std::unique_ptr<kv::KvClient> client);
     ~KvClientObjectStorageAdapter() override;
 
+    // Single-object entry points only wrap the batch path with one request;
+    // `PutBatch` / `GetBatch` / `DeleteBatch` are the sole data path.
     tl::expected<void, ErrorCode> Put(const std::string& logical_key,
                                       std::span<const char> data) override;
     tl::expected<void, ErrorCode> PutV(const std::string& logical_key,
@@ -1280,7 +1282,7 @@ void KvClientObjectStorageAdapter::RetainOrphans(
 
 ### 3.2.3 数据路径
 
-**Batch 流程**（`PutBatch` / `GetBatch` 相同，仅方向不同）。读路径把 requests（`ObjectGetRequest`）交给 `RegisterBuffers` 的读重载；其余步骤相同。
+**Batch 流程**（`PutBatch` / `GetBatch` 相同，仅方向不同）。适配器只有这一条数据路径；`Put` / `PutV` / `Get` / `Delete` 只是把它包成单条请求（`iov` 或单段 buffer）。读路径把 requests（`ObjectGetRequest`）交给 `RegisterBuffers` 的读重载；其余步骤相同。
 
 ```cpp
 // 1) 校验 + 注册：按 capacity 选择直传/暂存，清零写尾部并去重注册

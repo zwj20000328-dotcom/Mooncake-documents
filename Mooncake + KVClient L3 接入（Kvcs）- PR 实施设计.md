@@ -1,6 +1,6 @@
 # Mooncake + KVClient L3 接入（Kvcs）— 三个 PR 的实施设计
 
-版本：v1.1　更新日期：2026-11-16
+版本：v1.2　更新日期：2026-11-16
 对应设计文档：`Mooncake + KVClient L3 接入（Kvcs）- v3.md` v4.6
 代码核对基线：`Mooncake` main `46c5eca8`
 
@@ -100,6 +100,8 @@ classDiagram
     KvClientObjectStorageAdapter ..> KvClientAdapterConfig : 读取
     Factory ..> KvClientObjectStorageAdapter : 创建（SDK 存在）
 ```
+
+> 数据面只有 batch 一条路径：`Put` / `PutV` / `Get` / `Delete` 都只是把单条请求包装成 `PutBatch` / `GetBatch` / `DeleteBatch` 调用，不单独实现 I/O。PR1 只声明它们并返回 `NOT_SUPPORTED`，PR2 用单行包装替换。
 
 ### 1.4 流程图
 
@@ -723,7 +725,42 @@ std::vector<tl::expected<void, ErrorCode>> KvClientObjectStorageAdapter::PutBatc
 }
 ```
 
-#### 2.6.3 Master 门控
+#### 2.6.3 单条入口（batch 包装）
+
+```cpp
+// 适配器只有 batch 数据路径；以下四个入口都只构造一条请求。
+tl::expected<void, ErrorCode> KvClientObjectStorageAdapter::Put(
+    const std::string& key, std::span<const char> data) {
+    iovec iov{const_cast<char*>(data.data()), data.size()};
+    auto results = PutBatch({ObjectPutRequest{key, &iov, 1, 0}});
+    return results.empty() ? tl::make_unexpected(ErrorCode::INVALID_PARAMS)
+                           : results.front();
+}
+
+tl::expected<void, ErrorCode> KvClientObjectStorageAdapter::PutV(
+    const std::string& key, const iovec* iov, int iovcnt) {
+    auto results = PutBatch({ObjectPutRequest{key, iov, iovcnt, 0}});
+    return results.empty() ? tl::make_unexpected(ErrorCode::INVALID_PARAMS)
+                           : results.front();
+}
+
+tl::expected<size_t, ErrorCode> KvClientObjectStorageAdapter::Get(
+    const std::string& key, void* buf, size_t len) {
+    auto results = GetBatch({ObjectGetRequest{key, buf, len, 0}});
+    return results.empty() ? tl::make_unexpected(ErrorCode::INVALID_PARAMS)
+                           : results.front();
+}
+
+tl::expected<void, ErrorCode> KvClientObjectStorageAdapter::Delete(
+    const std::string& key) {
+    std::array<std::string, 1> keys{key};
+    auto results = DeleteBatch(keys);
+    return results.empty() ? tl::make_unexpected(ErrorCode::INVALID_PARAMS)
+                           : results.front();
+}
+```
+
+#### 2.6.4 Master 门控
 
 ```cpp
 // 初始化（MasterService 构造 / 配置注入）
