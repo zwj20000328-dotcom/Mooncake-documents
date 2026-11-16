@@ -1,6 +1,6 @@
 # Mooncake + KVClient L3 接入（Kvcs）— 三个 PR 的实施设计
 
-版本：v1.0　更新日期：2026-11-13
+版本：v1.1　更新日期：2026-11-16
 对应设计文档：`Mooncake + KVClient L3 接入（Kvcs）- v3.md` v4.6
 代码核对基线：`Mooncake` main `46c5eca8`
 
@@ -28,9 +28,8 @@
 | `include/storage/distributed/kvclient/kvclient_config.h` | 新增，header-only：`kKvClientMaxValueBytes`、`KvClientAdapterConfig`、`FromEnvironment()`、`Validate()` |
 | `include/storage/distributed/kvclient/kvclient_key_codec.h` | 新增，header-only：`kKvClientHashSeed`、`EncodeBinaryKey`（`MakeCacheKey` 是适配器私有方法，转调它） |
 | `include/storage/distributed/kvclient/kvclient_backend.h` | 新增，厂商无关工厂声明 |
-| `src/storage/distributed/kvclient/kvclient_backend_stub.cpp` | 新增，SDK 缺失时的 `NOT_SUPPORTED` 实现 |
 | `include/storage/distributed/kvclient/kvclient_object_storage_adapter.h` | 新增，类定义（数据方法占位；含 `Completion` 与 `waitForCompletion`，删除路径依赖它） |
-| `src/storage/distributed/kvclient/kvclient_object_storage_adapter.cpp` | 新增，控制面实现 + 数据方法 stub + 工厂实现 |
+| `src/storage/distributed/kvclient/kvclient_object_storage_adapter.cpp` | 新增，控制面实现 + 数据方法 NOT_SUPPORTED 占位 + 工厂实现 |
 | `include/config/distributed_storage_config.h`、`src/config/distributed_storage_config.cpp` | `UsesKvClient()`、`Validate()` 分支、`UsesObjectStorage()` 列表 |
 | `src/config/file_storage_config.cpp` | `Validate()` 跳过本地目录校验 |
 | `include/storage/distributed/distributed_storage_backend.h` | 新增 `UsesKvClient()` |
@@ -97,12 +96,9 @@ classDiagram
         +returns expected~ObjectStorageAdapter~
     }
 
-    class Stub["kvclient_backend_stub.cpp"]
-
     KvClientObjectStorageAdapter *-- SdkKvClient : 持有
     KvClientObjectStorageAdapter ..> KvClientAdapterConfig : 读取
     Factory ..> KvClientObjectStorageAdapter : 创建（SDK 存在）
-    Factory ..> Stub : NOT_SUPPORTED（SDK 缺失）
 ```
 
 ### 1.4 流程图
@@ -113,7 +109,7 @@ flowchart TB
     CFG --> VAL{"Validate()"}
     VAL -->|失败| ERR1["工厂返回 INVALID_PARAMS"]
     VAL -->|通过| FOUND{"CMake: MOONCAKE_KVCLIENT_SDK_FOUND?"}
-    FOUND -->|否| STUB["CreateKvClientObjectStorageAdapter() from stub<br/>返回 NOT_SUPPORTED"]
+    FOUND -->|否| STUB["storage_backend.cpp 的 #else 分支<br/>直接返回 NOT_SUPPORTED（不编适配器 TU）"]
     FOUND -->|是| CREATE["make_unique<KvClientObjectStorageAdapter>(cfg)"]
     CREATE --> BACKEND["DistributedStorageBackend(cfg, dcfg, nullptr, adapter)"]
     BACKEND --> INJECT["FileStorage 构造：SetDfsStorageBackend(backend)<br/>enable_dfs = !UsesObjectStorage() || UsesKvcs() || UsesKvClient()"]
@@ -217,21 +213,26 @@ inline kv::BinaryKey EncodeBinaryKey(std::string_view logical_key) {
 }
 ```
 
-#### 1.6.3 工厂与 stub
+#### 1.6.3 工厂与 SDK 缺失分支
 
 ```cpp
 // kvclient_backend.h（厂商无关）
 tl::expected<std::unique_ptr<ObjectStorageAdapter>, ErrorCode>
 CreateKvClientObjectStorageAdapter();
 
-// kvclient_backend_stub.cpp（SDK 缺失）
-tl::expected<std::unique_ptr<ObjectStorageAdapter>, ErrorCode>
-CreateKvClientObjectStorageAdapter() {
+// storage_backend.cpp（工厂分支；SDK 缺失时不引用任何 SDK 符号）
+#if defined(MOONCAKE_HAVE_KVCLIENT_SDK)
+#include "storage/distributed/kvclient/kvclient_backend.h"
+#endif
+...
+#ifdef MOONCAKE_HAVE_KVCLIENT_SDK
+    return CreateKvClientObjectStorageAdapter();
+#else
     LOG(ERROR) << "KVClient SDK not built in; kvclient backend unavailable";
     return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
-}
+#endif
 
-// kvclient_object_storage_adapter.cpp（SDK 存在）
+// kvclient_object_storage_adapter.cpp（SDK 存在时才参与编译）
 tl::expected<std::unique_ptr<ObjectStorageAdapter>, ErrorCode>
 CreateKvClientObjectStorageAdapter() {
     auto cfg = KvClientAdapterConfig::FromEnvironment();
@@ -375,7 +376,7 @@ ObjectStorageIoResults KvClientObjectStorageAdapter::DeleteBatch(
 
 | 项 | 预期 |
 | --- | --- |
-| SDK 缺失构建 | 后端 stub 返回 `NOT_SUPPORTED`，其余后端不受影响 |
+| SDK 缺失构建 | 工厂分支返回 `NOT_SUPPORTED`，适配器 TU 不参与编译，其余后端不受影响 |
 | 配置非法 | 工厂返回 `INVALID_PARAMS`，不启动 SDK |
 | `sharedProviderMode != SHARED` | `Init` 失败 `DFS_SERVICE_UNAVAILABLE` |
 | `timeoutMs < wait_timeout_ms` | `Init` 失败 `INVALID_PARAMS` |

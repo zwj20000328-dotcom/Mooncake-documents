@@ -1,6 +1,6 @@
 # Mooncake + KVClient L3 接入设计方案
 
-版本：v4.6（文件名沿用 v3）　更新日期：2026-11-13
+版本：v4.7（文件名沿用 v3）　更新日期：2026-11-13
 
 代码核对基线：`Mooncake` main `46c5eca8`（2026-11-13）；下文源码行号均以该提交为准，升级基线后需重新锚定。
 
@@ -572,7 +572,7 @@ sequenceDiagram
     RC->>FS: 构造（UsesKvClient 时强制 kDistributed）
     FS->>F: CreateStorageBackend(config)
     F->>F: DistributedStorageConfig::Validate()<br/>single_tenant / 无 eviction_check_interval 要求
-    F->>AD: CreateKvClientObjectStorageAdapter()<br/>（SDK 缺失时 stub 返回 NOT_SUPPORTED）
+    F->>AD: CreateKvClientObjectStorageAdapter()<br/>（SDK 缺失时该分支直接返回 NOT_SUPPORTED）
     F->>BE: DistributedStorageBackend(cfg, distributed_cfg, nullptr, adapter)
     F-->>FS: backend
     FS->>C: SetDfsStorageBackend(backend)
@@ -1385,7 +1385,7 @@ return results;
 
 **校验**（`ReadConfig`）：`config_path` 非空；`max_object_bytes % 512 == 0 && <= 16776704`；`wait_timeout_ms > 0`。
 
-配置单元是 **header-only**，不含 SDK 头，因此 stub 构建与测试都能独立包含：
+配置单元是 **header-only**，不含 SDK 头，因此无 SDK 构建与测试都能独立包含：
 
 ```cpp
 // kvclient_config.h
@@ -1734,21 +1734,17 @@ if(TARGET PkgConfig::KVCLIENT)
   set(MOONCAKE_KVCLIENT_SDK_FOUND ON)
   message(STATUS "KVClient SDK found: kvclient backend enabled")
 else()
-  message(STATUS "KVClient SDK not found: kvclient backend builds with "
-                 "unsupported stub")
+  message(STATUS "KVClient SDK not found: kvclient backend disabled")
 endif()
 set(MOONCAKE_KVCLIENT_SDK_FOUND ${MOONCAKE_KVCLIENT_SDK_FOUND} PARENT_SCOPE)
 ```
 
-新增源文件（进 `MOONCAKE_STORE_CLIENT_SOURCES`，由 `mooncake_store_client_objects` 消费并最终链入 `mooncake_store`；不得放进 shared sources，否则会经 `$<TARGET_OBJECTS>` 进入 master）。适配器 TU 包含 SDK 头，必须按 SDK 是否找到二选一，二者只编译其一：
+新增源文件（进 `MOONCAKE_STORE_CLIENT_SOURCES`，由 `mooncake_store_client_objects` 消费并最终链入 `mooncake_store`；不得放进 shared sources，否则会经 `$<TARGET_OBJECTS>` 进入 master）。适配器 TU 包含 SDK 头，只在 SDK 存在时编译；SDK 缺失时工厂分支在 `storage_backend.cpp` 内直接返回 `NOT_SUPPORTED`，不需要额外的 stub 源文件：
 
 ```cmake
 if(MOONCAKE_KVCLIENT_SDK_FOUND)
   list(APPEND MOONCAKE_STORE_CLIENT_SOURCES
        storage/distributed/kvclient/kvclient_object_storage_adapter.cpp)
-else()
-  list(APPEND MOONCAKE_STORE_CLIENT_SOURCES
-       storage/distributed/kvclient/kvclient_backend_stub.cpp)
 endif()
 ```
 
@@ -1765,20 +1761,36 @@ if(MOONCAKE_KVCLIENT_SDK_FOUND)
 endif()
 ```
 
-**厂商类型隔离**：适配器头文件直接 `#include "kv_client.h"` / `kv_types.h`，所以只有适配器 TU 与工厂需要看到 SDK。`storage_backend.cpp` 只包含厂商无关的 `storage/distributed/kvclient/kvclient_backend.h`：
+**厂商类型隔离**：适配器头文件直接 `#include "kv_client.h"` / `kv_types.h`，因此只有适配器 TU 需要看到 SDK。`storage_backend.cpp` 在 `#ifdef MOONCAKE_HAVE_KVCLIENT_SDK` 内包含厂商无关的 `storage/distributed/kvclient/kvclient_backend.h`，并在同一宏下调用工厂；`#else` 直接返回 `NOT_SUPPORTED`：
+
+```cpp
+#if defined(MOONCAKE_HAVE_KVCLIENT_SDK)
+#include "storage/distributed/kvclient/kvclient_backend.h"
+#endif
+
+// CreateStorageBackend 的 UsesKvClient() 分支
+#ifdef MOONCAKE_HAVE_KVCLIENT_SDK
+    return CreateKvClientObjectStorageAdapter();
+#else
+    LOG(ERROR) << "KVClient SDK not built in; kvclient backend unavailable";
+    return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+#endif
+```
+
+工厂声明（`kvclient_backend.h`）本身不含厂商类型：
 
 ```cpp
 tl::expected<std::unique_ptr<ObjectStorageAdapter>, ErrorCode>
 CreateKvClientObjectStorageAdapter();
 ```
 
-SDK 存在时由适配器 TU 实现（读取 `KvClientAdapterConfig`、`make_unique`）；缺失时由 `kvclient_backend_stub.cpp` 返回 `NOT_SUPPORTED`，与 `kvcs_capi_driver.cpp:392-406` 同型。这样社区构建既不需要 SDK 头，工厂处也不出现厂商类型。
+SDK 存在时由适配器 TU 实现（读取 `KvClientAdapterConfig`、`make_unique`）；缺失时整个适配器 TU 不参与编译，工厂调用点返回 `NOT_SUPPORTED`。
 
-**打包前提**：UCM 的 `kv_semantics` 目前只 `install(TARGETS kv_client kv_transport LIBRARY DESTINATION ...)`，不安装头文件、也不生成 `kvclient.pc`；后续会单独打包 `KvClient`。打包落地前 `pkg_check_modules(KVCLIENT ...)` 找不到，后端按 stub 构建。打包产物必须同时满足：提供 `kvclient.pc`（模块名与版本对齐本节）、头文件安装到 include 根目录（使 `#include "kv_client.h"` 可解析）；否则需要同步改模块名/版本/头路径，不能假定“无需改动”。
+**打包前提**：UCM 的 `kv_semantics` 目前只 `install(TARGETS kv_client kv_transport LIBRARY DESTINATION ...)`，不安装头文件、也不生成 `kvclient.pc`；后续会单独打包 `KvClient`。打包落地前 `pkg_check_modules(KVCLIENT ...)` 找不到，该后端不可用（工厂分支返回 `NOT_SUPPORTED`），其他后端照常构建。打包产物必须同时满足：提供 `kvclient.pc`（模块名与版本对齐本节）、头文件安装到 include 根目录（使 `#include "kv_client.h"` 可解析）；否则需要同步改模块名/版本/头路径，不能假定“无需改动”。
 
 **`mooncake_store_master` 不链接 KVClient SDK**——不支持恢复裁决下 Master 无适配器实例、无 capacity provider，与 KVCS 需要链接（`:719-721`）不同。
 
-SDK 缺失时工厂的 `UsesKvClient()` 分支返回 `NOT_SUPPORTED`（经 `CreateKvClientObjectStorageAdapter()` 的 stub 实现），其他后端照常构建。
+SDK 缺失时工厂的 `UsesKvClient()` 分支在 `storage_backend.cpp` 内直接返回 `NOT_SUPPORTED`，不引用任何 SDK 符号。
 
 测试目标（`tests/CMakeLists.txt:429-437` 的 KVCS 模式）：
 
@@ -1795,7 +1807,7 @@ if(MOONCAKE_KVCLIENT_SDK_FOUND)
 endif()
 ```
 
-测试目标只在 SDK 存在时创建：`kv_client.h` / `kv_types.h` 由 SDK 提供，key codec 也包含 `kv_types.h`；SDK 缺失时后端走 stub，不编这两个测试。fake SDK 通过注入构造函数实现，仍需要真实 SDK 类型定义。
+测试目标只在 SDK 存在时创建：`kv_client.h` / `kv_types.h` 由 SDK 提供，key codec 也包含 `kv_types.h`；SDK 缺失时后端不可用，不编这两个测试。fake SDK 通过注入构造函数实现，仍需要真实 SDK 类型定义。
 
 ---
 
