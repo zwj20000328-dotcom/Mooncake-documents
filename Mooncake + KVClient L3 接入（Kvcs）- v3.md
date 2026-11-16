@@ -585,7 +585,6 @@ sequenceDiagram
     AD->>AD: 校验 cfg.timeoutMs >= wait_timeout_ms<br/>transport deadline 不得短于 Wait 超时
     AD->>SDK: Init(cfg)
     SDK-->>AD: Status
-    AD->>AD: CheckSharedProviderMode()<br/>sharedProviderMode == SHARED ?
     AD-->>BE: OK
     BE-->>FS: OK
 ```
@@ -800,7 +799,7 @@ sequenceDiagram
 | SFMEA-01 | logical key XXH64 碰撞：两个不同 key 映射到同一 CacheKey | **数据损坏**：后写覆盖先写，读到错 value。默认（`MOONCAKE_STORE_CHECKSUM` 关闭）无从发现；开启后 Get 端以 `CHECKSUM_MISMATCH` 暴露，但 Put 侧仍是覆盖写 | 不做 fingerprint（默许碰撞）；可复用既有 object checksum 作为检测手段；部署须限定 key 数量级 | 概率 ≈ n²/2^65：10^8 key → 2.7e-4 |
 | SFMEA-02 | 非法 key / 长度：空 key、同批重复、N == 0、N > 16,776,704、全零 CacheKey | 编码失败；协议层拒绝，预发送失败会 **abort 整个 transport task** | `RegisterBuffers` 拒空 key；`MakeCacheKey` 把全零映射为非零常量；写侧拒绝同批重复；逐请求预检 `n > 0` 且 `wire_len <= max_object_bytes`；Master `PrepareWriteStart` 第一道校验 | 不能指望「只失败越界那条」 |
 | SFMEA-03 | 写路径未按 `AlignUp(N,512)` 补零 / 未清零尾部，或直传时越界写 | 提交被拒；残留字节被当成 padding 发到存储侧；越界写破坏相邻内存 | 直传要求 `capacity >= wire_len`；暂存由适配器分配 `wire_len` 并对 `[N, wire_len)` 清零 | 写 513 字节对象断言尾部全 0；未声明容量时走暂存 |
-| SFMEA-04 | 初始化门禁失败：`sharedProviderMode != SHARED`、SDK `Init` 失败、transport deadline < `Wait` 超时 | 适配器不可用；或健康但较慢的写被判 `PARTIAL_FAILED` + `TIMEOUT` | `CheckSharedProviderMode` 硬门禁；`Init` 失败即失败；校验 `cfg.timeoutMs >= wait_timeout_ms` | 全部在 `Init` 阶段失败 |
+| SFMEA-04 | 初始化门禁失败：SDK `Init` 失败、transport deadline < `Wait` 超时 | 适配器不可用；或健康但较慢的写被判 `PARTIAL_FAILED` + `TIMEOUT` | `Init` 失败即失败；校验 `cfg.timeoutMs >= wait_timeout_ms` | 全部在 `Init` 阶段失败 |
 | SFMEA-05 | 提交的 handle 未被本批注册覆盖（取自他批、已注销或拼错） | 到 `Wait` 才以 `BUFFER_NOT_REGISTERED` 暴露且**连坐整 task** | handle 由本批 `RegisterBuffers` 直接回填进 `BufferPlan`，构造 `KVBuffer` 时按下标取；`mrKey` 由 SDK 按 handle 解析，适配器留 `std::nullopt` | 注册只在批内产生，生命周期与 batch 相同 |
 | SFMEA-06 | `Wait` 超时 / 取消：**直传**路径的调用方 buffer 可能被迟到写覆盖；`entryStatus` 仍停留在初值 `OK` | 读到错数据；或把未落盘的数据报成功 | 非终态**不读** `entryStatus`，整批置错；直传保留 handle，暂存把 staging + handle 转入 `orphans_`；暂存路径调用方 buffer 不受影响 | SDK 无面向业务的中止能力 |
 | SFMEA-07 | task 级 `PARTIAL_FAILED`、派发后 `CANCELED`、或路由失败 | 部分 key 成功、部分失败；`CANCELED` 时设备可能已访问 buffer | 逐项映射 `entryStatus` 并按 `originalIndices` 回填；直传无自有 buffer，暂存 buffer 随 plan 释放（非终态转 `orphans_`） | entryStatus 与输入严格一一对应 |
@@ -826,7 +825,7 @@ sequenceDiagram
 | 字段 | 来源 | 用途 |
 | --- | --- | --- |
 | `logical_key` | 应用 | 业务侧关联（可能含敏感信息，按日志级别裁剪） |
-| `cache_key` | `MakeCacheKey` 结果（内部调用 `EncodeBinaryKey`）的 16 位 hex | 碰撞排查的**主要**手段（默认配置下唯一；开启 object checksum 后可被 `CHECKSUM_MISMATCH` 直接发现）：两个不同 logical_key 出现同一 cache_key 即为碰撞 |
+| `cache_key` | `MakeCacheKey` 结果的 16 位 hex | 碰撞排查的**主要**手段（默认配置下唯一；开启 object checksum 后可被 `CHECKSUM_MISMATCH` 直接发现）：两个不同 logical_key 出现同一 cache_key 即为碰撞 |
 | `object_size` | descriptor | 对齐/上限问题定位 |
 | `task_id` | SDK | 跨 client/transport 层关联 SDK 内部日志 |
 | `replica_id` | descriptor | miss 清理 CAS 排查 |
@@ -839,8 +838,8 @@ sequenceDiagram
 | 级别 | 内容 |
 | --- | --- |
 | `ERROR` | Wait 超时（含 `task_id`、`op`、`task_status`、`buffer_addr`、**本批 buffer 数**）；`RegisterRegions` / `UnregisterRegions` 失败；非终态保留 handle（`kvclient_batch_release_skipped`）；析构时仍有在途 batch；entryStatus 映射到未知 SDK 码 |
-| `WARNING` | `CheckSharedProviderMode` 通过但 provider 类型非预期；单项 entryStatus 失败（非整 task）；请求因 `N == 0` 或 `wire_len` 超上限被拒 |
-| `INFO` | `Init` 成功（含 SDK 版本、`sharedProviderMode`、适配器上限 `max_object_bytes`，默认 `kKvClientMaxValueBytes`）；析构完成 |
+| `WARNING` | 单项 entryStatus 失败（非整 task）；请求因 `N == 0` 或 `wire_len` 超上限被拒 |
+| `INFO` | `Init` 成功（含 SDK 版本、适配器上限 `max_object_bytes`，默认 `kKvClientMaxValueBytes`）；析构完成 |
 | `VLOG(1)` | 每次 `PutBatch` / `GetBatch` / `DeleteBatch` 的 key 数、总字节、注册 buffer 数、耗时分解 |
 | `VLOG(2)` | 逐 entry 的 `logical_key` → `cache_key`、`buffer_addr`、handle |
 
@@ -854,8 +853,8 @@ sequenceDiagram
 
 | 症状 | 排查路径 |
 | --- | --- |
-| Init 失败 `DFS_SERVICE_UNAVAILABLE` | 查 `sharedProviderMode` 是否为 SHARED（SFMEA-04）；查 view service 可达性 |
-| Init 失败 `PARTIAL_FAILED` | 查 SDK `Init` 日志；AICPU provider 下确认 SHARED 模式 |
+| Init 失败 `DFS_SERVICE_UNAVAILABLE` | 查 view service 可达性；查 SDK `Init` 日志 |
+| Init 失败 `PARTIAL_FAILED` | 查 SDK `Init` 日志；确认 provider 配置 |
 | Put 全部失败但 SDK 日志无异常 | 查是否读了超时后的 `entryStatus`（SFMEA-06）；查 `Wait` 超时日志里的 `task_id` 与 `task_status`（§2.5.2） |
 | 读到错误数据，无报错 | **优先怀疑 key 碰撞**（SFMEA-01）：grep VLOG(2) 日志，比对两个 logical_key 是否得到同一 `cache_key` |
 | 读取恒返回 `FILE_READ_FAIL`，但数据其实写对了 | 查 `GetBatch` 是否误返回 `aligned_size` 而非 N（§3.4）——后端比对的是 `desc.object_size` |
@@ -875,69 +874,28 @@ sequenceDiagram
 
 # 3 shard 设计描述
 
-## 3.1 shard-1：key 编码（`kvclient_key_codec`）
+## 3.1 shard-1：key 编码（`MakeCacheKey`）
 
 **职责**：logical key → 8 字节 `kv::BinaryKey` 的确定性映射，并包装成 SDK 的 `kv::CacheKey`。
 
-**文件**：`mooncake-store/include/storage/distributed/kvclient/kvclient_key_codec.h`（header-only）
+**位置**：`KvClientObjectStorageAdapter::MakeCacheKey`（`src/storage/distributed/kvclient/kvclient_object_storage_adapter.cpp`），不单独建头文件。
 
 ```cpp
-#pragma once
+// 文件内匿名命名空间
+inline constexpr uint64_t kKvClientHashSeed = 5381;
 
-#include <cstdint>
-#include <cstring>
-#include <string>
-#include <string_view>
-
-#include <xxhash.h>
-
-#include "kv_types.h"
-
-namespace mooncake::kvclient {
-
-// Fixed seed. The mapping must be a pure function of the logical key so that
-// any client, at any time, derives the same CacheKey. Do not mix in epoch,
-// process id, or random salt: that would break cross-client reads.
-// Deliberately the same value as the SDK's HASH_SEED_VALUE
-// (kv_semantics/src/client/key_resolver.h). We never hand the SDK a string key,
-// so this does not change the wire identity today; sharing one constant keeps a
-// future switch to FromEngineKey a no-op and makes cache_key directly
-// comparable with the UCM/ASUStore side.
-inline constexpr XXH64_hash_t kCacheKeySeed = 5381ULL;
-
-// Collisions are accepted by design (no fingerprint validation). Two distinct
-// logical keys mapping to the same CacheKey silently overwrite each other.
-// Probability is ~n^2/2^65; see SFMEA-01 for the deployment key-count bound.
-inline kv::BinaryKey EncodeBinaryKey(std::string_view logical_key) {
-    XXH64_hash_t hash =
-        XXH64(logical_key.data(), logical_key.size(), kCacheKeySeed);
-    // The protocol rejects an all-zero key (kv_protocol.cc IsCacheKeyAllZero)
-    // and that rejection aborts the whole transport task, so the 2^-64 case
-    // is mapped away instead of being left as a latent batch poisoner.
-    if (hash == 0) hash = kCacheKeySeed;
-    kv::BinaryKey raw{};
-    std::memcpy(raw.data(), &hash, sizeof(hash));
-    return raw;
+kv::BinaryKey KvClientObjectStorageAdapter::MakeCacheKey(
+    std::string_view logical_key) const {
+    uint64_t hash =
+        XXH64(logical_key.data(), logical_key.size(), kKvClientHashSeed);
+    // 协议拒绝全零 key；映射为 seed，避免整批被毒化。
+    if (hash == 0) hash = kKvClientHashSeed;
+    kv::BinaryKey key{};
+    // 显式小端，与 SDK key_resolver 的打包方式一致；不要用 memcpy。
+    for (size_t i = 0; i < sizeof(hash); ++i)
+        key[i] = static_cast<std::byte>(hash >> (8 * i));
+    return key;
 }
-
-// 16 hex chars. This is the only observable handle for collision diagnosis,
-// so it must be logged unconditionally at VLOG(2). It takes BinaryKey rather
-// than CacheKey because CacheKeyView/CacheKeyToHex live in the SDK's private
-// src/trans/trans_types.h and are not available to external consumers.
-inline std::string CacheKeyToLogString(const kv::BinaryKey& key) {
-    static constexpr char kHex[] = "0123456789abcdef";
-    std::string text;
-    text.reserve(key.size() * 2);
-    for (auto byte : key) {
-        const auto value =
-            static_cast<unsigned char>(std::to_integer<unsigned char>(byte));
-        text.push_back(kHex[value >> 4]);
-        text.push_back(kHex[value & 0x0F]);
-    }
-    return text;
-}
-
-}  // namespace mooncake::kvclient
 ```
 
 **设计说明**：
@@ -946,6 +904,7 @@ inline std::string CacheKeyToLogString(const kv::BinaryKey& key) {
 - **纯函数约束**：映射不得混入 epoch / 进程 id / 随机种子。这既是跨 Client 读取的前提，也是不支持恢复裁决下唯一需要保证的稳定性。
 - **SDK 侧 string key 哈希为预留能力，本方案不使用**（KVClient `#1641` 起 `kv::CacheKey::FromEngineKey(std::string)` 会在 `SubmitAsync` 内用 XXH64(seed=5381) 自行哈希）。
 - **全零 key 必须映射掉**：协议层对全零 key 直接 `INVALID_ARGUMENT`，而预发送失败会 abort 整个 transport task（SFMEA-02 同一机制）。XXH64 输出全零的概率是 2^-64，但代价是一整批被毒化，不值得留窗口。
+- **不做独立 codec 单元**：编码只有 `MakeCacheKey` 一个调用方；PR3 通过注入 fake client 截获 `DeleteAsync` 的 `CacheKey` 做断言。碰撞诊断如需 `cache_key` 日志，可在同一 `.cpp` 内加私有 helper，不引入额外头文件。
 
 ## 3.2 shard-2：适配器（`kvclient_object_storage_adapter`）
 
@@ -983,8 +942,8 @@ class KvClientObjectStorageAdapter final : public ObjectStorageAdapter {
    public:
     explicit KvClientObjectStorageAdapter(KvClientAdapterConfig config = {});
     // Test seam: inject an SDK client (real or fake) instead of creating one in
-    // Init(). Init() then skips CreateKvClient / LoadFromFile / SDK Init /
-    // sharedProviderMode checks and only validates the adapter config.
+    // Init(). Init() then skips CreateKvClient / LoadFromFile / SDK Init
+    // and only validates the adapter config.
     // Mirrors KvcsObjectStorageAdapter(std::unique_ptr<KvcsDriver>).
     KvClientObjectStorageAdapter(KvClientAdapterConfig config,
                                  std::unique_ptr<kv::KvClient> client);
@@ -1026,7 +985,7 @@ class KvClientObjectStorageAdapter final : public ObjectStorageAdapter {
         kv::MRHandle handle = kv::kInvalidMRHandle;
     };
 
-    // Delegates to kvclient_key_codec.h's EncodeBinaryKey.
+    // Encodes with XXH64 (seed 5381) and explicit little-endian packing.
     kv::BinaryKey MakeCacheKey(std::string_view logical_key) const;
     // Validates each request's buffer (length, contiguity, 512B alignment,
     // write-tail zeroing), registers the distinct (addr, wire_len) regions with
@@ -1063,7 +1022,6 @@ class KvClientObjectStorageAdapter final : public ObjectStorageAdapter {
     };
     Completion waitForCompletion(kv::TaskId task_id, size_t entry_count);
     static ErrorCode ToErrorCode(const kv::Status& status);
-    bool CheckSharedProviderMode(const kv::KvClientConfig& sdk_config) const;
 
     // Non-terminal Wait: the device may still touch these buffers, so keep the
     // staging memory and handles alive until Shutdown().
@@ -1798,12 +1756,10 @@ SDK 缺失时工厂的 `UsesKvClient()` 分支在 `storage_backend.cpp` 内直�
 
 ```cmake
 if(MOONCAKE_KVCLIENT_SDK_FOUND)
-  add_store_test(kvclient_key_codec_test kvclient_key_codec_test.cpp)
   add_store_test(kvclient_object_storage_adapter_test
                  kvclient_object_storage_adapter_test.cpp)
   # SDK 是 mooncake_store 的 PRIVATE 依赖，include 目录不会传给测试；
   # 测试需直接链接 imported target 才能找到 kv_client.h / 符号。
-  target_link_libraries(kvclient_key_codec_test PRIVATE PkgConfig::KVCLIENT)
   target_link_libraries(kvclient_object_storage_adapter_test
                         PRIVATE PkgConfig::KVCLIENT)
 endif()
@@ -1819,12 +1775,12 @@ endif()
 
 | 编号 | 层级 | 用例 | 预期结果 | 覆盖 |
 | --- | --- | --- | --- | --- |
-| T-01 | 单元 | key codec：幂等、单射、强制碰撞、全零 hash | 同 key 逐字节一致；不同 key 不碰撞；碰撞时后写覆盖；全零被映射为非零 | SFMEA-01/02 |
+| T-01 | 单元 | `MakeCacheKey`：同 key 稳定、显式小端、全零 hash 替代 | 同 key 逐字节一致；按小端解析得到 XXH64 值；全零被映射为非零 | SFMEA-01/02 |
 | T-02 | 单元 | 空 logical key、同批重复 key、N=0 | 均 `INVALID_PARAMS` | SFMEA-02 |
 | T-03 | 单元 | N=513 写读；直传（声明 `capacity`、512 对齐、单段连续）与暂存（`capacity=0`、未对齐、多段 iov）两条路径；`wire_len` 超 `max_object_bytes` | 尾部补零无残留；暂存时调用方 buffer 不被写、读后拷回 N 字节正确；超上限拒绝 | SFMEA-03/18 |
 | T-04 | 单元 | N = 16,776,704 与越界值（16,777,000 / 16,777,216） | 上限成功；越界由 Master 与适配器双层拒绝 | SFMEA-02 |
 | T-05 | 单元 | `GetBatch` 对 N=513 的返回值；构造读回长度不符 | 返回 **513** 而非 1024；长度不符 → `FILE_READ_FAIL` | SFMEA-16 |
-| T-06 | 单元 | `sharedProvider=0`；`timeoutMs < wait_timeout_ms` | 前者 `Init` 失败；后者 `INVALID_PARAMS` 且不调用 SDK `Init` | SFMEA-04 |
+| T-06 | 单元 | `timeoutMs < wait_timeout_ms` | `INVALID_PARAMS` 且不调用 SDK `Init` | SFMEA-04 |
 | T-07 | 单元 | fake SDK 让 `Wait` 返回 `BUFFER_NOT_REGISTERED` | 该 task / sub-batch 内 key 全部映射为 `INVALID_PARAMS`；其他 sub-batch 不受影响 | SFMEA-05 |
 | T-08 | 单元 | fake SDK 让 `Wait` 超时且 task 保持 in-flight；直传 / 暂存各一批；`entryStatus` 初值 `OK` | 逐项 `RPC_TIMEOUT`；**绝不为 OK**；直传不注销 handle，暂存把 staging + handle 转入 `orphans_`；暂存不改调用方 buffer | SFMEA-06/19 |
 | T-09 | 单元 | task 级 `PARTIAL_FAILED`（第 2 项业务错误）；整个 task `CANCELED` | 按原下标回填、其余成功；只做错误映射 | SFMEA-07 |

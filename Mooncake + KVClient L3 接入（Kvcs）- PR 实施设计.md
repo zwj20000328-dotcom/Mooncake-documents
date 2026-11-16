@@ -26,17 +26,18 @@
 | --- | --- |
 | `mooncake-common/include/environment_variables.h` | 新增 `KvClientEnvironmentVariables`（三个 env 变量声明） |
 | `include/storage/distributed/kvclient/kvclient_config.h` | 新增，header-only：`kKvClientMaxValueBytes`、`KvClientAdapterConfig`、`FromEnvironment()`、`Validate()` |
-| `include/storage/distributed/kvclient/kvclient_key_codec.h` | 新增，header-only：`kKvClientHashSeed`、`EncodeBinaryKey`（`MakeCacheKey` 是适配器私有方法，转调它） |
 | `include/storage/distributed/kvclient/kvclient_backend.h` | 新增，厂商无关工厂声明 |
 | `include/storage/distributed/kvclient/kvclient_object_storage_adapter.h` | 新增，类定义（`kKvClientAdapterName`、注入构造、全部纯虚 override；数据方法占位；含 `Completion` 与 `waitForCompletion`，删除路径依赖它） |
-| `src/storage/distributed/kvclient/kvclient_object_storage_adapter.cpp` | 新增，控制面实现（`Init`、`Delete`、`DeleteBatch`）+ 数据方法 NOT_SUPPORTED 占位 + 工厂实现 |
+| `src/storage/distributed/kvclient/kvclient_object_storage_adapter.cpp` | 新增，控制面实现（`Init`、`Delete`、`DeleteBatch`、私有 `MakeCacheKey` 编码）+ 数据方法 NOT_SUPPORTED 占位 + 工厂实现 |
 | `include/config/distributed_storage_config.h`、`src/config/distributed_storage_config.cpp` | `UsesKvClient()`、`Validate()` 分支、`UsesObjectStorage()` 列表 |
 | `src/config/file_storage_config.cpp` | `Validate()` 跳过本地目录校验 |
 | `include/storage/distributed/distributed_storage_backend.h` | 新增 `UsesKvClient()` |
 | `src/storage_backend.cpp` | 工厂新增 `UsesKvClient()` 分支 |
 | `src/file_storage.cpp` | `enable_dfs` 加入 `UsesKvClient()` |
-| `src/real_client.cpp` | `enable_kvcs` 判断加入 `UsesKvClient()` |
+| `src/real_client.cpp` | 新增 `enable_kvclient`；构造条件与 `kDistributed` 强制均加入 |
 | `src/CMakeLists.txt` | pkg-config、条件源、define/link（具体落点见 1.6.6） |
+| `tests/distributed_storage_config_test.cpp` | 新增 kvclient 解析、校验、allocator 与 SDK 缺失工厂用例 |
+| `tests/CMakeLists.txt` | SDK 缺失时给配置测试定义 `MOONCAKE_KVCLIENT_TEST_NO_SDK=1` |
 
 ### 1.3 类图
 
@@ -78,7 +79,6 @@ classDiagram
         +Get(key, buf, len) expected
         +GetBatch(requests) results
         -ToErrorCode(status) ErrorCode$
-        -CheckSharedProviderMode(cfg) bool
     }
 
     KvClientObjectStorageAdapter ..> Completion : 返回
@@ -152,7 +152,6 @@ sequenceDiagram
     AD->>AD: 校验 cfg.timeoutMs >= wait_timeout_ms
     AD->>SDK: Init(cfg)
     SDK-->>AD: Status
-    AD->>AD: CheckSharedProviderMode()
     AD-->>BE: OK
     BE-->>FS: OK
 ```
@@ -227,15 +226,19 @@ struct KvClientAdapterConfig {
 
 > `wait_timeout_ms` 默认 30 s，而 SDK 的 `timeoutMs` / `defaultWaitTimeoutMs` 默认只有 100 ms；`Init` 的硬校验要求 `cfg.timeoutMs >= wait_timeout_ms`。因此部署侧必须在 SDK client 配置里把 `waitTimeoutMs` / `timeoutMs` 调到至少 `MOONCAKE_KVCLIENT_WAIT_TIMEOUT_MS`（默认 30000），否则 `Init` 返回 `INVALID_PARAMS`。`Init` 失败日志必须同时打印 `cfg.timeoutMs` 与 `wait_timeout_ms`，便于定位。
 
-#### 1.6.2 key 编码
+#### 1.6.2 key 编码（适配器私有方法）
+
+编码逻辑只存在于 `KvClientObjectStorageAdapter::MakeCacheKey`，不单独建头文件：
 
 ```cpp
-// kvclient_key_codec.h
+// kvclient_object_storage_adapter.cpp（匿名命名空间）
 inline constexpr uint64_t kKvClientHashSeed = 5381;   // 与 SDK key_resolver 一致
 
-inline kv::BinaryKey EncodeBinaryKey(std::string_view logical_key) {
-    uint64_t hash = XXH64(logical_key.data(), logical_key.size(), kKvClientHashSeed);
-    if (hash == 0) hash = kKvClientHashSeed;   // 全零映射为非零常量（与 v3 一致）
+kv::BinaryKey KvClientObjectStorageAdapter::MakeCacheKey(
+    std::string_view logical_key) const {
+    uint64_t hash =
+        XXH64(logical_key.data(), logical_key.size(), kKvClientHashSeed);
+    if (hash == 0) hash = kKvClientHashSeed;   // 全零映射为非零常量
     kv::BinaryKey key{};
     // 显式小端逐字节写入，与 SDK key_resolver 的打包方式一致；
     // 不用 memcpy（主机字节序），否则大小端客户端会得到不同的 CacheKey。
@@ -281,9 +284,9 @@ return std::make_shared<DistributedStorageBackend>(
 // kvclient_object_storage_adapter.cpp（SDK 存在时才参与编译）
 tl::expected<std::unique_ptr<ObjectStorageAdapter>, ErrorCode>
 CreateKvClientObjectStorageAdapter() {
-    auto cfg = KvClientAdapterConfig::FromEnvironment();
-    if (!cfg) return tl::make_unexpected(cfg.error());
-    return std::make_unique<KvClientObjectStorageAdapter>(*cfg);
+    auto config = KvClientAdapterConfig::FromEnvironment();
+    if (!config) return tl::make_unexpected(config.error());
+    return std::make_unique<KvClientObjectStorageAdapter>(*config);
 }
 ```
 
@@ -295,7 +298,7 @@ CreateKvClientObjectStorageAdapter() {
 inline constexpr char kKvClientAdapterName[] = "kvclient";
 ```
 
-`Init` 的关键是**把 client 创建到局部变量，成功后才写入成员**。SDK `Init` 非幂等（第二次调用返回 `RESOURCE_BUSY`），因此每次重试都必须重新执行配置加载与校验，任何失败路径都不能留下"非空但未初始化"的 `kv_client_`。`sharedProviderMode` 门禁放在 SDK `Init` 之前，避免初始化成功后再被拒绝；SDK 同时接受 `INDEPENDENT`（默认）与 `SHARED`，"必须 SHARED" 是 Mooncake 的策略门禁。
+`Init` 的关键是**把 client 创建到局部变量，成功后才写入成员**。SDK `Init` 非幂等（第二次调用返回 `RESOURCE_BUSY`），因此每次重试都必须重新执行配置加载与校验，任何失败路径都不能留下"非空但未初始化"的 `kv_client_`。
 
 ```cpp
 tl::expected<void, ErrorCode> KvClientObjectStorageAdapter::Init() {
@@ -321,25 +324,15 @@ tl::expected<void, ErrorCode> KvClientObjectStorageAdapter::Init() {
                    << config_.wait_timeout_ms;
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
-    // 门禁放在 SDK Init 之前：Init 非幂等，失败后重试会 RESOURCE_BUSY。
-    if (!CheckSharedProviderMode(cfg))
-        return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
+    // Init 非幂等；局部 client 只在成功后提交，重试会从新的 client 开始。
     if (!client->Init(cfg).ok())
         return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
 
     kv_client_ = std::move(client);          // 仅在此处提交，失败不会污染成员
     initialized_ = true;
+    LOG(INFO) << "KVClient adapter initialized, max_object_bytes="
+              << config_.max_object_bytes;
     return {};
-}
-
-bool KvClientObjectStorageAdapter::CheckSharedProviderMode(
-    const kv::KvClientConfig& cfg) {
-    if (cfg.sharedProviderMode != kv::SharedProviderMode::SHARED) {
-        LOG(ERROR) << "KVClient requires sharedProviderMode=SHARED, got="
-                   << static_cast<int>(cfg.sharedProviderMode);
-        return false;
-    }
-    return true;
 }
 
 KvClientObjectStorageAdapter::~KvClientObjectStorageAdapter() {
@@ -488,7 +481,7 @@ tl::expected<void, ErrorCode> KvClientObjectStorageAdapter::Delete(
 四个落点必须分开，不能把 KVCS 的写法整体照搬：
 
 ```cmake
-# ① 检测块：与 KVCS 检测块并列（src/CMakeLists.txt:199-217 旁）
+# ① 检测块：与 src/CMakeLists.txt 的 KVCS 检测块并列
 set(MOONCAKE_KVCLIENT_SDK_FOUND OFF)
 find_package(PkgConfig QUIET)
 if(PkgConfig_FOUND)
@@ -501,7 +494,9 @@ if(TARGET PkgConfig::KVCLIENT)
 else()
   message(STATUS "KVClient SDK not found: kvclient backend disabled")
 endif()
-set(MOONCAKE_KVCLIENT_SDK_FOUND ${MOONCAKE_KVCLIENT_SDK_FOUND} PARENT_SCOPE)
+set(MOONCAKE_KVCLIENT_SDK_FOUND
+    ${MOONCAKE_KVCLIENT_SDK_FOUND}
+    PARENT_SCOPE)
 
 # ② 条件源：必须在 add_library(mooncake_store_client_objects ...) 之前
 if(MOONCAKE_KVCLIENT_SDK_FOUND)
@@ -524,7 +519,7 @@ if(MOONCAKE_KVCLIENT_SDK_FOUND)
 endif()
 ```
 
-> `mooncake_store_master` 不链接 KVClient SDK。适配器源不得放进 `MOONCAKE_STORE_SHARED_SOURCES`（该对象库会经 `$<TARGET_OBJECTS>` 进入 master）。`storage_backend.cpp` 只允许在 `MOONCAKE_HAVE_KVCLIENT_SDK` 内包含厂商无关的 `kvclient_backend.h`，不得包含 `kvclient_object_storage_adapter.h` 或 `kvclient_key_codec.h`。SDK 存在时适配器 TU 才参与编译；SDK 缺失时工厂的 `#else` 分支返回 `NOT_SUPPORTED`，不引用任何 SDK 符号。
+> `mooncake_store_master` 不链接 KVClient SDK。适配器源不得放进 `MOONCAKE_STORE_SHARED_SOURCES`（该对象库会经 `$<TARGET_OBJECTS>` 进入 master）。`storage_backend.cpp` 只允许在 `MOONCAKE_HAVE_KVCLIENT_SDK` 内包含厂商无关的 `kvclient_backend.h`，不得包含 `kvclient_object_storage_adapter.h`。SDK 存在时适配器 TU 才参与编译；SDK 缺失时工厂的 `#else` 分支返回 `NOT_SUPPORTED`，不引用任何 SDK 符号。
 
 ### 1.7 验收
 
@@ -532,7 +527,6 @@ endif()
 | --- | --- |
 | SDK 缺失构建 | 工厂分支返回 `NOT_SUPPORTED`，适配器 TU 不参与编译，其余后端不受影响 |
 | 配置非法（含 `MOONCAKE_KVCLIENT_*` 数值无法解析） | 工厂返回 `INVALID_PARAMS`，不启动 SDK |
-| `sharedProviderMode != SHARED` | `Init` 失败 `DFS_SERVICE_UNAVAILABLE` |
 | `timeoutMs < wait_timeout_ms` | `Init` 失败 `INVALID_PARAMS` |
 | 读写方法 | `Put` / `PutV` / `PutBatch` / `Get` / `GetBatch` 返回 `NOT_SUPPORTED`（PR2 替换）；`Delete` / `DeleteBatch` 已实现 |
 
@@ -983,9 +977,8 @@ auto target_pred = [this, replica_type, &client_id, expected_replica_id](
 | --- | --- |
 | `include/client_service.h` | `ReconcileMissingKvcsReplica` → `ReconcileMissingKvReplica` |
 | `src/client_service.cpp` | 改名（声明 + 2 处调用点 `:1626`、`:1936`）；`BatchRemove` 的 KVClient 分支；`Remove`/`RemoveAll`/`RemoveByRegex` 门控；`AttachHostId` |
-| `tests/kvclient_key_codec_test.cpp` | 新增 |
-| `tests/kvclient_object_storage_adapter_test.cpp` | 新增 |
-| `tests/CMakeLists.txt` | 新增两个测试目标（仅 SDK 存在时），并 `target_link_libraries(... PkgConfig::KVCLIENT)` |
+| `tests/kvclient_object_storage_adapter_test.cpp` | 新增（含 `MakeCacheKey` 稳定性/小端断言） |
+| `tests/CMakeLists.txt` | 新增测试目标（仅 SDK 存在时），并 `target_link_libraries(... PkgConfig::KVCLIENT)` |
 
 ### 3.3 类图
 
@@ -1201,7 +1194,7 @@ ReplicateConfig Client::AttachHostId(const ReplicateConfig& config) const {
 #### 3.6.4 测试清单
 
 ```cpp
-TEST(KvClientCodec, IdempotentAndInjective) { /* T-01 */ }
+TEST(KvClientAdapter, MakeCacheKeyIsStableAndLittleEndian) { /* T-01 */ }
 TEST(KvClientAdapter, RejectEmptyKeyZeroLengthAndDuplicate) { /* T-02 */ }
 TEST(KvClientAdapter, DirectAndStagedPaths) { /* T-03 */ }
 TEST(KvClientAdapter, RegisterFailureFailsBatch) { /* T-20 */ }
