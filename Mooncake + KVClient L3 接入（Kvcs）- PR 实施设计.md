@@ -28,15 +28,15 @@
 | `include/storage/distributed/kvclient/kvclient_config.h` | 新增，header-only：`kKvClientMaxValueBytes`、`KvClientAdapterConfig`、`FromEnvironment()`、`Validate()` |
 | `include/storage/distributed/kvclient/kvclient_key_codec.h` | 新增，header-only：`kKvClientHashSeed`、`EncodeBinaryKey`（`MakeCacheKey` 是适配器私有方法，转调它） |
 | `include/storage/distributed/kvclient/kvclient_backend.h` | 新增，厂商无关工厂声明 |
-| `include/storage/distributed/kvclient/kvclient_object_storage_adapter.h` | 新增，类定义（数据方法占位；含 `Completion` 与 `waitForCompletion`，删除路径依赖它） |
-| `src/storage/distributed/kvclient/kvclient_object_storage_adapter.cpp` | 新增，控制面实现 + 数据方法 NOT_SUPPORTED 占位 + 工厂实现 |
+| `include/storage/distributed/kvclient/kvclient_object_storage_adapter.h` | 新增，类定义（`kKvClientAdapterName`、注入构造、全部纯虚 override；数据方法占位；含 `Completion` 与 `waitForCompletion`，删除路径依赖它） |
+| `src/storage/distributed/kvclient/kvclient_object_storage_adapter.cpp` | 新增，控制面实现（`Init`、`Delete`、`DeleteBatch`）+ 数据方法 NOT_SUPPORTED 占位 + 工厂实现 |
 | `include/config/distributed_storage_config.h`、`src/config/distributed_storage_config.cpp` | `UsesKvClient()`、`Validate()` 分支、`UsesObjectStorage()` 列表 |
 | `src/config/file_storage_config.cpp` | `Validate()` 跳过本地目录校验 |
 | `include/storage/distributed/distributed_storage_backend.h` | 新增 `UsesKvClient()` |
 | `src/storage_backend.cpp` | 工厂新增 `UsesKvClient()` 分支 |
 | `src/file_storage.cpp` | `enable_dfs` 加入 `UsesKvClient()` |
 | `src/real_client.cpp` | `enable_kvcs` 判断加入 `UsesKvClient()` |
-| `src/CMakeLists.txt` | pkg-config、条件源、define/link |
+| `src/CMakeLists.txt` | pkg-config、条件源、define/link（具体落点见 1.6.6） |
 
 ### 1.3 类图
 
@@ -61,8 +61,11 @@ classDiagram
         -KvClientAdapterConfig config_
         -unique_ptr~KvClient~ kv_client_
         -bool initialized_
+        +KvClientObjectStorageAdapter(config) 构造
+        +KvClientObjectStorageAdapter(config, client) 测试注入构造
+        +KvClientObjectStorageAdapter() 析构
         +Init() expected
-        +GetName() char*
+        +GetName() const char*
         +Exists(key) expected
         +ListKeys() expected
         +Delete(key) expected
@@ -101,7 +104,7 @@ classDiagram
     Factory ..> KvClientObjectStorageAdapter : 创建（SDK 存在）
 ```
 
-> 数据面只有 batch 一条路径：`Put` / `PutV` / `Get` / `Delete` 都只是把单条请求包装成 `PutBatch` / `GetBatch` / `DeleteBatch` 调用，不单独实现 I/O。PR1 只声明它们并返回 `NOT_SUPPORTED`，PR2 用单行包装替换。
+> 数据面只有 batch 一条路径：`Put` / `PutV` / `Get` 都只是把单条请求包装成 `PutBatch` / `GetBatch` 调用，不单独实现 I/O；`Delete` 同样只是 `DeleteBatch` 的单条包装。PR1 实现 `Delete` 与 `DeleteBatch`（控制面删除），`Put` / `PutV` / `PutBatch` / `Get` / `GetBatch` 以 `NOT_SUPPORTED` 占位，PR2 用单行包装替换。`GetName()` 的真实签名是 `const char* GetName() const override`，不是 `char*`；适配器头必须 override `object_storage_adapter.h` 的全部纯虚函数（`Put` / `PutV` / `Get` / `Exists` / `Delete` / `ListKeys` / `Init` / `GetName`），并声明析构 `~KvClientObjectStorageAdapter() override`，否则类保持抽象、`make_unique` 无法编译。
 
 ### 1.4 流程图
 
@@ -176,23 +179,45 @@ struct KvClientAdapterConfig {
     uint64_t max_object_bytes = kKvClientMaxValueBytes;
     uint64_t wait_timeout_ms = 30'000;
 
+    // 数值变量必须严格解析：Environ::ReadOr 对 "abc"/"-1" 只打 stderr
+    // 警告并回退默认值，会让非法配置静默通过校验。
+    static tl::expected<uint64_t, ErrorCode> ReadUint(
+        const EnvironmentVariable<uint64_t>& variable, uint64_t default_value) {
+        const auto raw = Environ::Process().Get(variable.name);
+        if (!raw.has_value()) return default_value;          // 未设置：用默认值
+        const auto parsed = Environ::Process().GetTyped(variable);
+        if (!parsed.has_value()) {
+            LOG(ERROR) << "Invalid value for env " << variable.name << ": '"
+                       << *raw << "'";
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        return *parsed;
+    }
+
     static tl::expected<KvClientAdapterConfig, ErrorCode> FromEnvironment() {
         KvClientAdapterConfig cfg;
         cfg.config_path = Environ::ReadOr(
             KvClientEnvironmentVariables::MOONCAKE_KVCLIENT_CONFIG,
             std::string{});
-        cfg.max_object_bytes = Environ::ReadOr(
+        auto max_object_bytes = ReadUint(
             KvClientEnvironmentVariables::MOONCAKE_KVCLIENT_MAX_OBJECT_BYTES,
             kKvClientMaxValueBytes);
-        cfg.wait_timeout_ms = Environ::ReadOr(
+        if (!max_object_bytes)
+            return tl::make_unexpected(max_object_bytes.error());
+        cfg.max_object_bytes = *max_object_bytes;
+        auto wait_timeout_ms = ReadUint(
             KvClientEnvironmentVariables::MOONCAKE_KVCLIENT_WAIT_TIMEOUT_MS,
             uint64_t{30'000});
+        if (!wait_timeout_ms)
+            return tl::make_unexpected(wait_timeout_ms.error());
+        cfg.wait_timeout_ms = *wait_timeout_ms;
         if (!cfg.Validate()) return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         return cfg;
     }
 
     bool Validate() const {
         return !config_path.empty() &&
+               max_object_bytes > 0 &&
                max_object_bytes % kKvClientAlignment == 0 &&
                max_object_bytes <= kKvClientMaxValueBytes &&
                wait_timeout_ms > 0;
@@ -200,20 +225,27 @@ struct KvClientAdapterConfig {
 };
 ```
 
+> `wait_timeout_ms` 默认 30 s，而 SDK 的 `timeoutMs` / `defaultWaitTimeoutMs` 默认只有 100 ms；`Init` 的硬校验要求 `cfg.timeoutMs >= wait_timeout_ms`。因此部署侧必须在 SDK client 配置里把 `waitTimeoutMs` / `timeoutMs` 调到至少 `MOONCAKE_KVCLIENT_WAIT_TIMEOUT_MS`（默认 30000），否则 `Init` 返回 `INVALID_PARAMS`。`Init` 失败日志必须同时打印 `cfg.timeoutMs` 与 `wait_timeout_ms`，便于定位。
+
 #### 1.6.2 key 编码
 
 ```cpp
 // kvclient_key_codec.h
-inline constexpr uint64_t kKvClientHashSeed = 5381;   // 与 key_resolver 一致
+inline constexpr uint64_t kKvClientHashSeed = 5381;   // 与 SDK key_resolver 一致
 
 inline kv::BinaryKey EncodeBinaryKey(std::string_view logical_key) {
     uint64_t hash = XXH64(logical_key.data(), logical_key.size(), kKvClientHashSeed);
-    if (hash == 0) hash = 1;              // 全零映射为非零常量
+    if (hash == 0) hash = kKvClientHashSeed;   // 全零映射为非零常量（与 v3 一致）
     kv::BinaryKey key{};
-    std::memcpy(key.data(), &hash, sizeof(hash));
+    // 显式小端逐字节写入，与 SDK key_resolver 的打包方式一致；
+    // 不用 memcpy（主机字节序），否则大小端客户端会得到不同的 CacheKey。
+    for (size_t i = 0; i < sizeof(hash); ++i)
+        key[i] = static_cast<std::byte>(hash >> (8 * i));
     return key;
 }
 ```
+
+> 三个 wire 值必须同时固定：seed `5381`、`hash == 0` 的替代值 `5381`（不是 `1`）、以及小端字节序。SDK 的 `key_resolver` 对 string key 使用 `XXH64(..., 5381)` 后逐字节取低 8 位，见 `kv_semantics/src/client/key_resolver.cc:51-55`；Mooncake 只传 `CacheKey::FromBytes`，不走 SDK 的 string 路径。
 
 #### 1.6.3 工厂与 SDK 缺失分支
 
@@ -223,16 +255,28 @@ tl::expected<std::unique_ptr<ObjectStorageAdapter>, ErrorCode>
 CreateKvClientObjectStorageAdapter();
 
 // storage_backend.cpp（工厂分支；SDK 缺失时不引用任何 SDK 符号）
+// 只允许包含厂商无关的 kvclient_backend.h；不得包含适配器头或 key codec。
 #if defined(MOONCAKE_HAVE_KVCLIENT_SDK)
 #include "storage/distributed/kvclient/kvclient_backend.h"
 #endif
 ...
+// 接在既有 UsesKvcs() 分支之后；object_storage_adapter 变量在分支前已声明。
+} else if (distributed_config.UsesKvClient()) {
 #ifdef MOONCAKE_HAVE_KVCLIENT_SDK
-    return CreateKvClientObjectStorageAdapter();
+    auto adapter = CreateKvClientObjectStorageAdapter();
+    if (!adapter) return tl::make_unexpected(adapter.error());
+    object_storage_adapter = std::move(*adapter);
 #else
     LOG(ERROR) << "KVClient SDK not built in; kvclient backend unavailable";
     return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
 #endif
+}
+
+// 与既有分支共用收尾：工厂返回的是 ObjectStorageAdapter，
+// 必须包装进 DistributedStorageBackend；不能直接 return 工厂结果。
+return std::make_shared<DistributedStorageBackend>(
+    config, distributed_config, std::move(fs_adapter),
+    std::move(object_storage_adapter));
 
 // kvclient_object_storage_adapter.cpp（SDK 存在时才参与编译）
 tl::expected<std::unique_ptr<ObjectStorageAdapter>, ErrorCode>
@@ -245,28 +289,57 @@ CreateKvClientObjectStorageAdapter() {
 
 #### 1.6.4 控制面
 
+适配器头必须声明名称常量、注入构造、析构，并 override 全部纯虚函数：
+
+```cpp
+inline constexpr char kKvClientAdapterName[] = "kvclient";
+```
+
+`Init` 的关键是**把 client 创建到局部变量，成功后才写入成员**。SDK `Init` 非幂等（第二次调用返回 `RESOURCE_BUSY`），因此每次重试都必须重新执行配置加载与校验，任何失败路径都不能留下"非空但未初始化"的 `kv_client_`。`sharedProviderMode` 门禁放在 SDK `Init` 之前，避免初始化成功后再被拒绝；SDK 同时接受 `INDEPENDENT`（默认）与 `SHARED`，"必须 SHARED" 是 Mooncake 的策略门禁。
+
 ```cpp
 tl::expected<void, ErrorCode> KvClientObjectStorageAdapter::Init() {
     if (initialized_) return {};
     if (!config_.Validate()) return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
 
-    if (!kv_client_) {                       // 注入构造已提供 client 时跳过
-        kv_client_ = kv::CreateKvClient();
-        if (!kv_client_) return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
-
-        kv::KvClientConfig cfg;
-        if (!kv::KvClientConfig::LoadFromFile(config_.config_path, cfg).ok())
-            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-        cfg.keyResolution = {};              // 强制 GENERIC
-        if (cfg.timeoutMs < config_.wait_timeout_ms)
-            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-        if (!kv_client_->Init(cfg).ok())
-            return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
-        if (!CheckSharedProviderMode(cfg))
-            return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
+    // 注入构造已提供 client（测试缝）：只校验适配器配置，跳过 SDK 级初始化。
+    if (kv_client_) {
+        initialized_ = true;
+        return {};
     }
+
+    auto client = kv::CreateKvClient();      // 先建到局部变量，成功后才赋值
+    if (!client) return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
+
+    kv::KvClientConfig cfg;
+    if (!kv::KvClientConfig::LoadFromFile(config_.config_path, cfg).ok())
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    cfg.keyResolution = {};                  // 强制 GENERIC
+    if (cfg.timeoutMs < config_.wait_timeout_ms) {
+        LOG(ERROR) << "KVClient config timeoutMs=" << cfg.timeoutMs
+                   << " is shorter than wait_timeout_ms="
+                   << config_.wait_timeout_ms;
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    // 门禁放在 SDK Init 之前：Init 非幂等，失败后重试会 RESOURCE_BUSY。
+    if (!CheckSharedProviderMode(cfg))
+        return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
+    if (!client->Init(cfg).ok())
+        return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
+
+    kv_client_ = std::move(client);          // 仅在此处提交，失败不会污染成员
     initialized_ = true;
     return {};
+}
+
+bool KvClientObjectStorageAdapter::CheckSharedProviderMode(
+    const kv::KvClientConfig& cfg) {
+    if (cfg.sharedProviderMode != kv::SharedProviderMode::SHARED) {
+        LOG(ERROR) << "KVClient requires sharedProviderMode=SHARED, got="
+                   << static_cast<int>(cfg.sharedProviderMode);
+        return false;
+    }
+    return true;
 }
 
 KvClientObjectStorageAdapter::~KvClientObjectStorageAdapter() {
@@ -282,19 +355,29 @@ ErrorCode KvClientObjectStorageAdapter::ToErrorCode(const kv::Status& s) {
         case StatusCode::CQE_IO_TIMEOUT: return ErrorCode::RPC_TIMEOUT;
         case StatusCode::IN_PROGRESS:
         case StatusCode::CANCELED: return ErrorCode::INTERNAL_ERROR;
-        case StatusCode::NOT_FOUND:
+
+        // 对象 miss：只有 entry 级 key-not-found 才是 OBJECT_NOT_FOUND。
         case StatusCode::CQE_KEY_NOT_EXIST:
         case StatusCode::ENTRY_KEY_NOT_FOUND:
         case StatusCode::ENTRY_KEY_NOT_EXIST: return ErrorCode::OBJECT_NOT_FOUND;
+
+        // NOT_FOUND 是路由/配置/视图错误，不是对象 miss；
+        // 映射为 OBJECT_NOT_FOUND 会让 PR3 误删元数据、PR2 误触发 miss 清理。
+        case StatusCode::NOT_FOUND:
+        case StatusCode::NOT_INITIALIZED:
+        case StatusCode::CONNECTION_ERROR:
+        case StatusCode::IO_ERROR:
+        case StatusCode::UNSUPPORTED:
+        // Delete 的逐项失败码；ENTRY_KEY_NOT_EXIST 是 QUERY 专用。
+        case StatusCode::ENTRY_DELETE_FAILED:
+            return ErrorCode::DFS_SERVICE_UNAVAILABLE;
+
         case StatusCode::INVALID_ARGUMENT:
         case StatusCode::BUFFER_NOT_REGISTERED:
         case StatusCode::BUFFER_NOT_SUPPORTED: return ErrorCode::INVALID_PARAMS;
         case StatusCode::CQE_OUT_OF_CREATE_SIZE:
         case StatusCode::RESOURCE_BUSY:
         case StatusCode::CQE_RESOURCE_BUSY: return ErrorCode::NO_AVAILABLE_HANDLE;
-        case StatusCode::CONNECTION_ERROR:
-        case StatusCode::IO_ERROR:
-        case StatusCode::UNSUPPORTED: return ErrorCode::DFS_SERVICE_UNAVAILABLE;
         default: return ErrorCode::INTERNAL_ERROR;
     }
 }
@@ -306,25 +389,35 @@ KvClientObjectStorageAdapter::waitForCompletion(kv::TaskId task_id,
     const auto wait_status =
         kv_client_->Wait(task_id, config_.wait_timeout_ms, result);
     const auto code = wait_status.ok() ? result.status.code : wait_status.code;
+    const kv::Status& task_status = wait_status.ok() ? result.status : wait_status;
 
     Completion c;
-    if (code == kv::StatusCode::TASK_NOT_FOUND) {
-        // 任务已不存在，没有在途 I/O，handle 可以安全注销。
-        c.terminal = true;
-        c.entryStatus.assign(
-            entry_count,
-            kv::Status::Error(kv::StatusCode::INTERNAL_ERROR, "task not found"));
-        return c;
+    switch (code) {
+        case kv::StatusCode::TASK_NOT_FOUND:
+            // Wait 在超时后也会移除 task；未知 task 不能证明底层 I/O 已结束。
+            // 保守地按非终态处理，让调用方保留 handle/staging。
+            c.terminal = false;
+            c.entryStatus.assign(
+                entry_count,
+                kv::Status::Error(kv::StatusCode::INTERNAL_ERROR,
+                                  "task not found"));
+            return c;
+        case kv::StatusCode::TIMEOUT:
+        case kv::StatusCode::IN_PROGRESS:
+        case kv::StatusCode::CANCELED:
+            // SDK 在返回超时前可能已填充 entryStatus，但 task 未终态；
+            // 逐项结果不可信，统一用 task 级状态填充并保留资源。
+            c.terminal = false;
+            c.entryStatus.assign(entry_count, task_status);
+            return c;
+        default:
+            // task 已结束：OK / PARTIAL_FAILED，以及 INVALID_ARGUMENT /
+            // NOT_INITIALIZED / CONNECTION_ERROR / IO_ERROR / RESOURCE_BUSY
+            // 等 task 级最终错误，都算终态。
+            c.terminal = true;
+            break;
     }
 
-    c.terminal = (code == kv::StatusCode::OK ||
-                  code == kv::StatusCode::PARTIAL_FAILED);
-    if (!c.terminal) {
-        // TIMEOUT / CANCELED / IN_PROGRESS：用 task 级状态填充，不可当逐项结果。
-        const kv::Status& task_status = wait_status.ok() ? result.status : wait_status;
-        c.entryStatus.assign(entry_count, task_status);
-        return c;
-    }
     if (result.entryStatus.size() != entry_count) {
         c.entryStatus.assign(
             entry_count,
@@ -337,11 +430,17 @@ KvClientObjectStorageAdapter::waitForCompletion(kv::TaskId task_id,
 }
 ```
 
-#### 1.6.5 删除（控制面唯一的数据方法）
+#### 1.6.5 删除（PR1 已落地的唯一数据方法）
 
 ```cpp
 ObjectStorageIoResults KvClientObjectStorageAdapter::DeleteBatch(
     std::span<const std::string> keys) {
+    // Init 前或 Init 失败后直接调用：逐项失败，不解引用空 client。
+    if (!initialized_ || !kv_client_) {
+        return ObjectStorageIoResults(
+            keys.size(),
+            tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE));
+    }
     ObjectStorageIoResults results(keys.size());
     if (keys.empty()) return results;
 
@@ -372,17 +471,70 @@ ObjectStorageIoResults KvClientObjectStorageAdapter::DeleteBatch(
     }
     return results;
 }
+
+// Delete 只是 DeleteBatch 的单条包装；PR1 即落地，不属于 NOT_SUPPORTED 占位。
+tl::expected<void, ErrorCode> KvClientObjectStorageAdapter::Delete(
+    const std::string& key) {
+    std::array<std::string, 1> keys{key};
+    auto results = DeleteBatch(keys);
+    return results.empty()
+               ? tl::make_unexpected(ErrorCode::INVALID_PARAMS)
+               : std::move(results.front());
+}
 ```
+
+#### 1.6.6 构建（CMake）
+
+四个落点必须分开，不能把 KVCS 的写法整体照搬：
+
+```cmake
+# ① 检测块：与 KVCS 检测块并列（src/CMakeLists.txt:199-217 旁）
+set(MOONCAKE_KVCLIENT_SDK_FOUND OFF)
+find_package(PkgConfig QUIET)
+if(PkgConfig_FOUND)
+  # GLOBAL：tests/ 与 src/ 是兄弟目录，非 GLOBAL 的 imported target 不可见
+  pkg_check_modules(KVCLIENT QUIET IMPORTED_TARGET GLOBAL "kvclient>=0.1.0")
+endif()
+if(TARGET PkgConfig::KVCLIENT)
+  set(MOONCAKE_KVCLIENT_SDK_FOUND ON)
+  message(STATUS "KVClient SDK found: kvclient backend enabled")
+else()
+  message(STATUS "KVClient SDK not found: kvclient backend disabled")
+endif()
+set(MOONCAKE_KVCLIENT_SDK_FOUND ${MOONCAKE_KVCLIENT_SDK_FOUND} PARENT_SCOPE)
+
+# ② 条件源：必须在 add_library(mooncake_store_client_objects ...) 之前
+if(MOONCAKE_KVCLIENT_SDK_FOUND)
+  list(APPEND MOONCAKE_STORE_CLIENT_SOURCES
+       storage/distributed/kvclient/kvclient_object_storage_adapter.cpp)
+endif()
+
+# ③ define/link：storage_backend.cpp 与适配器 TU 都在 client objects 中。
+#    挂到 mooncake_store_shared_objects 会让 storage_backend.cpp 永远走 #else。
+if(MOONCAKE_KVCLIENT_SDK_FOUND)
+  target_compile_definitions(mooncake_store_client_objects
+                             PRIVATE MOONCAKE_HAVE_KVCLIENT_SDK=1)
+  target_link_libraries(mooncake_store_client_objects
+                        PRIVATE PkgConfig::KVCLIENT)
+endif()
+
+# ④ 最终库：OBJECT 库的 PRIVATE 链接不传播，mooncake_store 需要再链一次
+if(MOONCAKE_KVCLIENT_SDK_FOUND)
+  target_link_libraries(mooncake_store PRIVATE PkgConfig::KVCLIENT)
+endif()
+```
+
+> `mooncake_store_master` 不链接 KVClient SDK。适配器源不得放进 `MOONCAKE_STORE_SHARED_SOURCES`（该对象库会经 `$<TARGET_OBJECTS>` 进入 master）。`storage_backend.cpp` 只允许在 `MOONCAKE_HAVE_KVCLIENT_SDK` 内包含厂商无关的 `kvclient_backend.h`，不得包含 `kvclient_object_storage_adapter.h` 或 `kvclient_key_codec.h`。SDK 存在时适配器 TU 才参与编译；SDK 缺失时工厂的 `#else` 分支返回 `NOT_SUPPORTED`，不引用任何 SDK 符号。
 
 ### 1.7 验收
 
 | 项 | 预期 |
 | --- | --- |
 | SDK 缺失构建 | 工厂分支返回 `NOT_SUPPORTED`，适配器 TU 不参与编译，其余后端不受影响 |
-| 配置非法 | 工厂返回 `INVALID_PARAMS`，不启动 SDK |
+| 配置非法（含 `MOONCAKE_KVCLIENT_*` 数值无法解析） | 工厂返回 `INVALID_PARAMS`，不启动 SDK |
 | `sharedProviderMode != SHARED` | `Init` 失败 `DFS_SERVICE_UNAVAILABLE` |
 | `timeoutMs < wait_timeout_ms` | `Init` 失败 `INVALID_PARAMS` |
-| 读写方法 | 返回 `NOT_SUPPORTED`（PR2 替换） |
+| 读写方法 | `Put` / `PutV` / `PutBatch` / `Get` / `GetBatch` 返回 `NOT_SUPPORTED`（PR2 替换）；`Delete` / `DeleteBatch` 已实现 |
 
 ---
 
@@ -728,7 +880,8 @@ std::vector<tl::expected<void, ErrorCode>> KvClientObjectStorageAdapter::PutBatc
 #### 2.6.3 单条入口（batch 包装）
 
 ```cpp
-// 适配器只有 batch 数据路径；以下四个入口都只构造一条请求。
+// 适配器只有 batch 数据路径；Delete 已在 PR1 落地，
+// PR2 只需为以下三个入口补 batch 包装。
 tl::expected<void, ErrorCode> KvClientObjectStorageAdapter::Put(
     const std::string& key, std::span<const char> data) {
     iovec iov{const_cast<char*>(data.data()), data.size()};
@@ -747,14 +900,6 @@ tl::expected<void, ErrorCode> KvClientObjectStorageAdapter::PutV(
 tl::expected<size_t, ErrorCode> KvClientObjectStorageAdapter::Get(
     const std::string& key, void* buf, size_t len) {
     auto results = GetBatch({ObjectGetRequest{key, buf, len, 0}});
-    return results.empty() ? tl::make_unexpected(ErrorCode::INVALID_PARAMS)
-                           : results.front();
-}
-
-tl::expected<void, ErrorCode> KvClientObjectStorageAdapter::Delete(
-    const std::string& key) {
-    std::array<std::string, 1> keys{key};
-    auto results = DeleteBatch(keys);
     return results.empty() ? tl::make_unexpected(ErrorCode::INVALID_PARAMS)
                            : results.front();
 }
