@@ -385,8 +385,10 @@ bool UsesKvClient() const { return fs_adapter_type == "kvclient"; }
 ```cpp
 if (UsesKvClient()) {
     if (!single_tenant) {
-        // 同步写路径传入未加租户前缀的 key；SDK 的 IoOptions.kvns
-        // 当前未被消费，多租户会出现跨租户 key 碰撞。
+        // Client::Put/BatchPut -> WriteDfsReplicas -> DfsWriteRequest ->
+        // ObjectPutRequest 传的是 raw user key；只有 offload/read RPC 路径
+        // 用 TenantId::MakeScopedKey。SDK 的 IoOptions.kvns 当前未被消费，
+        // 多租户会出现跨租户 key 碰撞。
         LOG(ERROR) << "DistributedStorageConfig: KVClient requires "
                       "single_tenant=true";
         return false;
