@@ -26,7 +26,7 @@
 | --- | --- |
 | `mooncake-common/include/environment_variables.h` | 新增 `KvClientEnvironmentVariables`（三个 env 变量声明） |
 | `include/storage/distributed/kvclient/kvclient_config.h` | 新增，header-only：`kKvClientMaxValueBytes`、`KvClientAdapterConfig`、`FromEnvironment()`、`Validate()` |
-| `include/storage/distributed/kvclient/kvclient_backend.h` | 新增，厂商无关工厂声明 |
+| `include/storage/distributed/kvclient/kvclient_adapter_factory.h` | 新增，厂商无关工厂声明 |
 | `include/storage/distributed/kvclient/kvclient_object_storage_adapter.h` | 新增，类定义（`kKvClientAdapterName`、注入构造、全部纯虚 override；数据方法占位；含 `Completion` 与 `waitForCompletion`，删除路径依赖它） |
 | `src/storage/distributed/kvclient/kvclient_object_storage_adapter.cpp` | 新增，控制面实现（`Init`、`Delete`、`DeleteBatch`、私有 `MakeCacheKey` 编码）+ 数据方法 NOT_SUPPORTED 占位 + 工厂实现 |
 | `include/config/distributed_storage_config.h`、`src/config/distributed_storage_config.cpp` | `UsesKvClient()`、`Validate()` 分支、`UsesObjectStorage()` 列表 |
@@ -253,14 +253,14 @@ kv::BinaryKey KvClientObjectStorageAdapter::MakeCacheKey(
 #### 1.6.3 工厂与 SDK 缺失分支
 
 ```cpp
-// kvclient_backend.h（厂商无关）
+// kvclient_adapter_factory.h（厂商无关）
 tl::expected<std::unique_ptr<ObjectStorageAdapter>, ErrorCode>
 CreateKvClientObjectStorageAdapter();
 
 // storage_backend.cpp（工厂分支；SDK 缺失时不引用任何 SDK 符号）
-// 只允许包含厂商无关的 kvclient_backend.h；不得包含适配器头或 key codec。
+// 只允许包含厂商无关的 kvclient_adapter_factory.h；不得包含适配器头或 key codec。
 #if defined(MOONCAKE_HAVE_KVCLIENT_SDK)
-#include "storage/distributed/kvclient/kvclient_backend.h"
+#include "storage/distributed/kvclient/kvclient_adapter_factory.h"
 #endif
 ...
 // 接在既有 UsesKvcs() 分支之后；object_storage_adapter 变量在分支前已声明。
@@ -519,7 +519,7 @@ if(MOONCAKE_KVCLIENT_SDK_FOUND)
 endif()
 ```
 
-> `mooncake_store_master` 不链接 KVClient SDK。适配器源不得放进 `MOONCAKE_STORE_SHARED_SOURCES`（该对象库会经 `$<TARGET_OBJECTS>` 进入 master）。`storage_backend.cpp` 只允许在 `MOONCAKE_HAVE_KVCLIENT_SDK` 内包含厂商无关的 `kvclient_backend.h`，不得包含 `kvclient_object_storage_adapter.h`。SDK 存在时适配器 TU 才参与编译；SDK 缺失时工厂的 `#else` 分支返回 `NOT_SUPPORTED`，不引用任何 SDK 符号。
+> `mooncake_store_master` 不链接 KVClient SDK。适配器源不得放进 `MOONCAKE_STORE_SHARED_SOURCES`（该对象库会经 `$<TARGET_OBJECTS>` 进入 master）。`storage_backend.cpp` 只允许在 `MOONCAKE_HAVE_KVCLIENT_SDK` 内包含厂商无关的 `kvclient_adapter_factory.h`，不得包含 `kvclient_object_storage_adapter.h`。SDK 存在时适配器 TU 才参与编译；SDK 缺失时工厂的 `#else` 分支返回 `NOT_SUPPORTED`，不引用任何 SDK 符号。
 
 ### 1.7 验收
 

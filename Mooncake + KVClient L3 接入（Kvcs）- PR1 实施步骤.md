@@ -425,7 +425,7 @@ bool UsesKvClient() const {
 
 ### 7.5 `mooncake-store/src/storage_backend.cpp`
 
-- 只在 `MOONCAKE_HAVE_KVCLIENT_SDK` 内包含厂商无关的 `kvclient_backend.h`；
+- 只在 `MOONCAKE_HAVE_KVCLIENT_SDK` 内包含厂商无关的 `kvclient_adapter_factory.h`；
 - 不要包含 `kvclient_object_storage_adapter.h`；
 - 在 `UsesKvcs()` 分支后新增：
 
@@ -682,7 +682,7 @@ pre-commit run --files <本次改动文件>
 
 | 文件 | 行数 |
 | --- | ---: |
-| `mooncake-store/include/storage/distributed/kvclient/kvclient_backend.h` | 16 |
+| `mooncake-store/include/storage/distributed/kvclient/kvclient_adapter_factory.h` | 16 |
 | `mooncake-store/include/storage/distributed/kvclient/kvclient_config.h` | 78 |
 | `mooncake-store/include/storage/distributed/kvclient/kvclient_object_storage_adapter.h` | 63 |
 | `mooncake-store/src/storage/distributed/kvclient/kvclient_object_storage_adapter.cpp` | 287 |

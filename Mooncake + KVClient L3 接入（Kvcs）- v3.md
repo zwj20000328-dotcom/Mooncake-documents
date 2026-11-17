@@ -1721,11 +1721,11 @@ if(MOONCAKE_KVCLIENT_SDK_FOUND)
 endif()
 ```
 
-**厂商类型隔离**：适配器头文件直接 `#include "kv_client.h"` / `kv_types.h`，因此只有适配器 TU 需要看到 SDK。`storage_backend.cpp` 在 `#ifdef MOONCAKE_HAVE_KVCLIENT_SDK` 内包含厂商无关的 `storage/distributed/kvclient/kvclient_backend.h`，并在同一宏下调用工厂；`#else` 直接返回 `NOT_SUPPORTED`：
+**厂商类型隔离**：适配器头文件直接 `#include "kv_client.h"` / `kv_types.h`，因此只有适配器 TU 需要看到 SDK。`storage_backend.cpp` 在 `#ifdef MOONCAKE_HAVE_KVCLIENT_SDK` 内包含厂商无关的 `storage/distributed/kvclient/kvclient_adapter_factory.h`，并在同一宏下调用工厂；`#else` 直接返回 `NOT_SUPPORTED`：
 
 ```cpp
 #if defined(MOONCAKE_HAVE_KVCLIENT_SDK)
-#include "storage/distributed/kvclient/kvclient_backend.h"
+#include "storage/distributed/kvclient/kvclient_adapter_factory.h"
 #endif
 
 // CreateStorageBackend 的 UsesKvClient() 分支
@@ -1737,7 +1737,7 @@ endif()
 #endif
 ```
 
-工厂声明（`kvclient_backend.h`）本身不含厂商类型：
+工厂声明（`kvclient_adapter_factory.h`）本身不含厂商类型：
 
 ```cpp
 tl::expected<std::unique_ptr<ObjectStorageAdapter>, ErrorCode>
