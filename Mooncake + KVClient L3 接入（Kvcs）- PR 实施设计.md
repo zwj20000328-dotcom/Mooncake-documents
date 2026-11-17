@@ -486,7 +486,8 @@ set(MOONCAKE_KVCLIENT_SDK_FOUND OFF)
 find_package(PkgConfig QUIET)
 if(PkgConfig_FOUND)
   # GLOBAL：tests/ 与 src/ 是兄弟目录，非 GLOBAL 的 imported target 不可见
-  pkg_check_modules(KVCLIENT QUIET IMPORTED_TARGET GLOBAL "kvclient>=0.1.0")
+  # 暂不设版本下限：SDK 尚未发布 kvclient.pc，没有确定的包版本。
+  pkg_check_modules(KVCLIENT QUIET IMPORTED_TARGET GLOBAL "kvclient")
 endif()
 if(TARGET PkgConfig::KVCLIENT)
   set(MOONCAKE_KVCLIENT_SDK_FOUND ON)

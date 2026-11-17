@@ -357,7 +357,8 @@ mooncake-store/src/storage/distributed/kvclient/kvclient_driver.cpp
 沿用 KVCS 的可选依赖模式（`src/CMakeLists.txt:179-197`）：
 
 ```cmake
-pkg_check_modules(KVCLIENT QUIET IMPORTED_TARGET "kvclient>=X.Y")
+# 暂不设版本下限：SDK 尚未发布 kvclient.pc，没有确定的包版本。
+pkg_check_modules(KVCLIENT QUIET IMPORTED_TARGET "kvclient")
 if(TARGET PkgConfig::KVCLIENT)
   set(MOONCAKE_KVCLIENT_SDK_FOUND ON)
 endif()

@@ -1688,7 +1688,8 @@ if (dfs_storage_backend_ &&
 set(MOONCAKE_KVCLIENT_SDK_FOUND OFF)
 find_package(PkgConfig QUIET)
 if(PkgConfig_FOUND)
-  pkg_check_modules(KVCLIENT QUIET IMPORTED_TARGET "kvclient>=0.1.0")
+  # 暂不设版本下限：SDK 尚未发布 kvclient.pc，没有确定的包版本。
+  pkg_check_modules(KVCLIENT QUIET IMPORTED_TARGET GLOBAL "kvclient")
 endif()
 if(TARGET PkgConfig::KVCLIENT)
   set(MOONCAKE_KVCLIENT_SDK_FOUND ON)
@@ -1746,7 +1747,7 @@ CreateKvClientObjectStorageAdapter();
 
 SDK 存在时由适配器 TU 实现（读取 `KvClientAdapterConfig`、`make_unique`）；缺失时整个适配器 TU 不参与编译，工厂调用点返回 `NOT_SUPPORTED`。
 
-**打包前提**：UCM 的 `kv_semantics` 目前只 `install(TARGETS kv_client kv_transport LIBRARY DESTINATION ...)`，不安装头文件、也不生成 `kvclient.pc`；后续会单独打包 `KvClient`。打包落地前 `pkg_check_modules(KVCLIENT ...)` 找不到，该后端不可用（工厂分支返回 `NOT_SUPPORTED`），其他后端照常构建。打包产物必须同时满足：提供 `kvclient.pc`（模块名与版本对齐本节）、头文件安装到 include 根目录（使 `#include "kv_client.h"` 可解析）；否则需要同步改模块名/版本/头路径，不能假定“无需改动”。
+**打包前提**：UCM 的 `kv_semantics` 目前只 `install(TARGETS kv_client kv_transport LIBRARY DESTINATION ...)`，不安装头文件、也不生成 `kvclient.pc`；后续会单独打包 `KvClient`。打包落地前 `pkg_check_modules(KVCLIENT ...)` 找不到，该后端不可用（工厂分支返回 `NOT_SUPPORTED`），其他后端照常构建。打包产物必须同时满足：提供 `kvclient.pc`（模块名对齐本节；版本下限暂不设，待打包确定版本策略）、头文件安装到 include 根目录（使 `#include "kv_client.h"` 可解析）；否则需要同步改模块名/头路径，不能假定“无需改动”。
 
 **`mooncake_store_master` 不链接 KVClient SDK**——不支持恢复裁决下 Master 无适配器实例、无 capacity provider，与 KVCS 需要链接（`:719-721`）不同。
 
