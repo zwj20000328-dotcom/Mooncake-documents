@@ -1,6 +1,6 @@
 # Mooncake + KVClient L3 接入（Kvcs）— 三个 PR 的实施设计
 
-版本：v1.2　更新日期：2026-11-16
+版本：v1.3　更新日期：2026-11-18
 对应设计文档：`Mooncake + KVClient L3 接入（Kvcs）- v3.md` v4.6
 代码核对基线：`Mooncake` main `46c5eca8`
 
@@ -105,6 +105,8 @@ classDiagram
 ```
 
 > 数据面只有 batch 一条路径：`Put` / `PutV` / `Get` 都只是把单条请求包装成 `PutBatch` / `GetBatch` 调用，不单独实现 I/O；`Delete` 同样只是 `DeleteBatch` 的单条包装。PR1 实现 `Delete` 与 `DeleteBatch`（控制面删除），`Put` / `PutV` / `PutBatch` / `Get` / `GetBatch` 以 `NOT_SUPPORTED` 占位，PR2 用单行包装替换。`GetName()` 的真实签名是 `const char* GetName() const override`，不是 `char*`；适配器头必须 override `object_storage_adapter.h` 的全部纯虚函数（`Put` / `PutV` / `Get` / `Exists` / `Delete` / `ListKeys` / `Init` / `GetName`），并声明析构 `~KvClientObjectStorageAdapter() override`，否则类保持抽象、`make_unique` 无法编译。
+>
+> **PR2 实现注意**：`Completion` 是 PR1 已存在的类内私有嵌套类型，图中仅示意，PR2 **不要**重新声明；`BufferPlan` 也必须是类内私有类型（`RegisterBuffers` 的签名依赖它）。`orphans_` 的真实类型是 `std::vector<std::pair<std::shared_ptr<char[]>, kv::MRHandle>>`，拆解后只清内存、不重复注销 handle。
 
 ### 1.4 流程图
 
@@ -539,6 +541,15 @@ endif()
 
 实现直传/暂存两种模式的批读写、按批注册与释放、超时保留；并把 Master 侧的描述符铸造与门控接上，使 KVClient 后端可端到端读写。
 
+#### 2.1.1 已确认决策（2026-11-18）
+
+| 决策项 | 结论 | 对实施的影响 |
+| --- | --- | --- |
+| capacity 策略 | 所有现有调用点一律传 0（v3 第一阶段）；直传仅在适配器单测中构造 capacity 验证 | 生产路径只走暂存；PR2 **不改** `client_service.cpp` / `file_storage.cpp`；§2.7 的直传验收标注为适配器单测级 |
+| SDK 覆盖语义 | `StoreAsync` 对已存在 key 为覆盖写（upsert） | `PutBatch` 不做预删，不需要 `DeleteAsync` + `StoreAsync` 组合；重复写不会返回 `CQE_KEY_ALREADY_EXISTED` |
+| kvclient + oplog | `InitDfsAllocatorFromEnvironment` 在 `enable_oplog_` 为真时 `LOG(FATAL)` 拒绝启动 | kvclient 不支持快照/oplog 恢复；恢复门保持 KVCS-only，不并入 `use_kvclient_` |
+| PR2 测试归属 | PR2 自带适配器单测（原文档放在 PR3） | `tests/kvclient_object_storage_adapter_test.cpp` 与 `tests/CMakeLists.txt` 纳入 PR2 改动面 |
+
 ### 2.2 改动文件
 
 | 文件 | 改动 |
@@ -548,7 +559,13 @@ endif()
 | `src/storage/distributed/distributed_storage_backend.cpp` | 透传 capacity |
 | `include/storage/distributed/kvclient/kvclient_object_storage_adapter.h` | `BufferPlan`、`RegisterBuffers`/`ReleaseBuffers`/`RetainOrphans`、`orphans_` 成员（`Completion` 已在 PR1 声明） |
 | `src/storage/distributed/kvclient/kvclient_object_storage_adapter.cpp` | 数据面实现；析构中清理 `orphans_` |
-| `include/master_service.h` / `src/master_service.cpp` | `use_kvclient_`、门控、descriptor、白名单 |
+| `include/master_service.h` / `src/master_service.cpp` | `use_kvclient_`、门控、descriptor、白名单；`InitDfsAllocatorFromEnvironment` 新增 kvclient 早退分支（`enable_oplog_` 拒绝） |
+| `tests/kvclient_object_storage_adapter_test.cpp` | 新增，适配器数据面单测（SDK 存在时编译） |
+| `tests/CMakeLists.txt` | SDK 存在时新增测试目标并 `target_link_libraries(... PkgConfig::KVCLIENT)` |
+
+> **capacity 来源**：`Slice` 只有 `{ptr, size}`，写路径又强制 `sum(slices) == desc.object_size`，因此现有调用点没有"缓冲区真实容量"信息。PR2 只在 `BatchWrite` / `BatchRead` 两个构造点显式填 0（读路径多 slice 后端暂存时也必须为 0），不改上游 `client_service.cpp` / `file_storage.cpp`。直传分支保留实现，但生产路径不可达。
+>
+> **测试归属**：PR2 自带 §2.7 的适配器级用例；PR3 再补 Client 集成、删除顺序与 miss 自愈用例。
 
 ### 2.3 类图
 
@@ -562,7 +579,7 @@ classDiagram
         +size_t wire_len
         +bool staged
         +shared_ptr~char~ staging
-        +uint64 handle
+        +MRHandle handle
     }
 
     class Completion {
@@ -574,7 +591,7 @@ classDiagram
         -KvClientAdapterConfig config_
         -unique_ptr~KvClient~ kv_client_
         -mutex orphan_mu_
-        -vector~Orphan~ orphans_
+        -vector~pair~ orphans_
         +PutBatch(requests) results
         +GetBatch(requests) results
         -RegisterBatchImpl(requests, plans, errors, is_store, extract)
@@ -815,6 +832,11 @@ tl::expected<void, ErrorCode> KvClientObjectStorageAdapter::RegisterBatchImpl(
 std::vector<tl::expected<void, ErrorCode>> KvClientObjectStorageAdapter::PutBatch(
     const std::vector<ObjectPutRequest>& requests) {
     std::vector<tl::expected<void, ErrorCode>> results(requests.size());
+    if (!initialized_ || !kv_client_) {
+        FillError(results, ErrorCode::DFS_SERVICE_UNAVAILABLE);
+        return results;
+    }
+
     std::vector<std::optional<BufferPlan>> plans;
     std::vector<ErrorCode> errors(requests.size(), ErrorCode::INVALID_PARAMS);
 
@@ -843,27 +865,32 @@ std::vector<tl::expected<void, ErrorCode>> KvClientObjectStorageAdapter::PutBatc
 
     kv::TaskId task_id = kv::kInvalidTaskId;
     const auto submit = kv_client_->StoreAsync(entries, task_id);
-    bool terminal = !submit.ok();
-
-    if (submit.ok()) {
-        const auto completion = waitForCompletion(task_id, entries.size());
-        terminal = completion.terminal;
-        if (completion.entryStatus.size() != entries.size()) {
-            FillError(results, ErrorCode::INTERNAL_ERROR);
-        } else {
-            for (size_t j = 0; j < entries.size(); ++j) {
-                const size_t i = indices[j];
-                const auto& st = completion.entryStatus[j];
-                if (!st.ok()) results[i] = tl::make_unexpected(ToErrorCode(st));
-                else if (!terminal) results[i] = tl::make_unexpected(ErrorCode::RPC_TIMEOUT);
-                else results[i] = {};
-            }
-        }
-    } else {
-        FillError(results, ToErrorCode(submit));
+    if (!submit.ok()) {
+        // 任务未入队；只覆盖参与项，保留空 key / 重复 key 的 INVALID_PARAMS。
+        for (size_t i : indices)
+            results[i] = tl::make_unexpected(ToErrorCode(submit));
+        ReleaseBuffers(plans);
+        return results;
     }
 
-    if (terminal) ReleaseBuffers(plans);
+    const auto completion = waitForCompletion(task_id, entries.size());
+    if (completion.entryStatus.size() != entries.size()) {
+        for (size_t i : indices)
+            results[i] = tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    } else if (!completion.terminal) {
+        // 未终态：逐项结果不可信，统一超时；绝不返回 OBJECT_NOT_FOUND。
+        for (size_t i : indices)
+            results[i] = tl::make_unexpected(ErrorCode::RPC_TIMEOUT);
+    } else {
+        for (size_t j = 0; j < entries.size(); ++j) {
+            const auto& st = completion.entryStatus[j];
+            results[indices[j]] = st.ok()
+                                      ? tl::expected<void, ErrorCode>{}
+                                      : tl::make_unexpected(ToErrorCode(st));
+        }
+    }
+
+    if (completion.terminal) ReleaseBuffers(plans);
     else {
         RetainOrphans(plans);
         LOG(ERROR) << "action=kvclient_batch_release_skipped, task_id=" << task_id;
@@ -871,6 +898,13 @@ std::vector<tl::expected<void, ErrorCode>> KvClientObjectStorageAdapter::PutBatc
     return results;
 }
 ```
+
+> **实现约束（文档旧伪代码缺失，必须补上）**：
+>
+> 1. 入口先检查 `!initialized_ || !kv_client_`，逐项返回 `DFS_SERVICE_UNAVAILABLE`，与 PR1 的 `DeleteBatch` 一致。
+> 2. `StoreAsync` 已确认是覆盖写，因此不预删；不要为 upsert 引入 `DeleteAsync` + `StoreAsync` 组合。
+> 3. 非终态（`terminal == false`）时**所有条目统一返回 `RPC_TIMEOUT`**，不得逐项调用 `ToErrorCode(entryStatus)`——未完成的 entry 可能是默认 `OK` 或中间的 `OBJECT_NOT_FOUND`，后者会让 PR3 误删元数据。注意旧伪代码 `!st.ok() → ToErrorCode(st)` 的写法必须改掉。
+> 4. 注册失败时如果 SDK 已回滚部分注册，直接整批 `DFS_SERVICE_UNAVAILABLE`；`PutBatch` 不要再次 `UnregisterRegions`。
 
 #### 2.6.3 单条入口（batch 包装）
 
@@ -903,34 +937,60 @@ tl::expected<size_t, ErrorCode> KvClientObjectStorageAdapter::Get(
 #### 2.6.4 Master 门控
 
 ```cpp
-// 初始化（MasterService 构造 / 配置注入）
-use_kvcs_ = (distributed_config.fs_adapter_type == "kvcs-lowlevel");
-use_kvclient_ = (distributed_config.fs_adapter_type == "kvclient");
+// 初始化落点：MasterService::InitDfsAllocatorFromEnvironment(const MasterServiceConfig&)
+// （实际 master_service.cpp:855-951；文档旧行号 :906-911 已漂移）
+const auto dfs_config = DistributedStorageConfig::FromEnvironment();
 enable_dfs_ = DfsEnablementConfig::FromEnvironment().enabled ||
-              distributed_config.UsesKvcs() ||
-              distributed_config.UsesKvClient();
+              dfs_config.UsesKvcs() || dfs_config.UsesKvClient();
+if (!enable_dfs_) return;
 
-// DFS 可用性门（master_service.cpp:5273-5275）：保留 !enable_dfs_ 前缀
+// ... Validate() / single_tenant 检查不变 ...
+
+// 必须在 filesystem allocator 初始化（:930）之前新增 kvclient 早退分支，
+// 否则会落入 oplog 检查（throw）或 ShardAllocator::Init（必然失败）。
+if (dfs_config.UsesKvClient()) {
+    if (enable_oplog_) {
+        // kvclient 不支持元数据恢复；启动期拒绝，避免运行期 restore 静默失败。
+        LOG(FATAL) << "kvclient backend does not support snapshot/oplog recovery";
+    }
+    use_kvclient_ = true;
+    // 不创建 EFC target、capacity provider 与水位淘汰；直接返回。
+    LOG(INFO) << "KVClient distributed object storage initialized, config={"
+              << dfs_config.FormatStr() << "}";
+    return;
+}
+
+// DFS 可用性门（实际 master_service.cpp:5154-5156）：保留 !enable_dfs_ 前缀
 if (config.dfs_replica_num > 0 &&
     (!enable_dfs_ ||
      (!use_kvcs_ && !use_kvclient_ &&
       (!dfs_allocator_ || !dfs_allocator_->IsInitialized())))) {
-    return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    // 现有实现返回 DFS_SERVICE_UNAVAILABLE（:5160），不要改成 INVALID_PARAMS。
+    return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
 }
 
-// PrepareWriteStart：长度上限 + 三副本拒绝
+// PrepareWriteStart：长度上限 + NOF 拒绝（覆盖 PutStart / UpsertStart / BatchPutStart）
 if (config.dfs_replica_num > 0 && use_kvclient_) {
-    if (slice_length > 16'776'704) return INVALID_PARAMS;
-    if (config.nof_replica_num > 0) return INVALID_PARAMS;   // 三副本不支持
+    // 上限本身已 512 对齐，N <= 上限等价于 AlignUp(N,512) <= 上限。
+    if (slice_length > kKvClientMaxValueBytes) return INVALID_PARAMS;
+    if (config.nof_replica_num > 0) return INVALID_PARAMS;   // NOF 与 kvclient 不共存
 }
 
-// descriptor 铸造
-if (use_kvclient_) {
-    DistributedFSDescriptor d;
-    d.object_size = value_length;
-    d.aligned_size = AlignUp(value_length, 512);
-    d.shard_idx = -1;
-    replicas.emplace_back(std::move(d), ReplicaStatus::PROCESSING);
+// descriptor 铸造：kvclient 单独子分支，KVCS 的 aligned_size 保持 value_length
+if (config.dfs_replica_num > 0) {
+    if (use_kvcs_) {
+        // ... 原 KVCS 分支不变（aligned_size = value_length）...
+    } else if (use_kvclient_) {
+        auto aligned = CheckedAlignUp(value_length, kKvClientAlignment);
+        if (!aligned) return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        DistributedFSDescriptor d;
+        d.object_size = value_length;
+        d.aligned_size = *aligned;
+        d.shard_idx = -1;
+        replicas.emplace_back(std::move(d), ReplicaStatus::PROCESSING);
+    } else if (!dfs_allocator_ || !dfs_allocator_->IsInitialized()) {
+        return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
+    }
 }
 
 // 白名单 1：replica_type 校验
@@ -939,7 +999,7 @@ const bool supports_dfs_condition =
     expected_replica_id != nullptr &&
     (use_kvcs_ || use_kvclient_);
 
-// 白名单 2：target_pred 里同样要放宽（:6481）
+// 白名单 2：target_pred 里同样要放宽（实际 :6345-6360）
 auto target_pred = [this, replica_type, &client_id, expected_replica_id](
                        const Replica& r) {
     if (replica_type == ReplicaType::DFS) {
@@ -952,17 +1012,31 @@ auto target_pred = [this, replica_type, &client_id, expected_replica_id](
 };
 ```
 
+> **Master 侧实现约束**：
+>
+> - `aligned_size` 必须 512 对齐；Master TU 没有现成 `AlignUp`，可用 `bucket_entry_layout.h` 的 `CheckedAlignUp`（返回 `optional`）。不能把 `if (use_kvcs_)` 直接改成 `if (use_kvcs_ || use_kvclient_)`——KVCS 的 `aligned_size = value_length` 要保持不变。
+> - 恢复门（`master_service.cpp:3434 / 3726 / 4014`）保持 KVCS-only，**不要**并入 `use_kvclient_`；kvclient 的恢复能力由启动期 `LOG(FATAL)` 拒绝 `enable_oplog_` 兜底。
+> - 16MB 上限用 `kKvClientMaxValueBytes`（`kvclient_config.h:18`），不要写字面量。`nof_replica_num > 0` 的拒绝在默认构建已有 `#ifndef USE_NOF` 分支（`:5170-5177`），kvclient 需要**无条件**拒绝，避免 `-DUSE_NOF=ON` 构建下漏拦。
+> - `PrepareWriteStart` 同时覆盖 `PutStart`、`UpsertStart` 与 `BatchPutStart`；Upsert 的 descriptor 门必须一起放宽。
+> - `EvictDiskReplica` / `BatchEvictDiskReplica` 以 `expected_replica_id = nullptr` 调用共享实现，DFS 永远被拒；PR2 不改变该行为，只有 `EvictDiskReplicaIfCurrent` 可用。
+
 ### 2.7 验收
 
-| 场景 | 预期 |
-| --- | --- |
-| N=513 直传 | 尾部补零；提交成功；`Get` 返回 513 |
-| N=513 暂存（capacity=0） | 调用方 buffer 不被写；读回 513 字节正确 |
-| 多段 iov / 未对齐 | 自动走暂存，不报 `INVALID_PARAMS` |
-| 同批重复 key | 只失败重复条目 |
-| 注册失败 | 整批 `DFS_SERVICE_UNAVAILABLE`，不提交 SDK |
-| `Wait` 超时 | 逐项 `RPC_TIMEOUT`；handle+staging 保留；不误报成功 |
-| 读 miss | `OBJECT_NOT_FOUND` 触发 miss 清理；超时不触发 |
+| 场景 | 预期 | 层级 |
+| --- | --- | --- |
+| N=513 直传（单测构造 `capacity >= 1024`） | 尾部补零；提交成功；`Get` 返回 513 | 适配器单测 |
+| N=513 暂存（`capacity=0`，生产路径） | 调用方 buffer 不被写；读回 513 字节正确 | 适配器单测 |
+| 多段 iov / 未对齐 | 自动走暂存，不报 `INVALID_PARAMS` | 适配器单测 |
+| 同批重复 key | 第一条受理，后续条目 `INVALID_PARAMS` | 适配器单测 |
+| 注册失败 | 整批 `DFS_SERVICE_UNAVAILABLE`，不提交 SDK | 适配器单测 |
+| `Wait` 超时 | 全批 `RPC_TIMEOUT`（**不得出现 `OBJECT_NOT_FOUND`**）；handle+staging 保留且不注销 | 适配器单测 |
+| 已存在 key 覆盖写 | `StoreAsync` 直接覆盖；调用序列中不出现 `DeleteAsync` | 适配器单测（fake client） |
+| 空 key / N=0 | 逐项 `INVALID_PARAMS`，不进入注册与提交 | 适配器单测 |
+| Init 前调用 `PutBatch` / `GetBatch` | 逐项 `DFS_SERVICE_UNAVAILABLE`，不空指针 | 适配器单测 |
+| 读 miss | 适配器返回 `OBJECT_NOT_FOUND`；触发 miss 清理属于 PR3 | 单测 + PR3 集成 |
+| kvclient + `enable_oplog` | Master 启动期 `LOG(FATAL)`，拒绝启动 | 启动验收 |
+| Master descriptor | `object_size=N`；`aligned_size=AlignUp(N,512)`；`shard_idx=-1` | 集成 |
+| 恢复门 | 保持 KVCS-only；kvclient 不做元数据恢复 | 代码审查 |
 
 ---
 
