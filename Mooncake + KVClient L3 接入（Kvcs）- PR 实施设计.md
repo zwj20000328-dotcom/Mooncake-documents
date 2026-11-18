@@ -545,7 +545,7 @@ endif()
 
 | 决策项 | 结论 | 对实施的影响 |
 | --- | --- | --- |
-| capacity 策略 | 所有现有调用点一律传 0（v3 第一阶段）；直传仅在适配器单测中构造 capacity 验证 | 生产路径只走暂存；PR2 **不改** `client_service.cpp` / `file_storage.cpp`；§2.7 的直传验收标注为适配器单测级 |
+| 直传判定 | 不新增 capacity 字段；直传条件为 N 已 512 对齐（`wire_len == N`）且地址对齐、iov 连续 | 接口层零改动；未对齐对象一律暂存；现有 `iov`/`iovcnt`、`buffer`/`size` 已足够表达安全性 |
 | SDK 覆盖语义 | `StoreAsync` 对已存在 key 为覆盖写（upsert） | `PutBatch` 不做预删，不需要 `DeleteAsync` + `StoreAsync` 组合；重复写不会返回 `CQE_KEY_ALREADY_EXISTED` |
 | kvclient + oplog | `InitDfsAllocatorFromEnvironment` 在 `enable_oplog_` 为真时 `LOG(FATAL)` 拒绝启动 | kvclient 不支持快照/oplog 恢复；恢复门保持 KVCS-only，不并入 `use_kvclient_` |
 | PR2 测试归属 | PR2 自带适配器单测（原文档放在 PR3） | `tests/kvclient_object_storage_adapter_test.cpp` 与 `tests/CMakeLists.txt` 纳入 PR2 改动面 |
@@ -554,16 +554,14 @@ endif()
 
 | 文件 | 改动 |
 | --- | --- |
-| `include/storage/distributed/object_storage_adapter.h` | `ObjectPutRequest` / `ObjectGetRequest` 末尾追加 `size_t capacity = 0` |
-| `include/storage/distributed/distributed_storage_backend.h` | `DfsWriteRequest` / `DfsReadRequest` 末尾追加 `size_t capacity = 0` |
-| `src/storage/distributed/distributed_storage_backend.cpp` | 透传 capacity |
+| `include/storage/distributed/object_storage_adapter.h` / `include/storage/distributed/distributed_storage_backend.h` / `src/storage/distributed/distributed_storage_backend.cpp` | **不改**：直传判定只用现有 `iov`/`iovcnt`、`buffer`/`size` 与 `wire_len == N` |
 | `include/storage/distributed/kvclient/kvclient_object_storage_adapter.h` | `BufferPlan`、`RegisterBuffers`/`ReleaseBuffers`/`RetainOrphans`、`orphans_` 成员（`Completion` 已在 PR1 声明） |
 | `src/storage/distributed/kvclient/kvclient_object_storage_adapter.cpp` | 数据面实现；析构中清理 `orphans_` |
 | `include/master_service.h` / `src/master_service.cpp` | `use_kvclient_`、门控、descriptor、白名单；`InitDfsAllocatorFromEnvironment` 新增 kvclient 早退分支（`enable_oplog_` 拒绝） |
 | `tests/kvclient_object_storage_adapter_test.cpp` | 新增，适配器数据面单测（SDK 存在时编译） |
 | `tests/CMakeLists.txt` | SDK 存在时新增测试目标并 `target_link_libraries(... PkgConfig::KVCLIENT)` |
 
-> **capacity 来源**：`Slice` 只有 `{ptr, size}`，写路径又强制 `sum(slices) == desc.object_size`，因此现有调用点没有"缓冲区真实容量"信息。PR2 只在 `BatchWrite` / `BatchRead` 两个构造点显式填 0（读路径多 slice 后端暂存时也必须为 0），不改上游 `client_service.cpp` / `file_storage.cpp`。直传分支保留实现，但生产路径不可达。
+> **直传判定**：`Slice` 只有 `{ptr, size}`，现有接口没有缓冲区容量信息，因此直传条件收紧为 `wire_len == N`（N 已 512 对齐）+ `addr % 512 == 0` + iov 连续；不满足即暂存。未对齐对象即使底层分配有富余也不直传，这是有意的安全取舍。`ObjectPutRequest` / `ObjectGetRequest` / `DfsWriteRequest` / `DfsReadRequest` **不新增字段**。
 >
 > **测试归属**：PR2 自带 §2.7 的适配器级用例；PR3 再补 Client 集成、删除顺序与 miss 自愈用例。
 
@@ -621,8 +619,8 @@ flowchart TB
     A["PutBatch / GetBatch(requests)"] --> B["RegisterBuffers：逐条校验"]
     B --> C{"空 key / n==0 / wire_len>上限?"}
     C -->|是| E["errors[i]=INVALID_PARAMS<br/>plans[i]=空"]
-    C -->|否| D{"capacity>=wire_len<br/>且 addr%512==0<br/>且 iov 连续?"}
-    D -->|是| DIR["直传：写侧原地清零尾部"]
+    C -->|否| D{"wire_len==N（N 已 512 对齐）<br/>且 addr%512==0<br/>且 iov 连续?"}
+    D -->|是| DIR["直传：无需补齐"]
     D -->|否| STG["暂存：分配 wire_len/512 对齐 buffer<br/>写侧 memcpy + 清零；读侧留空"]
     DIR --> REG["按 (addr,wire_len) 去重<br/>一次 RegisterRegions<br/>handle 回填 plan"]
     STG --> REG
@@ -652,7 +650,7 @@ sequenceDiagram
 
     C->>BE: BatchWrite(key, desc, slices)
     BE->>BE: 校验 total_size == desc.object_size<br/>每 slice 转 iovec
-    BE->>AD: PutBatch(ObjectPutRequest{key, iov, iovcnt, capacity})
+    BE->>AD: PutBatch(ObjectPutRequest{key, iov, iovcnt})
     AD->>AD: RegisterBuffers：校验 + 直传/暂存 + 去重注册
     alt 注册失败
         AD-->>BE: 逐项 DFS_SERVICE_UNAVAILABLE
@@ -690,7 +688,6 @@ struct BufferView {
     const iovec* iov = nullptr;
     int iovcnt = 0;
     size_t n = 0;
-    size_t capacity = 0;
 };
 
 inline size_t AlignUp(size_t n, size_t a) { return (n + a - 1) & ~(a - 1); }
@@ -758,7 +755,8 @@ tl::expected<void, ErrorCode> KvClientObjectStorageAdapter::RegisterBatchImpl(
         plan.wire_len = wire_len;
         plan.addr = reinterpret_cast<uintptr_t>(v.iov[0].iov_base);
 
-        const bool direct = v.capacity >= wire_len &&
+        // N 已 512 对齐时 wire_len == N，直传不会越过调用方声明的范围。
+        const bool direct = wire_len == v.n &&
                             plan.addr % kv::kAlignmentBytes == 0 &&
                             IsContiguous(v.iov, v.iovcnt);
         if (!direct) {
@@ -772,6 +770,7 @@ tl::expected<void, ErrorCode> KvClientObjectStorageAdapter::RegisterBatchImpl(
             if (is_store) CopyIovTo(plan.staging.get(), v.iov, v.iovcnt);
         }
         if (is_store && wire_len > v.n) {
+            // 只有暂存路径会出现补齐；直传已保证 wire_len == n。
             std::memset(reinterpret_cast<char*>(plan.addr) + v.n, 0,
                         wire_len - v.n);
         }
@@ -914,21 +913,21 @@ std::vector<tl::expected<void, ErrorCode>> KvClientObjectStorageAdapter::PutBatc
 tl::expected<void, ErrorCode> KvClientObjectStorageAdapter::Put(
     const std::string& key, std::span<const char> data) {
     iovec iov{const_cast<char*>(data.data()), data.size()};
-    auto results = PutBatch({ObjectPutRequest{key, &iov, 1, 0}});
+    auto results = PutBatch({ObjectPutRequest{key, &iov, 1}});
     return results.empty() ? tl::make_unexpected(ErrorCode::INVALID_PARAMS)
                            : results.front();
 }
 
 tl::expected<void, ErrorCode> KvClientObjectStorageAdapter::PutV(
     const std::string& key, const iovec* iov, int iovcnt) {
-    auto results = PutBatch({ObjectPutRequest{key, iov, iovcnt, 0}});
+    auto results = PutBatch({ObjectPutRequest{key, iov, iovcnt}});
     return results.empty() ? tl::make_unexpected(ErrorCode::INVALID_PARAMS)
                            : results.front();
 }
 
 tl::expected<size_t, ErrorCode> KvClientObjectStorageAdapter::Get(
     const std::string& key, void* buf, size_t len) {
-    auto results = GetBatch({ObjectGetRequest{key, buf, len, 0}});
+    auto results = GetBatch({ObjectGetRequest{key, buf, len}});
     return results.empty() ? tl::make_unexpected(ErrorCode::INVALID_PARAMS)
                            : results.front();
 }
@@ -1024,8 +1023,9 @@ auto target_pred = [this, replica_type, &client_id, expected_replica_id](
 
 | 场景 | 预期 | 层级 |
 | --- | --- | --- |
-| N=513 直传（单测构造 `capacity >= 1024`） | 尾部补零；提交成功；`Get` 返回 513 | 适配器单测 |
-| N=513 暂存（`capacity=0`，生产路径） | 调用方 buffer 不被写；读回 513 字节正确 | 适配器单测 |
+| N=1024 直传（512 对齐） | 不暂存；提交成功；`Get` 返回 1024 | 适配器单测 |
+| N=513 暂存（未对齐） | 写侧补齐到 1024；调用方 buffer 不被写；读回 513 字节正确 | 适配器单测 |
+| N=513 但底层分配有富余 | 仍走暂存（不读取未声明的容量），结果正确 | 适配器单测 |
 | 多段 iov / 未对齐 | 自动走暂存，不报 `INVALID_PARAMS` | 适配器单测 |
 | 同批重复 key | 第一条受理，后续条目 `INVALID_PARAMS` | 适配器单测 |
 | 注册失败 | 整批 `DFS_SERVICE_UNAVAILABLE`，不提交 SDK | 适配器单测 |
