@@ -35,7 +35,7 @@
 | `src/storage_backend.cpp` | 工厂新增 `UsesKvClient()` 分支 |
 | `src/file_storage.cpp` | `enable_dfs` 加入 `UsesKvClient()` |
 | `src/real_client.cpp` | 新增 `enable_kvclient`；构造条件与 `kDistributed` 强制均加入 |
-| `src/CMakeLists.txt` | pkg-config、条件源、define/link（具体落点见 1.6.6） |
+| `src/CMakeLists.txt` | pkg-config / `find_path`+`find_library` 检测、条件源、define/link（具体落点见 1.6.6） |
 | `tests/distributed_storage_config_test.cpp` | 新增 kvclient 解析、校验、allocator 与 SDK 缺失工厂用例 |
 | `tests/CMakeLists.txt` | SDK 缺失时给配置测试定义 `MOONCAKE_KVCLIENT_TEST_NO_SDK=1` |
 
@@ -485,17 +485,78 @@ tl::expected<void, ErrorCode> KvClientObjectStorageAdapter::Delete(
 ```cmake
 # ① 检测块：与 src/CMakeLists.txt 的 KVCS 检测块并列
 set(MOONCAKE_KVCLIENT_SDK_FOUND OFF)
+set(MOONCAKE_KVCLIENT_SDK_ROOT "" CACHE PATH
+    "KVClient SDK source tree or install prefix")
+option(MOONCAKE_KVCLIENT_REQUIRED
+       "Fail configuration when the KVClient SDK is not found" OFF)
+
 find_package(PkgConfig QUIET)
 if(PkgConfig_FOUND)
-  # GLOBAL：tests/ 与 src/ 是兄弟目录，非 GLOBAL 的 imported target 不可见
-  # 暂不设版本下限：SDK 尚未发布 kvclient.pc，没有确定的包版本。
   pkg_check_modules(KVCLIENT QUIET IMPORTED_TARGET GLOBAL "kvclient")
 endif()
+
 if(TARGET PkgConfig::KVCLIENT)
+  add_library(Mooncake::kvclient INTERFACE IMPORTED GLOBAL)
+  set_target_properties(Mooncake::kvclient PROPERTIES
+                        INTERFACE_LINK_LIBRARIES PkgConfig::KVCLIENT)
   set(MOONCAKE_KVCLIENT_SDK_FOUND ON)
-  message(STATUS "KVClient SDK found: kvclient backend enabled")
+  message(STATUS "KVClient SDK found via pkg-config: kvclient backend enabled")
 else()
-  message(STATUS "KVClient SDK not found: kvclient backend disabled")
+  set(_kvclient_hints)
+  if(MOONCAKE_KVCLIENT_SDK_ROOT)
+    list(APPEND _kvclient_hints "${MOONCAKE_KVCLIENT_SDK_ROOT}")
+  endif()
+  if(DEFINED ENV{MOONCAKE_KVCLIENT_SDK_ROOT})
+    list(APPEND _kvclient_hints "$ENV{MOONCAKE_KVCLIENT_SDK_ROOT}")
+  endif()
+  find_path(MOONCAKE_KVCLIENT_INCLUDE_DIR
+            NAMES kv_client.h
+            HINTS ${_kvclient_hints}
+            PATH_SUFFIXES include kv_semantics/include include/kv_semantics)
+  find_library(MOONCAKE_KVCLIENT_LIBRARY
+               NAMES kv_client
+               HINTS ${_kvclient_hints}
+               PATH_SUFFIXES lib lib64 kv_semantics/src ucm/store/asu src
+                             build/src build)
+  find_library(MOONCAKE_KVCLIENT_TRANSPORT_LIBRARY
+               NAMES kv_transport
+               HINTS ${_kvclient_hints}
+               PATH_SUFFIXES lib lib64 kv_semantics/src ucm/store/asu src
+                             build/src build)
+  if(MOONCAKE_KVCLIENT_INCLUDE_DIR AND MOONCAKE_KVCLIENT_LIBRARY)
+    add_library(Mooncake::kvclient UNKNOWN IMPORTED GLOBAL)
+    set(_kvclient_link_libraries "${MOONCAKE_KVCLIENT_LIBRARY}")
+    if(MOONCAKE_KVCLIENT_TRANSPORT_LIBRARY)
+      list(APPEND _kvclient_link_libraries
+           "${MOONCAKE_KVCLIENT_TRANSPORT_LIBRARY}")
+    endif()
+    set_target_properties(
+      Mooncake::kvclient
+      PROPERTIES IMPORTED_LOCATION "${MOONCAKE_KVCLIENT_LIBRARY}"
+                 INTERFACE_INCLUDE_DIRECTORIES
+                 "${MOONCAKE_KVCLIENT_INCLUDE_DIR}"
+                 INTERFACE_LINK_LIBRARIES "${_kvclient_link_libraries}")
+    set(MOONCAKE_KVCLIENT_SDK_FOUND ON)
+    message(STATUS "KVClient SDK found: include=${MOONCAKE_KVCLIENT_INCLUDE_DIR}"
+                   ", library=${MOONCAKE_KVCLIENT_LIBRARY}")
+  endif()
+endif()
+
+if(NOT MOONCAKE_KVCLIENT_SDK_FOUND)
+  if(MOONCAKE_KVCLIENT_REQUIRED OR MOONCAKE_KVCLIENT_SDK_ROOT)
+    message(
+      FATAL_ERROR
+        "KVClient SDK not found (MOONCAKE_KVCLIENT_REQUIRED=ON or "
+        "MOONCAKE_KVCLIENT_SDK_ROOT was set). Set MOONCAKE_KVCLIENT_SDK_ROOT "
+        "to a source tree or install prefix that contains kv_client.h and "
+        "libkv_client, or set MOONCAKE_KVCLIENT_INCLUDE_DIR and "
+        "MOONCAKE_KVCLIENT_LIBRARY.")
+  endif()
+  message(
+    STATUS
+      "KVClient SDK not found: adapter disabled. Set "
+      "MOONCAKE_KVCLIENT_SDK_ROOT or pass -DMOONCAKE_KVCLIENT_REQUIRED=ON "
+      "to make this fatal.")
 endif()
 set(MOONCAKE_KVCLIENT_SDK_FOUND
     ${MOONCAKE_KVCLIENT_SDK_FOUND}
@@ -513,22 +574,25 @@ if(MOONCAKE_KVCLIENT_SDK_FOUND)
   target_compile_definitions(mooncake_store_client_objects
                              PRIVATE MOONCAKE_HAVE_KVCLIENT_SDK=1)
   target_link_libraries(mooncake_store_client_objects
-                        PRIVATE PkgConfig::KVCLIENT)
+                        PRIVATE Mooncake::kvclient)
 endif()
 
 # ④ 最终库：OBJECT 库的 PRIVATE 链接不传播，mooncake_store 需要再链一次
 if(MOONCAKE_KVCLIENT_SDK_FOUND)
-  target_link_libraries(mooncake_store PRIVATE PkgConfig::KVCLIENT)
+  target_link_libraries(mooncake_store PRIVATE Mooncake::kvclient)
 endif()
 ```
 
-> `mooncake_store_master` 不链接 KVClient SDK。适配器源不得放进 `MOONCAKE_STORE_SHARED_SOURCES`（该对象库会经 `$<TARGET_OBJECTS>` 进入 master）。`storage_backend.cpp` 只允许在 `MOONCAKE_HAVE_KVCLIENT_SDK` 内包含厂商无关的 `kvclient_adapter_factory.h`，不得包含 `kvclient_object_storage_adapter.h`。SDK 存在时适配器 TU 才参与编译；SDK 缺失时工厂的 `#else` 分支返回 `NOT_SUPPORTED`，不引用任何 SDK 符号。
+> - SDK 只安装 `libkv_client.so` / `libkv_transport.so`，**不安装头文件、不生成 `kvclient.pc`**。因此检测顺序是：pkg-config（未来兼容）→ `MOONCAKE_KVCLIENT_SDK_ROOT` / `MOONCAKE_KVCLIENT_INCLUDE_DIR` + `MOONCAKE_KVCLIENT_LIBRARY` 的 `find_path`/`find_library`。SDK 源码树可直接作为 root：头文件在 `kv_semantics/include`，库在 `build/src` 或安装目录 `kv_semantics/src`。`MOONCAKE_KVCLIENT_REQUIRED=ON` 或显式设置 `MOONCAKE_KVCLIENT_SDK_ROOT` 时，未找到 SDK 直接 `FATAL_ERROR`，避免"构建成功但适配器从未编译"掩盖编译错误。
+> - `mooncake_store_master` 不链接 KVClient SDK。适配器源不得放进 `MOONCAKE_STORE_SHARED_SOURCES`（该对象库会经 `$<TARGET_OBJECTS>` 进入 master）。`storage_backend.cpp` 只允许在 `MOONCAKE_HAVE_KVCLIENT_SDK` 内包含厂商无关的 `kvclient_adapter_factory.h`，不得包含 `kvclient_object_storage_adapter.h`。检测到 SDK 时适配器 TU 才参与编译；SDK 缺失时工厂的 `#else` 分支返回 `NOT_SUPPORTED`，不引用任何 SDK 符号。
 
 ### 1.7 验收
 
 | 项 | 预期 |
 | --- | --- |
 | SDK 缺失构建 | 工厂分支返回 `NOT_SUPPORTED`，适配器 TU 不参与编译，其余后端不受影响 |
+| SDK 存在但未检测到且 `MOONCAKE_KVCLIENT_REQUIRED=ON` 或设置了 `SDK_ROOT` | configure 阶段 `FATAL_ERROR`，不会生成"未编译适配器"的构建 |
+| 指定 `MOONCAKE_KVCLIENT_SDK_ROOT` 或 include/library | 适配器 TU 参与编译，`MOONCAKE_HAVE_KVCLIENT_SDK` 生效 |
 | 配置非法（含 `MOONCAKE_KVCLIENT_*` 数值无法解析） | 工厂返回 `INVALID_PARAMS`，不启动 SDK |
 | `timeoutMs < wait_timeout_ms` | `Init` 失败 `INVALID_PARAMS` |
 | 读写方法 | `Put` / `PutV` / `PutBatch` / `Get` / `GetBatch` 返回 `NOT_SUPPORTED`（PR2 替换）；`Delete` / `DeleteBatch` 已实现 |
@@ -559,7 +623,7 @@ endif()
 | `src/storage/distributed/kvclient/kvclient_object_storage_adapter.cpp` | 数据面实现；析构中清理 `orphans_` |
 | `include/master_service.h` / `src/master_service.cpp` | `use_kvclient_`、门控、descriptor、白名单；`InitDfsAllocatorFromEnvironment` 新增 kvclient 早退分支（`enable_oplog_` 拒绝） |
 | `tests/kvclient_object_storage_adapter_test.cpp` | 新增，适配器数据面单测（SDK 存在时编译） |
-| `tests/CMakeLists.txt` | SDK 存在时新增测试目标并 `target_link_libraries(... PkgConfig::KVCLIENT)` |
+| `tests/CMakeLists.txt` | SDK 存在时新增测试目标并 `target_link_libraries(... Mooncake::kvclient)` |
 
 > **直传判定**：`Slice` 只有 `{ptr, size}`，现有接口没有缓冲区容量信息，因此直传条件收紧为 `wire_len == N`（N 已 512 对齐）+ `addr % 512 == 0` + iov 连续；不满足即暂存。未对齐对象即使底层分配有富余也不直传，这是有意的安全取舍。`ObjectPutRequest` / `ObjectGetRequest` / `DfsWriteRequest` / `DfsReadRequest` **不新增字段**。
 >
@@ -1053,7 +1117,7 @@ auto target_pred = [this, replica_type, &client_id, expected_replica_id](
 | `include/client_service.h` | `ReconcileMissingKvcsReplica` → `ReconcileMissingKvReplica` |
 | `src/client_service.cpp` | 改名（声明 + 2 处调用点 `:1626`、`:1936`）；`BatchRemove` 的 KVClient 分支；`Remove`/`RemoveAll`/`RemoveByRegex` 门控；`AttachHostId` |
 | `tests/kvclient_object_storage_adapter_test.cpp` | 新增（含 `MakeCacheKey` 稳定性/小端断言） |
-| `tests/CMakeLists.txt` | 新增测试目标（仅 SDK 存在时），并 `target_link_libraries(... PkgConfig::KVCLIENT)` |
+| `tests/CMakeLists.txt` | 新增测试目标（仅 SDK 存在时），并 `target_link_libraries(... Mooncake::kvclient)` |
 
 ### 3.3 类图
 

@@ -869,11 +869,11 @@ if(MOONCAKE_KVCLIENT_SDK_FOUND)
   target_compile_definitions(kvclient_object_storage_adapter_test
                              PRIVATE MOONCAKE_KVCLIENT_TEST_SDK=1)
   target_link_libraries(kvclient_object_storage_adapter_test
-                        PRIVATE PkgConfig::KVCLIENT Mooncake::xxhash)
+                        PRIVATE Mooncake::kvclient Mooncake::xxhash)
 endif()
 ```
 
-`add_store_test` 已链接 `mooncake_store`（其中包含适配器 TU）；`PkgConfig::KVCLIENT` 用于 SDK 头路径，`Mooncake::xxhash` 用于断言 key 编码。
+`add_store_test` 已链接 `mooncake_store`（其中包含适配器 TU）；`Mooncake::kvclient` 用于 SDK 头路径，`Mooncake::xxhash` 用于断言 key 编码。
 
 ### 10.2 fake client
 

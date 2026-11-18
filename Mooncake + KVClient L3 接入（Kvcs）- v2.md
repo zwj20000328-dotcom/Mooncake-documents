@@ -357,12 +357,34 @@ mooncake-store/src/storage/distributed/kvclient/kvclient_driver.cpp
 沿用 KVCS 的可选依赖模式（`src/CMakeLists.txt:179-197`）：
 
 ```cmake
-# 暂不设版本下限：SDK 尚未发布 kvclient.pc，没有确定的包版本。
-pkg_check_modules(KVCLIENT QUIET IMPORTED_TARGET "kvclient")
-if(TARGET PkgConfig::KVCLIENT)
-  set(MOONCAKE_KVCLIENT_SDK_FOUND ON)
+set(MOONCAKE_KVCLIENT_SDK_FOUND OFF)
+set(MOONCAKE_KVCLIENT_SDK_ROOT "" CACHE PATH
+    "KVClient SDK source tree or install prefix")
+option(MOONCAKE_KVCLIENT_REQUIRED
+       "Fail configuration when the KVClient SDK is not found" OFF)
+find_package(PkgConfig QUIET)
+if(PkgConfig_FOUND)
+  pkg_check_modules(KVCLIENT QUIET IMPORTED_TARGET "kvclient")
+endif()
+if(NOT TARGET PkgConfig::KVCLIENT)
+  find_path(MOONCAKE_KVCLIENT_INCLUDE_DIR kv_client.h
+            HINTS ${MOONCAKE_KVCLIENT_SDK_ROOT}
+            PATH_SUFFIXES include kv_semantics/include)
+  find_library(MOONCAKE_KVCLIENT_LIBRARY kv_client
+               HINTS ${MOONCAKE_KVCLIENT_SDK_ROOT}
+               PATH_SUFFIXES lib lib64 kv_semantics/src build/src)
+  if(MOONCAKE_KVCLIENT_INCLUDE_DIR AND MOONCAKE_KVCLIENT_LIBRARY)
+    set(MOONCAKE_KVCLIENT_SDK_FOUND ON)
+  endif()
+endif()
+if(NOT MOONCAKE_KVCLIENT_SDK_FOUND AND
+   (MOONCAKE_KVCLIENT_REQUIRED OR MOONCAKE_KVCLIENT_SDK_ROOT))
+  message(FATAL_ERROR
+          "KVClient SDK not found and the SDK was explicitly requested")
 endif()
 ```
+
+SDK 不生成 `kvclient.pc`，因此不能只依赖 pkg-config；主路径是 `MOONCAKE_KVCLIENT_SDK_ROOT` 或显式 include/library。显式设置 `SDK_ROOT` 或 `REQUIRED=ON` 时，检测失败会让 configure 直接失败。完整的 imported target 与链接方式见 PR 实施设计 1.6.6。
 
 SDK 缺失时 driver 提供显式 `NOT_SUPPORTED` stub，其他后端照常构建。`mooncake_store_shared_objects`（`:570-574`）与 `mooncake_store`（`:756-758`）需条件链接；**`mooncake_store_master` 不需要**（决策 6：Master 无 driver）。
 
