@@ -41,6 +41,7 @@ L3 当前的 `DistributedStorageBackend` 已支持 `hf3fs` / `posix` / `oss` / `
 | S4 | 整值替换 | — | `Upsert`，复用 Master 现有状态机；同尺寸走原地复用分支 |
 | S5 | 读 miss 自愈 | — | 存储侧返回 entry 级 key-not-found（映射为 `OBJECT_NOT_FOUND`）时，按 ReplicaID 条件清理失效的 DFS 记录；task 级 `NOT_FOUND` 不触发清理 |
 | S6 | 批量读写删 | — | `BatchPut` / `BatchGet` / `BatchRemove`，逐 key 结果与原下标严格对应 |
+| S7 | 存在性查询 | — | `Exists`：SDK `QueryAsync` + `Wait`，读 entry 级 `ENTRY_KEY_EXIST` / `ENTRY_KEY_NOT_EXIST`；不注册 buffer |
 
 ### 1.2.2 明确不支持的场景
 
@@ -49,8 +50,8 @@ L3 当前的 `DistributedStorageBackend` 已支持 `hf3fs` / `posix` / `oss` / `
 | 场景 | 原因 | 行为 |
 | --- | --- | --- |
 | 范围读 / 前缀读 | `BatchReadAsync` 对象分支忽略 `range_read`，不实现范围语义（与容量无关） | `INVALID_PARAMS`；上层需回退整对象读后截取 |
-| `Exists` / `GetRange` | 设计不做存在性探测与范围读：`Exists` 显式返回 `NOT_SUPPORTED`，`GetRange` 沿用基类默认实现 | `NOT_SUPPORTED` |
-| key 枚举 | SDK 无 List 接口，`QueryResult` 只有 `exists` 位图 | `ListKeys` → `NOT_SUPPORTED` |
+| `GetRange` | 设计不做范围读 | 沿用基类默认 `NOT_SUPPORTED` |
+| key 枚举 | SDK 无 List 接口，`QueryResult` 只有 `exists` 位图，不能枚举 key | `ListKeys` → `NOT_SUPPORTED` |
 | `RemoveAll` / `RemoveByRegex` | 依赖 key 枚举；只删元数据会泄漏全部 L3 value | `NOT_SUPPORTED`，**元数据不删** |
 | 元数据恢复 | 不支持恢复裁决 | `enable_oplog=true` 时 Master 启动 `LOG(FATAL)` |
 | 容量水位淘汰 | SDK 无容量查询接口 | Master 侧降级：仅 WARNING，禁用淘汰 |
@@ -1196,7 +1197,7 @@ void KvClientObjectStorageAdapter::RetainOrphans(
 
 ### 3.2.3 数据路径
 
-适配器只有两条数据路径：同步写 `PutBatch` 与异步读 `GetBatchAsync`。`Put` / `PutV` / `Get` / `Delete` 只是把单条请求包成 batch。
+适配器有两条数据路径（同步写 `PutBatch`、异步读 `GetBatchAsync`）和一个查询接口（`Exists`）。`Put` / `PutV` / `Get` / `Delete` 只是把单条请求包成 batch。
 
 **写路径（同步、零拷贝）**：
 
@@ -1266,6 +1267,51 @@ KvClientObjectStorageAdapter::GetBatchAsync(
 //   终态  -> kDone：逐项 Results() = N，ReleaseBuffers
 //   非终态 -> kIndeterminate：逐项 RPC_TIMEOUT，RetainOrphans，buffer 隔离到 Shutdown
 ```
+
+**Exists（查询，不注册 buffer）**：
+
+```cpp
+tl::expected<bool, ErrorCode> KvClientObjectStorageAdapter::Exists(
+    const std::string& logical_key) {
+    if (!initialized_ || !kv_client_) {
+        return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
+    }
+    if (logical_key.empty()) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    std::vector<kv::CacheKey> keys{
+        kv::CacheKey::FromBytes(MakeCacheKey(logical_key))};
+    kv::TaskId task_id = kv::kInvalidTaskId;
+    const auto submit = kv_client_->QueryAsync(keys, task_id);
+    if (!submit.ok()) return tl::make_unexpected(ToErrorCode(submit));
+
+    kv::TaskResult result;
+    const auto wait = kv_client_->Wait(task_id, 0, result);
+    if (!wait.ok()) return tl::make_unexpected(ToErrorCode(wait));
+    if (result.status.code != kv::StatusCode::OK &&
+        result.status.code != kv::StatusCode::PARTIAL_FAILED) {
+        return tl::make_unexpected(ToErrorCode(result.status));
+    }
+    if (result.entryStatus.size() != 1 ||
+        (result.queryResult &&
+         result.queryResult->exists.size() != 1)) {
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+    switch (result.entryStatus[0].code) {
+        case kv::StatusCode::ENTRY_KEY_EXIST: return true;
+        case kv::StatusCode::ENTRY_KEY_NOT_EXIST: return false;
+        default:
+            return tl::make_unexpected(ToErrorCode(result.entryStatus[0]));
+    }
+}
+```
+
+- `QueryAsync` 不传 buffer，因此没有注册、没有完成句柄、没有资源隔离问题。
+- **不能看 `entryStatus[0].ok()`**：查询成功的 entry 是 `ENTRY_KEY_EXIST`（非 `OK`），必须按 code 分支。
+- `queryResult->exists` 是 SDK 的位图结果，可作为一致性校验；布尔值以 entryStatus 的明确 code 为准。
+- `Wait` 超时 → `RPC_TIMEOUT`，不触发 miss 清理；没有需要保留的 handle/staging。
+- `PARTIAL_FAILED` 仍逐项使用 entryStatus；非 `ENTRY_KEY_EXIST` / `ENTRY_KEY_NOT_EXIST` 的 entry 错误按 `ToErrorCode` 映射。
 
 **状态与资源**：
 
@@ -1747,7 +1793,8 @@ endif()
 | T-10 | 单元 | 读时返回 `ENTRY_KEY_NOT_FOUND`；读 `Wait` 超时 | 前者 `OBJECT_NOT_FOUND` 并触发清理；后者完成句柄为 `kIndeterminate`、`Results()` 为 `RPC_TIMEOUT`，**不**触发清理 | SFMEA-09 |
 | T-11 | 单元 | 跨对象合批：3 对象 250 entry，SDK 子批上限 110 | 适配器一次 `StoreAsync` 提交全部 entry；SDK 内部切 3 个 transport 子批（110/110/30），不切开对象；结果按原下标回填 | §3.2.3 |
 | T-12 | 单元 | 析构时仍有 in-flight task、非终态 handle 或未消费的完成句柄 | 只调用 SDK `Shutdown()`（停止受理并排空 pending task）；handle 不注销；完成句柄不得长于 adapter | SFMEA-15 |
-| T-13 | 单元 / 集成 | `Exists` / `ListKeys` / `GetRange` / 范围读 | 均 `NOT_SUPPORTED` / `INVALID_PARAMS` | §1.2.2、§3.2 |
+| T-13 | 单元 / 集成 | `ListKeys` / `GetRange` / 范围读 | 均 `NOT_SUPPORTED` / `INVALID_PARAMS` | §1.2.2、§3.2 |
+| T-23 | 单元 | `Exists`：存在 / 不存在 / 空 key / `Wait` 超时 / entry 级错误 | 存在 → true；不存在 → false；空 key → `INVALID_PARAMS`；超时 → `RPC_TIMEOUT`；entry 错误按 `ToErrorCode` 映射 | §3.2.3 |
 | T-14 | 集成 | 两副本 Put → 淘汰 memory → 另一 Client Get；DFS-only 全流程 | 数据逐字节一致；DFS-only 成功 | S1 / S2 |
 | T-15 | 集成 | 注入 ASU 写失败；注入 memory 写失败 | 前者整 Put 失败且 memory 一起 revoke；后者 ASU 零调用 | 两副本硬逻辑 |
 | T-16 | 集成 | 同尺寸 Upsert；仅 MEMORY 对象请求 dfs=1 | 原地复用并读到新值；后者拓扑不符失败 | §2.2.4 |

@@ -566,6 +566,7 @@ endif()
 | 写路径 | 512B 对齐、零拷贝；成功与否由 KvClient 判定 | 调用方保证对齐与连续；适配器**不校验**对齐/连续性，只保留空 key、N==0、空指针守卫 |
 | 读路径 | 注册调用方 buffer 做零拷贝读；读契约改为**异步 + 完成句柄** | `GetBatchAsync` 返回 `ObjectReadCompletion`；完成前 buffer 与注册必须保持有效；超时未终态即隔离到 Shutdown |
 | 配置项 | PR1 已删除 `MAX_OBJECT_BYTES` / `WAIT_TIMEOUT_MS`；`KvClientAdapterConfig` 只有 `config_path` | PR2 不校验这两项；`Wait(task_id, 0, result)` 使用 SDK 默认超时 |
+| `Exists` | PR2 实现：`QueryAsync` + `Wait`，读 entry 级 `ENTRY_KEY_EXIST` / `ENTRY_KEY_NOT_EXIST` | 不注册 buffer；不能用 `entryStatus.ok()` 判断存在性；`ListKeys` 仍 `NOT_SUPPORTED` |
 | provider 模式 | 不要求 `asuSharedProvider=1` | 部署按 KV 默认配置执行，文档不再把 SHARED 作为前置条件 |
 | SDK 覆盖语义 | `StoreAsync` 对已存在 key 为覆盖写（upsert） | `PutBatch` 不做预删，不需要 `DeleteAsync` + `StoreAsync` 组合；重复写不会返回 `CQE_KEY_ALREADY_EXISTED` |
 | kvclient + oplog | `InitDfsAllocatorFromEnvironment` 在 `enable_oplog_` 为真时 `LOG(FATAL)` 拒绝启动 | kvclient 不支持快照/oplog 恢复；恢复门保持 KVCS-only，不并入 `use_kvclient_` |
@@ -579,7 +580,7 @@ endif()
 | `include/storage/distributed/distributed_storage_backend.h` / `src/storage/distributed/distributed_storage_backend.cpp` | 新增 `BatchReadAsync`：返回已完成项的结果与待决的完成句柄；多 slice 暂存所有权转交完成句柄 |
 | `include/client_service.h` / `src/client_service.cpp` / `include/real_client.h` / `src/real_client.cpp` | 读完成句柄向上传递到 buffer 所有者；`BatchGet` 超时后不得释放/复用 buffer |
 | `include/storage/distributed/kvclient/kvclient_object_storage_adapter.h` | `BufferPlan`、`GetBatchAsync` 与类内私有 `ReadCompletion`、`RegisterBuffers`/`ReleaseBuffers`/`RetainOrphans`、`orphans_` |
-| `src/storage/distributed/kvclient/kvclient_object_storage_adapter.cpp` | 写零拷贝、读异步完成句柄、析构清理 |
+| `src/storage/distributed/kvclient/kvclient_object_storage_adapter.cpp` | 写零拷贝、读异步完成句柄、`Exists` 查询、析构清理 |
 | `include/master_service.h` / `src/master_service.cpp` | `use_kvclient_`、门控、descriptor、白名单；`InitDfsAllocatorFromEnvironment` 新增 kvclient 早退分支（`enable_oplog_` 拒绝） |
 | `tests/kvclient_object_storage_adapter_test.cpp` | 新增，适配器数据面与完成句柄单测（SDK 存在时编译） |
 | `tests/CMakeLists.txt` | SDK 存在时新增测试目标并 `target_link_libraries(... Mooncake::kvclient)` |
@@ -981,6 +982,55 @@ DfsReadAsyncResult DistributedStorageBackend::BatchReadAsync(
 
 完成句柄的生命周期不得超过 adapter：句柄持有 adapter 指针，`Client`/`RealClient` 必须在 adapter 析构前消费或丢弃；若需要跨层长期持有，应改为共享状态而不是裸指针。
 
+#### 2.6.2.2 Exists
+
+`Exists` 走 SDK 的查询接口，不注册 buffer，也不涉及完成句柄：
+
+```cpp
+tl::expected<bool, ErrorCode> KvClientObjectStorageAdapter::Exists(
+    const std::string& logical_key) {
+    if (!initialized_ || !kv_client_) {
+        return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
+    }
+    if (logical_key.empty()) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    std::vector<kv::CacheKey> keys{
+        kv::CacheKey::FromBytes(MakeCacheKey(logical_key))};
+    kv::TaskId task_id = kv::kInvalidTaskId;
+    const auto submit = kv_client_->QueryAsync(keys, task_id);
+    if (!submit.ok()) return tl::make_unexpected(ToErrorCode(submit));
+
+    kv::TaskResult result;
+    const auto wait = kv_client_->Wait(task_id, 0, result);
+    if (!wait.ok()) return tl::make_unexpected(ToErrorCode(wait));
+    if (result.status.code != kv::StatusCode::OK &&
+        result.status.code != kv::StatusCode::PARTIAL_FAILED) {
+        return tl::make_unexpected(ToErrorCode(result.status));
+    }
+    if (result.entryStatus.size() != 1 ||
+        (result.queryResult &&
+         result.queryResult->exists.size() != 1)) {
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+    switch (result.entryStatus[0].code) {
+        case kv::StatusCode::ENTRY_KEY_EXIST: return true;
+        case kv::StatusCode::ENTRY_KEY_NOT_EXIST: return false;
+        default:
+            return tl::make_unexpected(ToErrorCode(result.entryStatus[0]));
+    }
+}
+```
+
+约束：
+
+- **不能用 `entryStatus[0].ok()`**：查询成功的 entry 是 `ENTRY_KEY_EXIST`（非 `OK`），必须按 code 分支。
+- `queryResult->exists` 只做一致性校验；布尔值以 entryStatus 的明确 code 为准。
+- `Wait` 超时 → `RPC_TIMEOUT`，不触发 miss 清理；没有需要保留的 handle/staging。
+- 空 key 在本地拒绝，不发起 SDK 查询。
+- `ListKeys` 仍保持 `NOT_SUPPORTED`：SDK 没有 key 枚举接口。
+
 #### 2.6.3 单条入口（batch 包装）
 
 ```cpp
@@ -1112,6 +1162,9 @@ auto target_pred = [this, replica_type, &client_id, expected_replica_id](
 | 读提交失败 | 返回 `kDone` 的完成句柄，逐项错误；调用方 buffer 未被触碰 | 适配器单测 |
 | 读 `Wait` 超时 | `kIndeterminate`；handle 保留、不注销；buffer 与句柄隔离到 `Shutdown` | 适配器单测 |
 | 读 miss | 适配器返回 `OBJECT_NOT_FOUND`；触发 miss 清理属于 PR3 | 单测 + PR3 集成 |
+| `Exists` 存在/不存在 | `QueryAsync` entry 为 `ENTRY_KEY_EXIST` / `ENTRY_KEY_NOT_EXIST` → `true` / `false`；不得用 `ok()` 判断 | 适配器单测 |
+| `Exists` 超时/错误 | `Wait` 超时 → `RPC_TIMEOUT`；entry 级错误按 `ToErrorCode` 映射；空 key → `INVALID_PARAMS` | 适配器单测 |
+| `ListKeys` | 仍为 `NOT_SUPPORTED` | 适配器单测 |
 | kvclient + `enable_oplog` | Master 启动期 `LOG(FATAL)`，拒绝启动 | 启动验收 |
 | Master descriptor | `object_size=N`；`aligned_size=N`；`shard_idx=-1` | 集成 |
 | 恢复门 | 保持 KVCS-only；kvclient 不做元数据恢复 | 代码审查 |
