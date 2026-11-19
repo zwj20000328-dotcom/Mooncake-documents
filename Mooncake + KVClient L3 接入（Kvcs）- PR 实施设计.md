@@ -51,7 +51,7 @@ classDiagram
         +Validate() bool
     }
 
-    class Completion {
+    class Completion["Completion（私有嵌套）"] {
         +bool terminal
         +vector~Status~ entryStatus
     }
@@ -60,11 +60,11 @@ classDiagram
         -KvClientAdapterConfig config_
         -unique_ptr~KvClient~ kv_client_
         -bool initialized_
-        +KvClientObjectStorageAdapter(config) 构造
-        +KvClientObjectStorageAdapter(config, client) 测试注入构造
-        +KvClientObjectStorageAdapter() 析构
+        +KvClientObjectStorageAdapter(config)
+        +KvClientObjectStorageAdapter(config, client)
+        +~KvClientObjectStorageAdapter()
         +Init() expected
-        +GetName() const char*
+        +GetName() char*
         +Exists(key) expected
         +ListKeys() expected
         +Delete(key) expected
@@ -102,7 +102,7 @@ classDiagram
     Factory ..> KvClientObjectStorageAdapter : 创建（SDK 存在）
 ```
 
-> 数据面只有 batch 一条路径：`Put` / `PutV` / `Get` 都只是把单条请求包装成 `PutBatch` / `GetBatch` 调用，不单独实现 I/O；`Delete` 同样只是 `DeleteBatch` 的单条包装。PR1 实现 `Delete` 与 `DeleteBatch`（控制面删除），`Put` / `PutV` / `PutBatch` / `Get` / `GetBatch` 以 `NOT_SUPPORTED` 占位，PR2 用单行包装替换。`GetName()` 的真实签名是 `const char* GetName() const override`，不是 `char*`；适配器头必须 override `object_storage_adapter.h` 的全部纯虚函数（`Put` / `PutV` / `Get` / `Exists` / `Delete` / `ListKeys` / `Init` / `GetName`），并声明析构 `~KvClientObjectStorageAdapter() override`，否则类保持抽象、`make_unique` 无法编译。
+> 数据面只有 batch 一条路径：`Put` / `PutV` / `Get` 都只是把单条请求包装成 `PutBatch` / `GetBatch` 调用，不单独实现 I/O；`Delete` 同样只是 `DeleteBatch` 的单条包装。PR1 实现 `Delete` 与 `DeleteBatch`（控制面删除），`Put` / `PutV` / `PutBatch` / `Get` / `GetBatch` 以 `NOT_SUPPORTED` 占位。PR2 把 `PutBatch` / `GetBatchAsync` 变成真实数据路径，`Put` / `PutV` / `Get` 变成单条包装，并实现 `Exists`。`GetName()` 的真实签名是 `const char* GetName() const override`，不是 `char*`；适配器头必须 override `object_storage_adapter.h` 的全部纯虚函数（`Put` / `PutV` / `Get` / `Exists` / `Delete` / `ListKeys` / `Init` / `GetName`），并声明析构 `~KvClientObjectStorageAdapter() override`，否则类保持抽象、`make_unique` 无法编译。
 >
 > **PR2 实现注意**：`Completion` 是 PR1 已存在的类内私有嵌套类型，图中仅示意，PR2 **不要**重新声明；`BufferPlan` 也必须是类内私有类型（`RegisterBuffers` 的签名依赖它）。读写都注册调用方 buffer，不引入 arena/bounce buffer。
 
@@ -607,9 +607,15 @@ classDiagram
         +MRHandle handle
     }
 
-    class Completion {
+    class Completion["Completion（私有嵌套）"] {
         +bool terminal
         +vector~Status~ entryStatus
+    }
+
+    class ObjectReadState {
+        <<enumeration>>
+        kPending
+        kDone
     }
 
     class ObjectReadCompletion {
@@ -618,12 +624,26 @@ classDiagram
         +Results() vector~expected~
     }
 
+    class ReadCompletion["ReadCompletion（私有嵌套）"] {
+        -adapter_ KvClientObjectStorageAdapter*
+        -task_id_ TaskId
+        -plans_ vector~optional~
+        -indices_ vector~size_t~
+        -results_ vector~expected~
+        -state_ ObjectReadState
+    }
+
     class KvClientObjectStorageAdapter {
         -KvClientAdapterConfig config_
         -unique_ptr~KvClient~ kv_client_
+        -bool initialized_
         +PutBatch(requests) results
-        +GetBatchAsync(requests) ObjectReadCompletion
-        +Exists(key) bool
+        +GetBatch(requests) results
+        +GetBatchAsync(requests) unique_ptr~ObjectReadCompletion~
+        +Put(key, data) expected
+        +PutV(key, iov, iovcnt) expected
+        +Get(key, buf, len) expected
+        +Exists(key) expected~bool~
         -RegisterBatchImpl(requests, plans, errors, is_store, extract)
         -RegisterBuffers(put_requests, plans, errors)
         -RegisterBuffers(get_requests, plans, errors)
@@ -633,7 +653,7 @@ classDiagram
 
     class MasterService {
         -bool use_kvclient_
-        +PrepareWriteStart(...)
+        -PrepareWriteStart(...)
         +GetReplicaList(...)
         +EvictDiskReplicaIfCurrent(...)
     }
@@ -641,8 +661,14 @@ classDiagram
     KvClientObjectStorageAdapter ..> BufferPlan : 产生
     KvClientObjectStorageAdapter ..> Completion : 返回
     KvClientObjectStorageAdapter ..> ObjectReadCompletion : 返回
+    ObjectReadCompletion ..> ObjectReadState : 使用
+    ReadCompletion ..|> ObjectReadCompletion : 实现
+    ReadCompletion ..> BufferPlan : 持有
+    ReadCompletion ..> ObjectReadState : 持有
     MasterService ..> DistributedFSDescriptor : 铸造
 ```
+
+> 本图只列 PR2 新增或变更的成员；`Init` / `Delete` / `DeleteBatch` / `ListKeys` 等 PR1 成员未重复列出。
 
 ### 2.4 流程图（写/读共用骨架）
 
@@ -1232,22 +1258,22 @@ classDiagram
 
     class Client {
         -shared_ptr~DistributedStorageBackend~ dfs_storage_backend_
-        +BatchRemove(keys, force) results
-        +Remove(key) expected
-        +RemoveAll() expected
-        +RemoveByRegex(regex) expected
+        +BatchRemove(keys, force) vector~expected~
+        +Remove(key) expected~void~
+        +RemoveAll() expected~long~
+        +RemoveByRegex(regex) expected~long~
         -ReconcileMissingKvReplica(key, query, replica)
     }
 
     class DistributedStorageBackend {
         +UsesKvcs() bool
         +UsesKvClient() bool
-        +BatchDeleteObjects(keys) results
+        +BatchDeleteObjects(keys) vector~expected~
     }
 
     class MasterClient {
-        +BatchRemove(keys, force) results
-        +EvictDiskReplicaIfCurrent(key, tenant, type, id) expected
+        +BatchRemove(keys, force) vector~expected~
+        +EvictDiskReplicaIfCurrent(key, tenant, type, id) expected~bool~
     }
 
     Client o-- DistributedStorageBackend
