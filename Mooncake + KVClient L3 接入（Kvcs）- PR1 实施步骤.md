@@ -1,6 +1,6 @@
 # Mooncake + KVClient L3 接入（Kvcs）— PR1 实施步骤
 
-版本：v1.0　日期：2026-11-16
+版本：v1.1　日期：2026-11-19
 
 对应设计文档：`Mooncake + KVClient L3 接入（Kvcs）- PR 实施设计.md`（PR1 章节）
 
