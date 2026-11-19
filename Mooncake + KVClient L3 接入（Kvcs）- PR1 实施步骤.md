@@ -32,7 +32,7 @@ PR1 不做：Master 门控与描述符铸造（PR2）、Client value-first 删�
 | key 字节序 | 显式小端 | 与 SDK `key_resolver.cc:51-55` 一致；不要用主机字节序 `memcpy` |
 | `Delete` 归属 | PR1 实现 | `Delete` = `DeleteBatch` 单条包装；不是 `NOT_SUPPORTED` |
 | 配置层测试 | 随 PR1 | 不依赖 SDK；SDK 相关测试留 PR3 |
-| 超时硬门禁 | 保留 | `cfg.timeoutMs >= wait_timeout_ms`；部署侧必须把 SDK 的 `waitTimeoutMs` / `timeoutMs` 配到 >= 30000 |
+| 超时 | 由 SDK 负责 | 适配器不设 `WAIT_TIMEOUT_MS`；`Wait(task_id, 0)` 使用 SDK 的 `defaultWaitTimeoutMs`，超时由 SDK 返回 |
 
 ### 0.3 分支
 
@@ -69,8 +69,6 @@ git switch -c feat/kvclient-pr1
 ```cpp
 struct KvClientEnvironmentVariables {
     MC_DEFINE_ENV_VAR(std::string, MOONCAKE_KVCLIENT_CONFIG);
-    MC_DEFINE_ENV_VAR(uint64_t, MOONCAKE_KVCLIENT_MAX_OBJECT_BYTES);
-    MC_DEFINE_ENV_VAR(uint64_t, MOONCAKE_KVCLIENT_WAIT_TIMEOUT_MS);
 };
 ```
 
@@ -89,42 +87,27 @@ struct KvClientEnvironmentVariables {
 要求：
 
 - header-only，不包含任何 SDK 头。
-- 常量：
-  - `kKvClientMaxValueBytes = 16'776'704`
-  - `kKvClientAlignment = 512`（本地声明，避免配置单元依赖 `kv::kAlignmentBytes`）
-- `KvClientAdapterConfig`：
-  - `std::string config_path`
-  - `uint64_t max_object_bytes = kKvClientMaxValueBytes`
-  - `uint64_t wait_timeout_ms = 30'000`
-- `FromEnvironment()`：
-  - `config_path` 用 `Environ::ReadOr`，显式空值交由 `Validate()` 拒绝；
-  - 两个数值变量必须**严格解析**：未设置用默认值，设置但无法解析返回 `INVALID_PARAMS`；
-  - 不要直接用 `Environ::ReadOr` 读数值，它会对 `abc` / `-1` 静默回退默认值。
-- `Validate()`：
+- `KvClientAdapterConfig` 只保留 `std::string config_path`。
+- `FromEnvironment()`：`config_path` 用 `Environ::ReadOr`，空值由 `Validate()` 拒绝。
+- `Validate()`：只检查 `config_path` 非空。
+- **不校验对象大小与 512B 对齐**；由 KvClient SDK 判定是否成功并返回错误。
 
 ```cpp
-return !config_path.empty() &&
-       max_object_bytes > 0 &&
-       max_object_bytes % kKvClientAlignment == 0 &&
-       max_object_bytes <= kKvClientMaxValueBytes &&
-       wait_timeout_ms > 0;
-```
+struct KvClientAdapterConfig {
+    std::string config_path;
 
-严格解析示意：
-
-```cpp
-static tl::expected<uint64_t, ErrorCode> ReadUint(
-    const EnvironmentVariable<uint64_t>& variable, uint64_t default_value) {
-    const auto raw = Environ::Process().Get(variable.name);
-    if (!raw.has_value()) return default_value;
-    const auto parsed = Environ::Process().GetTyped(variable);
-    if (!parsed.has_value()) {
-        LOG(ERROR) << "Invalid value for env " << variable.name << ": '"
-                   << *raw << "'";
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    static tl::expected<KvClientAdapterConfig, ErrorCode> FromEnvironment() {
+        KvClientAdapterConfig cfg;
+        cfg.config_path = Environ::ReadOr(
+            KvClientEnvironmentVariables::MOONCAKE_KVCLIENT_CONFIG,
+            std::string{});
+        if (!cfg.Validate())
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        return cfg;
     }
-    return *parsed;
-}
+
+    bool Validate() const { return !config_path.empty(); }
+};
 ```
 
 依赖：`<ylt/util/tl/expected.hpp>`、`environ.h`、`glog/logging.h`。`environ.h` 是 mooncake-common 的内部头，仅限 in-tree 使用。
@@ -234,19 +217,12 @@ tl::expected<void, ErrorCode> KvClientObjectStorageAdapter::Init() {
     if (!kv::KvClientConfig::LoadFromFile(config_.config_path, cfg).ok())
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     cfg.keyResolution = {};                  // 强制 GENERIC
-    if (cfg.timeoutMs < config_.wait_timeout_ms) {
-        LOG(ERROR) << "KVClient config timeoutMs=" << cfg.timeoutMs
-                   << " is shorter than wait_timeout_ms="
-                   << config_.wait_timeout_ms;
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-    }
     if (!client->Init(cfg).ok())
         return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
 
     kv_client_ = std::move(client);
     initialized_ = true;
-    LOG(INFO) << "KVClient adapter initialized, max_object_bytes="
-              << config_.max_object_bytes;
+    LOG(INFO) << "KVClient adapter initialized";
     return {};
 }
 ```
@@ -254,9 +230,9 @@ tl::expected<void, ErrorCode> KvClientObjectStorageAdapter::Init() {
 关键点：
 
 - SDK `Init` 非幂等（第二次返回 `RESOURCE_BUSY`），所以 client 必须创建到局部变量，成功后才能写入成员。
-- 每次重试都重新执行 `LoadFromFile`、`keyResolution` 复位、超时校验、SDK `Init`。
+- 每次重试都重新执行 `LoadFromFile`、`keyResolution` 复位、SDK `Init`。
 - 失败路径不要留下"非空但未初始化"的 `kv_client_`。
-- Init 失败日志必须同时打印 `cfg.timeoutMs` 与 `wait_timeout_ms`。
+- 适配器不设独立超时；`Wait` 由 SDK 的 `defaultWaitTimeoutMs` / `timeoutMs` 控制。
 
 ### 6.2 析构
 
@@ -288,13 +264,18 @@ KvClientObjectStorageAdapter::~KvClientObjectStorageAdapter() {
 ### 6.4 waitForCompletion
 
 ```cpp
-const auto wait_status =
-    kv_client_->Wait(task_id, config_.wait_timeout_ms, result);
+// 0 表示使用 SDK 的 defaultWaitTimeoutMs；适配器不设第二套超时。
+const auto wait_status = kv_client_->Wait(task_id, 0, result);
 const auto code = wait_status.ok() ? result.status.code : wait_status.code;
 const kv::Status& task_status = wait_status.ok() ? result.status : wait_status;
 
 Completion c;
 switch (code) {
+    case kv::StatusCode::OK:
+    case kv::StatusCode::PARTIAL_FAILED:
+        // 只有这两个整体状态携带可信的逐项结果
+        c.terminal = true;
+        break;
     case kv::StatusCode::TASK_NOT_FOUND:
         // Wait 超时后也会移除 task；未知 task 不能证明 I/O 结束
         c.terminal = false;
@@ -309,11 +290,14 @@ switch (code) {
         c.entryStatus.assign(entry_count, task_status);
         return c;
     default:
-        // task 已结束：OK / PARTIAL_FAILED 以及任意 task 级最终错误
+        // task 级最终错误：entryStatus 可能仍是提交时的 OK，不读取；
+        // 把整体错误传播到每个已提交条目
         c.terminal = true;
-        break;
+        c.entryStatus.assign(entry_count, task_status);
+        return c;
 }
-// entry 数不匹配 -> 逐项 INTERNAL_ERROR；否则搬运 result.entryStatus
+// 仅 OK/PARTIAL_FAILED 走到这里：entry 数不匹配 -> 逐项 INTERNAL_ERROR；
+// 否则搬运 result.entryStatus
 ```
 
 ### 6.5 删除
@@ -624,7 +608,7 @@ endif()
 
 ### 9.2 留 PR3（需 SDK）
 
-- `kvclient_object_storage_adapter_test.cpp`：Init 门禁（timeout）、`MakeCacheKey` 稳定性/小端、`DeleteBatch` 守卫、错误映射。
+- `kvclient_object_storage_adapter_test.cpp`：`Wait` 传 0（SDK 超时）、task 级最终错误逐项传播、`MakeCacheKey` 稳定性/小端、`DeleteBatch` 守卫、错误映射。
 - 测试目标只在 SDK 存在时创建；若测试直接计算 `XXH64` 作断言，需额外链接 `Mooncake::xxhash`。
 
 ---
@@ -675,7 +659,7 @@ pre-commit run --files <本次改动文件>
   - `Put/PutV/PutBatch/Get/GetBatch` 返回 `NOT_SUPPORTED`；
   - SDK 缺失时工厂返回 `NOT_SUPPORTED`；
   - `MOONCAKE_ENABLE_DFS=1` + oplog/snapshot 不适用于 kvclient；
-  - `waitTimeoutMs >= wait_timeout_ms` 的部署要求。
+  - 适配器不设独立 `Wait` 超时，超时由 SDK 配置与其 `Status` 负责。
 - 使用 `.github/pull_request_template.md`，填写模块、类型、测试、检查清单、AI 协助披露。
 - 人工逐行审阅所有改动。
 
@@ -689,7 +673,8 @@ pre-commit run --files <本次改动文件>
 | 工厂可达 | 有 SDK（pkg-config 或 SDK_ROOT/include/library 检测到）时创建 adapter；无 SDK 时 `NOT_SUPPORTED`；`REQUIRED=ON` 或设置了 `SDK_ROOT` 时缺失在 configure 失败 |
 | CMake 检测 | SDK 无 `kvclient.pc` 时仍可通过 `MOONCAKE_KVCLIENT_SDK_ROOT` / include / library 编译适配器 |
 | 注入可达 | `FileStorage::enable_dfs` 为真并调用 `SetDfsStorageBackend` |
-| Init 门禁 | 非法配置 / SDK Init 失败 / timeout 不足按预期失败 |
+| Init 门禁 | 非法配置 / SDK Init 失败按预期失败；超时由 SDK 负责 |
+| task 级最终错误 | 逐项统一返回整体错误；不读取可能仍为 `OK` 的 `entryStatus` |
 | Init 重试 | 首次失败后重试不会假成功，不会撞 `RESOURCE_BUSY` |
 | 删除 | `Delete` / `DeleteBatch` 可用；未 Init 时逐项 `DFS_SERVICE_UNAVAILABLE` |
 | 读写 | 五个数据入口返回 `NOT_SUPPORTED` |
@@ -706,9 +691,9 @@ pre-commit run --files <本次改动文件>
 4. **Delete**：PR1 实现为 `DeleteBatch` 单条包装。
 5. **类声明**：`const char* GetName() const override`，override 全部纯虚，声明析构与注入构造。
 6. **CMake**：define 挂 `mooncake_store_client_objects`，不是 `mooncake_store_shared_objects`。
-7. **waitForCompletion**：`TASK_NOT_FOUND` / `TIMEOUT` / `IN_PROGRESS` / `CANCELED` 非终态；其余 task 最终错误终态。
+7. **waitForCompletion**：只有 `OK` / `PARTIAL_FAILED` 读取 `entryStatus`；`TASK_NOT_FOUND` / `TIMEOUT` / `IN_PROGRESS` / `CANCELED` 非终态；其他 task 级最终错误虽为终态，但逐项统一填整体错误。
 8. **错误映射**：`NOT_FOUND`、`NOT_INITIALIZED`、`ENTRY_DELETE_FAILED` → `DFS_SERVICE_UNAVAILABLE`；只有 entry 级 key-not-found → `OBJECT_NOT_FOUND`。
-9. **配置**：`max_object_bytes > 0`；数值 env 严格解析；`timeoutMs` 不足时打印两个值。
+9. **配置**：`KvClientAdapterConfig` 只校验 `config_path` 非空；对象大小与 512B 对齐由 SDK 判定；超时也由 SDK 配置负责。
 10. **`MakeCacheKey`**：零值替代 `5381`；显式小端；不用 `memcpy`。
 
 ---
@@ -719,7 +704,7 @@ pre-commit run --files <本次改动文件>
 | --- | --- |
 | SDK 未打包，无 `kvclient.pc` 且头文件未安装 | 用 `MOONCAKE_KVCLIENT_SDK_ROOT` 指向源码树/安装前缀，或显式 include/library；`REQUIRED=ON` 或显式 `SDK_ROOT` 让缺失在 configure 失败 |
 | 两个本地 SDK 快照 API 不一致 | 固定 `tmp_pr1641/ucm-pr` 变体，并在 CMake 检测处记录版本 |
-| 默认 `wait_timeout_ms=30000` 与 SDK 默认 100 ms 冲突 | 部署配置必须显式提高 `waitTimeoutMs` / `timeoutMs`；Init 日志打印两个值 |
+| SDK 的 `Wait` 默认超时较短 | 在 SDK client 配置中按需提高 `waitTimeoutMs` / `timeoutMs`；适配器不再交叉校验或覆盖 |
 | `MOONCAKE_DISTRIBUTED_HEALTH_CHECK=1` | PR1 未实现 `CheckHealth`，会 `NOT_SUPPORTED`；文档写明必须关闭 |
 | Master 未识别 kvclient | PR1 阶段不要启用 `MOONCAKE_ENABLE_DFS=1`；端到端等 PR2 |
 | `DeleteBatch` 在 PR1 生产路径不可达 | `BatchDeleteObjects` 目前只在 `UsesKvcs()` 门内调用；PR1 通过直接调用后端/适配器验收 |
