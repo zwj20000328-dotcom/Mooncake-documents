@@ -149,6 +149,7 @@ sequenceDiagram
     AD->>AD: kv::CreateKvClient()
     AD->>AD: KvClientConfig::LoadFromFile(path, cfg)
     AD->>AD: cfg.keyResolution = {}（强制 GENERIC）
+    AD->>AD: cfg.useBatchIoForSingleKey = true（强制批量协议）
     AD->>SDK: Init(cfg)
     SDK-->>AD: Status
     AD-->>BE: OK
@@ -277,6 +278,10 @@ tl::expected<void, ErrorCode> KvClientObjectStorageAdapter::Init() {
     if (!kv::KvClientConfig::LoadFromFile(config_.config_path, cfg).ok())
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     cfg.keyResolution = {};                  // 强制 GENERIC
+    // 单条读写也必须走批量协议：非批量 LOAD/STORE 路径只返回 CQE 状态、没有
+    // per-entry result buffer，数据面无法区分「对象不存在」与一般失败。
+    // 只影响 LoadAsync / StoreAsync（提交 8af2fc10，PR1 上无行为变化）。
+    cfg.useBatchIoForSingleKey = true;
     // Init 非幂等；局部 client 只在成功后提交，重试会从新的 client 开始。
     if (!client->Init(cfg).ok())
         return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
@@ -302,11 +307,8 @@ ErrorCode KvClientObjectStorageAdapter::ToErrorCode(const kv::Status& s) {
         case StatusCode::CANCELED: return ErrorCode::INTERNAL_ERROR;
 
         // 对象 miss：只有 entry 级 key-not-found 才是 OBJECT_NOT_FOUND。
-        // LOAD 用 ENTRY_KEY_NOT_FOUND / ENTRY_DATA_NOT_EXIST 报告未命中，
-        // QUERY 用 ENTRY_KEY_NOT_EXIST。
         case StatusCode::CQE_KEY_NOT_EXIST:
         case StatusCode::ENTRY_KEY_NOT_FOUND:
-        case StatusCode::ENTRY_DATA_NOT_EXIST:
         case StatusCode::ENTRY_KEY_NOT_EXIST: return ErrorCode::OBJECT_NOT_FOUND;
 
         // NOT_FOUND 是路由/配置/视图错误，不是对象 miss；
@@ -566,14 +568,14 @@ endif()
 
 | 决策项 | 结论 | 对实施的影响 |
 | --- | --- | --- |
-| 写路径 | 零拷贝；成功与否由 KvClient 判定 | 适配器不 staging、不补齐、不校验；只保留空 key、N==0、空指针、重复 key 守卫 |
+| 写路径 | 零拷贝；成功与否由 KvClient 判定 | 适配器不 staging、不补齐、不做业务参数校验；只保留空 key、N==0、空指针、重复 key、切片连续性守卫 |
 | 读路径 | 适配器内部注册目标 buffer 做零拷贝读；`LoadAsync` + `waitForCompletion` 同步完成 | `GetBatch` 在调用内注册目标 buffer，返回时逐项结果已就绪；返回后 buffer 可复用，无完成句柄 |
 | buffer 注册 | **适配器内部按请求注册，调用返回前注销**；不改上层接口 | `PutBatch` / `GetBatch` 内用私有成员 `RegisterBuffers` 注册 `iov[0].base` / 目标 buffer，返回前用 `UnregisterBuffers` 统一注销；`ObjectPutRequest` / `ObjectGetRequest`、`ObjectStorageAdapter` 与 `DistributedStorageBackend` 均不变 |
 | 超时 | 由 KvClient SDK 负责 | `Wait(task_id, 0, result)`；适配器不设超时状态、不重试、不保留资源 |
 | `Exists` | PR2 实现：`QueryAsync` + `Wait` | 不注册 buffer；按 entry 级 `ENTRY_KEY_EXIST` / `ENTRY_KEY_NOT_EXIST` 返回 |
 | provider 模式 | 不要求 `asuSharedProvider=1` | 部署按 KV 默认配置执行，文档不再把 SHARED 作为前置条件 |
 | SDK 覆盖语义 | `StoreAsync` 对已存在 key 为覆盖写（upsert） | `PutBatch` 不做预删，不需要 `DeleteAsync` + `StoreAsync` 组合；重复写不会返回 `CQE_KEY_ALREADY_EXISTED` |
-| kvclient + oplog | `InitDfsAllocatorFromEnvironment` 在 `enable_oplog_` 为真时 `LOG(FATAL)` 拒绝启动 | kvclient 不支持快照/oplog 恢复；恢复门保持 KVCS-only，不并入 `use_kvclient_` |
+| kvclient + oplog | `InitDfsAllocatorFromEnvironment` 在 `enable_oplog_` 为真时 `throw std::invalid_argument` 拒绝启动 | kvclient 不支持快照/oplog 恢复；恢复门保持 KVCS-only，不并入 `use_kvclient_` |
 | PR2 测试归属 | PR2 自带适配器单测（原文档放在 PR3） | `tests/kvclient_object_storage_adapter_test.cpp` 与 `tests/CMakeLists.txt` 纳入 PR2 改动面 |
 
 ### 2.2 改动文件
@@ -822,6 +824,54 @@ sequenceDiagram
 
 ### 2.6 伪代码
 
+#### 2.6.0 对 PR1 `ToErrorCode` 的补充（数据面落地后发现的缺口）
+
+PR1 的 `ToErrorCode`（§1.6.4）只覆盖控制面用到的状态码。PR2 实现读写数据面后，对照 SDK 的 `ResultBufferEntryToStatus`（`trans_task_utils.cc`）发现三个缺口：
+
+```cpp
+// ① 读 miss 的第二个码：LOAD 用 ENTRY_KEY_NOT_FOUND / ENTRY_DATA_NOT_EXIST
+//    报告未命中，QUERY 用 ENTRY_KEY_NOT_EXIST。PR1 只列了前两者中的第一个，
+//    缺 ENTRY_DATA_NOT_EXIST 会让读 miss 落到 default → INTERNAL_ERROR，
+//    §2.7 验收要求的 OBJECT_NOT_FOUND 不成立，PR3 的 miss 自愈也不会触发。
+case StatusCode::CQE_KEY_NOT_EXIST:
+case StatusCode::ENTRY_KEY_NOT_FOUND:
+case StatusCode::ENTRY_DATA_NOT_EXIST:      // PR2 补
+case StatusCode::ENTRY_KEY_NOT_EXIST:
+    return ErrorCode::OBJECT_NOT_FOUND;
+
+// ② SDK 标注可重试的两个 entry 码。原先落到 default → INTERNAL_ERROR，
+//    而单条 LOAD 下同一 raw 值经 EntryStatusCode(LOAD, raw) 变成 IO_ERROR →
+//    DFS_SERVICE_UNAVAILABLE，两条路径不一致。
+case StatusCode::ENTRY_RETRY_ADVISED:       // PR2 补
+    return ErrorCode::DFS_SERVICE_UNAVAILABLE;
+case StatusCode::ENTRY_NO_RETRY_ADVISED:    // PR2 补：显式声明，不静默落入 default
+    return ErrorCode::INTERNAL_ERROR;
+```
+
+```cpp
+// ③ 写侧专用映射。BATCH_STORE 与 BATCH_LOAD 共用 SDK 的 entry 解码器，
+//    所以 ① 里新增的两个码在写侧也会出现，但含义是「写入失败」而非「对象
+//    不存在」。沿用 ToErrorCode 会把写失败报成 OBJECT_NOT_FOUND，污染调用方
+//    分类与写错误指标。PutBatch 的逐项映射一律改用本函数。
+ErrorCode KvClientObjectStorageAdapter::ToWriteErrorCode(
+    const kv::Status& status) {
+    using kv::StatusCode;
+    switch (status.code) {
+        case StatusCode::ENTRY_KEY_NOT_FOUND:
+        case StatusCode::ENTRY_DATA_NOT_EXIST:
+            return ErrorCode::FILE_WRITE_FAIL;
+        default:
+            return ToErrorCode(status);   // 其余全部委托读侧映射
+    }
+}
+```
+
+约束：
+
+- ①② 改的是 PR1 已落地代码，属于 PR2 的修正，需在 PR 描述中说明。
+- ③ 用新函数而非给 `ToErrorCode` 加读写标志参数：后者要改 `DeleteBatch`/`Exists`/`GetBatch` 共 8 处调用点，前者只在 `PutBatch` 改 3 处，且读/删/查路径完全不受影响。
+- `GetBatch` 的逐项映射仍用 `ToErrorCode`（读路径需要 miss 语义），只有 `PutBatch` 用 `ToWriteErrorCode`。
+
 #### 2.6.1 适配器内部 buffer 注册
 
 注册与注销是两个私有成员函数，直接用 `kv_client_`，不引入额外类型：
@@ -927,7 +977,12 @@ KvClientObjectStorageAdapter::PutBatch(
                 results[i] = tl::make_unexpected(ErrorCode::INVALID_PARAMS);
                 continue;
             }
-            // 逐段求和：空段或回绕都会导致注册/提交区间错误。
+            // 逐段求和：空段或回绕都会导致注册/提交区间错误。SDK 每个 entry
+            // 只读一段连续区间，所以每一段还必须物理紧跟上一段；累加值正好
+            // 就是该段的期望起始偏移。地址运算用整数，因为比较不同分配来的
+            // 指针是 UB。
+            const auto base =
+                reinterpret_cast<uintptr_t>(requests[i].iov[0].iov_base);
             size_t total = 0;
             bool valid = true;
             for (int j = 0; j < requests[i].iovcnt; ++j) {
@@ -935,6 +990,11 @@ KvClientObjectStorageAdapter::PutBatch(
                 if (segment.iov_base == nullptr || segment.iov_len == 0 ||
                     segment.iov_len >
                         std::numeric_limits<size_t>::max() - total) {
+                    valid = false;
+                    break;
+                }
+                if (reinterpret_cast<uintptr_t>(segment.iov_base) !=
+                    base + total) {
                     valid = false;
                     break;
                 }
@@ -1210,7 +1270,12 @@ if (!enable_dfs_) return;
 if (dfs_config.UsesKvClient()) {
     if (enable_oplog_) {
         // kvclient 不支持元数据恢复；启动期拒绝，避免运行期 restore 静默失败。
-        LOG(FATAL) << "kvclient backend does not support snapshot/oplog recovery";
+        // 用 throw 而非 LOG(FATAL)：与本函数既有配置校验一致，master.cpp 有
+        // catch (const std::invalid_argument&) 的优雅退出惯例。
+        LOG(ERROR) << "KVClient DFS cannot be enabled with snapshot or oplog "
+                      "recovery because metadata restoration is not supported";
+        throw std::invalid_argument(
+            "KVClient DFS is incompatible with snapshot/oplog recovery");
     }
     use_kvclient_ = true;
     // 不创建 EFC target 与水位淘汰；直接返回。
@@ -1270,7 +1335,7 @@ auto target_pred = [this, replica_type, &client_id, expected_replica_id](
 >
 > - 不新增请求参数预检；参数合法性由 SDK 判定。
 > - descriptor 与 KVCS 形状一致（`aligned_size = value_length`），不需要 `CheckedAlignUp` 或 `kvclient_config.h`。
-> - 恢复门（`master_service.cpp:3434 / 3726 / 4014`）保持 KVCS-only，**不要**并入 `use_kvclient_`；kvclient 的恢复能力由启动期 `LOG(FATAL)` 拒绝 `enable_oplog_` 兜底。
+> - 恢复门（`master_service.cpp:3434 / 3726 / 4014`）保持 KVCS-only，**不要**并入 `use_kvclient_`；kvclient 的恢复能力由启动期 `throw std::invalid_argument` 拒绝 `enable_oplog_` 兜底。
 > - `nof_replica_num > 0` 的拒绝在默认构建已有 `#ifndef USE_NOF` 分支（`:5170-5177`），kvclient 需要**无条件**拒绝，避免 `-DUSE_NOF=ON` 构建下漏拦。
 > - `PrepareWriteStart` 同时覆盖 `PutStart`、`UpsertStart` 与 `BatchPutStart`。
 > - `EvictDiskReplica` / `BatchEvictDiskReplica` 以 `expected_replica_id = nullptr` 调用共享实现，DFS 永远被拒；PR2 不改变该行为，只有 `EvictDiskReplicaIfCurrent` 可用。
@@ -1280,10 +1345,14 @@ auto target_pred = [this, replica_type, &client_id, expected_replica_id](
 | 场景 | 预期 | 层级 |
 | --- | --- | --- |
 | N=1024 零拷贝写 | 不暂存、不拷贝；适配器内按请求 `RegisterBuffers` 并只用返回的 handle；`StoreAsync` 成功 | 适配器单测 |
-| SDK 拒绝无效请求 | 适配器不校验、不补齐；按 SDK 状态映射 | 适配器单测 |
+| 切片不连续 | 逐段校验 `iov[j].base == base + 已累加长度`；不满足逐项 `INVALID_PARAMS`，不注册、不提交 | 适配器单测 |
+| 切片连续 | 同一分配切成多段 → 成功；`region.addr` = 首段基址、`region.size` = 总长 | 适配器单测 |
+| SDK 拒绝无效请求 | 适配器不做业务参数校验、不补齐；按 SDK 状态映射 | 适配器单测 |
 | 同批重复 key | 第一条受理，后续条目 `INVALID_PARAMS` | 适配器单测 |
 | buffer 注册失败 | 该参与项 `INVALID_PARAMS` / `DFS_SERVICE_UNAVAILABLE`，不提交、不占用 key；其余项不受影响 | 适配器单测 |
+| 写 entry 级失败 | 逐项按 `ToWriteErrorCode` 映射：`ENTRY_KEY_NOT_FOUND` / `ENTRY_DATA_NOT_EXIST` → `FILE_WRITE_FAIL`（不是 `OBJECT_NOT_FOUND`）；`ENTRY_RETRY_ADVISED` → `DFS_SERVICE_UNAVAILABLE` | 适配器单测 |
 | 写 task 级错误 | 参与项统一映射 task 状态；`PutBatch` 返回前用 `UnregisterBuffers` 注销全部 handle | 适配器单测 |
+| 注销失败 | 只 `LOG(WARNING)`，不影响逐项结果、不重试 | 适配器单测 |
 | 单条 `Put` / `PutV` | `Put` 转成单 iovec 调 `PutV`；`PutV` 走单元素 `PutBatch`，结果与批量路径一致；`Get` 仍 `NOT_SUPPORTED` | 适配器单测 |
 | 已存在 key 覆盖写 | `StoreAsync` 直接覆盖；调用序列中不出现 `DeleteAsync` | 适配器单测（fake client） |
 | 空 key / N=0 | 逐项 `INVALID_PARAMS`，不进入提交 | 适配器单测 |
@@ -1295,7 +1364,7 @@ auto target_pred = [this, replica_type, &client_id, expected_replica_id](
 | `Exists` 存在/不存在 | `QueryAsync` entry 为 `ENTRY_KEY_EXIST` / `ENTRY_KEY_NOT_EXIST` → `true` / `false`；不得用 `ok()` 判断 | 适配器单测 |
 | `Exists` 错误 | entry 级错误按 `ToErrorCode` 映射；空 key → `INVALID_PARAMS` | 适配器单测 |
 | `ListKeys` | 仍为 `NOT_SUPPORTED` | 适配器单测 |
-| kvclient + `enable_oplog` | Master 启动期 `LOG(FATAL)`，拒绝启动 | 启动验收 |
+| kvclient + `enable_oplog` | Master 启动期 `throw std::invalid_argument`，拒绝启动 | 启动验收 |
 | Master descriptor | `object_size=N`；`aligned_size=N`；`shard_idx=-1` | 集成 |
 | 恢复门 | 保持 KVCS-only；kvclient 不做元数据恢复 | 代码审查 |
 
