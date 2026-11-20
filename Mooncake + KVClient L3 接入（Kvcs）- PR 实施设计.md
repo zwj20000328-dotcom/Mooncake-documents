@@ -104,7 +104,7 @@ classDiagram
 
 > 数据面只有 batch 一条路径：`Put` / `PutV` / `Get` 都只是把单条请求包装成 `PutBatch` / `GetBatch` 调用，不单独实现 I/O；`Delete` 同样只是 `DeleteBatch` 的单条包装。PR1 实现 `Delete` 与 `DeleteBatch`（控制面删除），`Put` / `PutV` / `PutBatch` / `Get` / `GetBatch` 以 `NOT_SUPPORTED` 占位。PR2 把 `PutBatch` / `GetBatch` 变成真实数据路径，并实现 `Exists`；`Put` / `PutV` 按 KVCS 结构改为 `Put` → `PutV` → `PutBatch` 的包装，`Get` 保持 `NOT_SUPPORTED`（读路径在步骤 6）。`GetName()` 的真实签名是 `const char* GetName() const override`，不是 `char*`；适配器头必须 override `object_storage_adapter.h` 的全部纯虚函数（`Put` / `PutV` / `Get` / `Exists` / `Delete` / `ListKeys` / `Init` / `GetName`），并声明析构 `~KvClientObjectStorageAdapter() override`，否则类保持抽象、`make_unique` 无法编译。
 >
-> **PR2 实现注意**：`Completion` 是 PR1 已存在的类内私有嵌套类型，图中仅示意，PR2 **不要**重新声明；PR2 不再有 `BufferPlan`。buffer 注册由匿名命名空间的 `RegisterBuffers` / `UnregisterBuffers` 在每次 batch 调用内完成，不修改请求结构或上层接口。
+> **PR2 实现注意**：`Completion` 是 PR1 已存在的类内私有嵌套类型，图中仅示意，PR2 **不要**重新声明；PR2 不再有 `BufferPlan`。buffer 注册由适配器新增的两个私有成员函数 `RegisterBuffers` / `UnregisterBuffers` 在每次 batch 调用内完成，不修改请求结构或上层接口。
 
 ### 1.4 流程图
 
@@ -565,7 +565,7 @@ endif()
 | --- | --- | --- |
 | 写路径 | 零拷贝；成功与否由 KvClient 判定 | 适配器不 staging、不补齐、不校验；只保留空 key、N==0、空指针、重复 key 守卫 |
 | 读路径 | 适配器内部注册目标 buffer 做零拷贝读；`LoadAsync` + `waitForCompletion` 同步完成 | `GetBatch` 在调用内注册目标 buffer，返回时逐项结果已就绪；返回后 buffer 可复用，无完成句柄 |
-| buffer 注册 | **适配器内部按请求注册，调用返回前注销**；不改上层接口 | `PutBatch` / `GetBatch` 内用 `RegisterBuffers` 注册 `iov[0].base` / 目标 buffer，返回前用 `UnregisterBuffers` 统一注销；`ObjectPutRequest` / `ObjectGetRequest`、`ObjectStorageAdapter` 与 `DistributedStorageBackend` 均不变 |
+| buffer 注册 | **适配器内部按请求注册，调用返回前注销**；不改上层接口 | `PutBatch` / `GetBatch` 内用私有成员 `RegisterBuffers` 注册 `iov[0].base` / 目标 buffer，返回前用 `UnregisterBuffers` 统一注销；`ObjectPutRequest` / `ObjectGetRequest`、`ObjectStorageAdapter` 与 `DistributedStorageBackend` 均不变 |
 | 超时 | 由 KvClient SDK 负责 | `Wait(task_id, 0, result)`；适配器不设超时状态、不重试、不保留资源 |
 | `Exists` | PR2 实现：`QueryAsync` + `Wait` | 不注册 buffer；按 entry 级 `ENTRY_KEY_EXIST` / `ENTRY_KEY_NOT_EXIST` 返回 |
 | provider 模式 | 不要求 `asuSharedProvider=1` | 部署按 KV 默认配置执行，文档不再把 SHARED 作为前置条件 |
@@ -577,13 +577,13 @@ endif()
 
 | 文件 | 改动 |
 | --- | --- |
-| `include/storage/distributed/kvclient/kvclient_object_storage_adapter.h` | `GetBatch`、`Exists` |
+| `include/storage/distributed/kvclient/kvclient_object_storage_adapter.h` | 新增私有成员 `RegisterBuffers` / `UnregisterBuffers` 声明；补 `<cstdint>` |
 | `src/storage/distributed/kvclient/kvclient_object_storage_adapter.cpp` | `RegisterBuffers` / `UnregisterBuffers`（按请求注册、批量注销）、`Put`/`PutV` 单条包装、写零拷贝、读零拷贝（`LoadAsync` + `waitForCompletion`）、`Exists` 查询 |
 | `include/master_service.h` / `src/master_service.cpp` | `use_kvclient_`、门控、descriptor、白名单；`InitDfsAllocatorFromEnvironment` 新增 kvclient 早退分支（`enable_oplog_` 拒绝） |
 | `tests/kvclient_object_storage_adapter_test.cpp` | 新增，适配器数据面、handle 透传与读结果单测（SDK 存在时编译） |
 | `tests/CMakeLists.txt` | SDK 存在时新增测试目标并 `target_link_libraries(... Mooncake::kvclient)` |
 
-> **buffer 注册**：由适配器内部的 `RegisterBuffers` / `UnregisterBuffers` 完成。`RegisterBuffers` 按请求调用 `RegisterRegions` 拿到 handle，`UnregisterBuffers` 在 batch 返回前逐个 `UnregisterRegions`；注销失败只打 `LOG(WARNING)`。适配器不维护跨调用的注册表。
+> **buffer 注册**：由适配器的私有成员函数 `RegisterBuffers` / `UnregisterBuffers` 完成。`RegisterBuffers` 按请求调用 `RegisterRegions` 拿到 handle，`UnregisterBuffers` 在 batch 返回前逐个 `UnregisterRegions`；注销失败只打 `LOG(WARNING)`。两者直接用成员 `kv_client_`，适配器不维护跨调用的注册表。
 >
 > **写路径**：适配器用刚注册的 handle 构造 `KVBuffer` 并 `StoreAsync`；不拷贝、不补齐；成功与否由 KvClient 判定。
 >
@@ -618,11 +618,6 @@ classDiagram
         +vector~Status~ entryStatus
     }
 
-    class BufferRegistration["RegisterBuffers / UnregisterBuffers（匿名命名空间函数）"] {
-        +RegisterBuffers(client, ptr, size) expected~uint64_t~
-        +UnregisterBuffers(client, handles)
-    }
-
     class SdkKvClient["kv::KvClient"] {
         +RegisterRegions(regions, out) Status
         +UnregisterRegions(handles) Status
@@ -638,13 +633,16 @@ classDiagram
         -KvClientAdapterConfig config_
         -unique_ptr~KvClient~ kv_client_
         -bool initialized_
-        +PutBatch(requests) results
-        +GetBatch(requests) results
         +Put(key, data) expected
         +PutV(key, iov, iovcnt) expected
+        +PutBatch(requests) results
         +Get(key, buf, len) expected
+        +GetBatch(requests) results
         +Exists(key) expected~bool~
+        -RegisterBuffers(ptr, size) expected~uint64_t~
+        -UnregisterBuffers(handles)
         -waitForCompletion(task_id, count) Completion
+        -MakeCacheKey(key) BinaryKey
     }
 
     class MasterService {
@@ -655,25 +653,24 @@ classDiagram
     }
 
     DistributedStorageBackend ..> KvClientObjectStorageAdapter : 提交/读取
-    KvClientObjectStorageAdapter ..> BufferRegistration : 注册/注销
-    BufferRegistration ..> SdkKvClient : RegisterRegions / UnregisterRegions
+    KvClientObjectStorageAdapter ..> SdkKvClient : RegisterRegions / UnregisterRegions / StoreAsync
     KvClientObjectStorageAdapter ..> ObjectPutRequest : 读取 iov
     KvClientObjectStorageAdapter ..> ObjectGetRequest : 读取 buffer
     KvClientObjectStorageAdapter ..> Completion : 返回
     MasterService ..> DistributedFSDescriptor : 铸造
 ```
 
-> 本图只列 PR2 新增或变更的成员；`Init` / `Delete` / `DeleteBatch` / `ListKeys` 等 PR1 成员未重复列出。
+> 本图只列 PR2 新增或变更的成员；`Init` / `Delete` / `DeleteBatch` / `ListKeys` 等 PR1 成员未重复列出。`RegisterBuffers` / `UnregisterBuffers` 是适配器的私有成员函数（不是匿名命名空间函数），直接用 `kv_client_`，调用点不传 client。`Put` → `PutV` → `PutBatch` 是单条包装链，与 KVCS 一致。
 
 ### 2.4 流程图（写/读共用骨架）
 
 ```mermaid
 flowchart TB
-    A["PutBatch / GetBatch(requests)"] --> A2["handles = []"]
+    A["PutBatch / GetBatch(requests)"] --> A2["初始化 handles 列表<br/>后续步骤在 try 块内"]
     A2 --> B["逐条守卫"]
     B --> C{"空 key / 空指针 / 长度非法?"}
     C -->|是| E["errors[i]=INVALID_PARAMS"]
-    C -->|否| REG["RegisterBuffers(client, base, size)<br/>RegisterRegions"]
+    C -->|否| REG["RegisterBuffers(base, size)<br/>RegisterRegions"]
     REG --> REGOK{"注册成功?"}
     REGOK -->|否| E
     REGOK -->|是| SUB{"写还是读?"}
@@ -691,7 +688,12 @@ flowchart TB
     TASKE --> UNREG
     MAPW --> UNREG
     RMAPR --> UNREG
-    UNREG["UnregisterBuffers(client, handles)：<br/>逐 handle UnregisterRegions"] --> END["返回结果"]
+    UNREG["UnregisterBuffers(handles)：<br/>逐 handle UnregisterRegions"] --> END["返回结果"]
+    B -.->|"异常展开"| CATCH["catch(...)"]
+    SUB -.->|"异常展开"| CATCH
+    WAIT -.->|"异常展开"| CATCH
+    CATCH -.-> CU["UnregisterBuffers(handles)"]
+    CU -.-> RETHROW["rethrow"]
     X["Exists(key)"] --> XQ["QueryAsync"]
     XQ --> XW["Wait(task_id, 0, result)"]
     XW --> XC{"entry code"}
@@ -711,7 +713,6 @@ sequenceDiagram
     participant C as Client
     participant BE as DistributedStorageBackend
     participant AD as KvClientObjectStorageAdapter
-    participant RB as RegisterBuffers / UnregisterBuffers
     participant SDK as kv::KvClient
     participant S as 远端存储
 
@@ -719,16 +720,16 @@ sequenceDiagram
     BE->>BE: 校验 total_size == desc.object_size<br/>每 slice 转 iovec
     BE->>AD: PutBatch(ObjectPutRequest{key, iov, iovcnt})
     Note over AD: 单条入口 Put → PutV → PutBatch，最终都汇聚到这里
+    AD->>AD: 初始化 handles 列表（try 块内）
     loop 每个请求
         AD->>AD: 守卫（空 key / 空指针 / 长度）
-        AD->>RB: RegisterBuffers(client, iov[0].base, total)
-        RB->>SDK: RegisterRegions([{HOST, base, total}])
-        SDK-->>RB: handle
+        AD->>AD: RegisterBuffers(iov[0].base, total)
+        AD->>SDK: RegisterRegions([{HOST, base, total}])
+        SDK-->>AD: handle
         alt 注册失败
-            RB-->>AD: INVALID_PARAMS / DFS_SERVICE_UNAVAILABLE
             AD->>AD: results[i]=错误，该项不提交
         else 注册成功
-            AD->>AD: 构造 KVBuffer{key, region, buffer.handle=handle}
+            AD->>AD: handles.push_back(handle)<br/>构造 KVBuffer{key, region, buffer.handle=handle}
         end
     end
     AD->>SDK: StoreAsync(entries, taskId)
@@ -744,8 +745,9 @@ sequenceDiagram
             AD->>AD: 统一映射 task 状态
         end
     end
-    AD->>RB: UnregisterBuffers(client, handles)
-    RB->>SDK: UnregisterRegions(handle) × N
+    AD->>AD: UnregisterBuffers(handles)
+    AD->>SDK: UnregisterRegions(handle) × N
+    Note over AD: 异常展开时 catch(...) 同样先 UnregisterBuffers 再 throw
     AD-->>BE: 逐项 expected
     BE-->>C: results[index]
 ```
@@ -758,20 +760,20 @@ sequenceDiagram
     participant C as Client
     participant BE as DistributedStorageBackend
     participant AD as KvClientObjectStorageAdapter
-    participant RB as RegisterBuffers / UnregisterBuffers
     participant SDK as kv::KvClient
 
     C->>BE: BatchRead(key, desc, slices)
     BE->>BE: 选择目标 buffer（调用方 buffer 或后端 staging）
     BE->>AD: GetBatch(ObjectGetRequest{key, buffer, N})
+    AD->>AD: 初始化 handles 列表（try 块内）
     loop 每个请求
         AD->>AD: 守卫（空 key / 空指针 / size==0）
-        AD->>RB: RegisterBuffers(client, buffer, N)
-        RB->>SDK: RegisterRegions([{HOST, buffer, N}])
+        AD->>AD: RegisterBuffers(buffer, N)
+        AD->>SDK: RegisterRegions([{HOST, buffer, N}])
         alt 注册失败
-            RB-->>AD: 错误，该项不提交
+            AD->>AD: results[i]=错误，该项不提交
         else 注册成功
-            AD->>AD: 构造 KVBuffer{key, region, buffer.handle=handle}
+            AD->>AD: handles.push_back(handle)<br/>构造 KVBuffer{key, region, buffer.handle=handle}
         end
     end
     AD->>SDK: LoadAsync(entries, taskId)
@@ -786,8 +788,9 @@ sequenceDiagram
             AD->>AD: 统一映射 task 状态
         end
     end
-    AD->>RB: UnregisterBuffers(client, handles)
-    RB->>SDK: UnregisterRegions(handle) × N
+    AD->>AD: UnregisterBuffers(handles)
+    AD->>SDK: UnregisterRegions(handle) × N
+    Note over AD: 异常展开时 catch(...) 同样先 UnregisterBuffers 再 throw
     AD-->>BE: 逐项 expected~size_t~
     BE-->>C: 逐 key 结果
 ```
@@ -818,30 +821,35 @@ sequenceDiagram
 
 #### 2.6.1 适配器内部 buffer 注册
 
-注册与注销是两个匿名命名空间函数，不引入额外类型：
+注册与注销是两个私有成员函数，直接用 `kv_client_`，不引入额外类型：
 
 ```cpp
+// 声明（kvclient_object_storage_adapter.h，private 段）
+tl::expected<uint64_t, ErrorCode> RegisterBuffers(void* ptr, size_t size);
+void UnregisterBuffers(const std::vector<uint64_t>& handles);
+
+// 实现（kvclient_object_storage_adapter.cpp）
 // 注册单块 host 内存并返回 handle；handle 在交给 UnregisterBuffers 前保持有效。
-tl::expected<uint64_t, ErrorCode> RegisterBuffers(kv::KvClient& client,
-                                                  void* ptr, size_t size) {
+tl::expected<uint64_t, ErrorCode>
+KvClientObjectStorageAdapter::RegisterBuffers(void* ptr, size_t size) {
     if (ptr == nullptr || size == 0) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
     std::vector<kv::MemoryRegion> regions{
         {kv::MemoryType::HOST, reinterpret_cast<uint64_t>(ptr), size, -1, -1}};
     std::vector<kv::RegisteredMemory> registered;
-    const auto status = client.RegisterRegions(regions, registered);
+    const auto status = kv_client_->RegisterRegions(regions, registered);
     if (!status.ok() || registered.size() != 1) {
         return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
     }
     return registered[0].handle;
 }
 
-// 批量注销；失败只记日志：SDK 保留该注册，且调用方无 handle 可重试。
-void UnregisterBuffers(kv::KvClient& client,
-                       const std::vector<uint64_t>& handles) {
+// 批量注销；失败只记日志：SDK 保留该注册，且已无 handle 可重试。
+void KvClientObjectStorageAdapter::UnregisterBuffers(
+    const std::vector<uint64_t>& handles) {
     for (uint64_t handle : handles) {
-        const auto status = client.UnregisterRegions({handle});
+        const auto status = kv_client_->UnregisterRegions({handle});
         if (!status.ok()) {
             LOG(WARNING) << "KVClient buffer unregister failed, handle="
                          << handle << ", error=" << status.message;
@@ -933,8 +941,7 @@ KvClientObjectStorageAdapter::PutBatch(
                 results[i] = tl::make_unexpected(ErrorCode::INVALID_PARAMS);
                 continue;
             }
-            auto handle = RegisterBuffers(*kv_client_,
-                                          requests[i].iov[0].iov_base, total);
+            auto handle = RegisterBuffers(requests[i].iov[0].iov_base, total);
             if (!handle) {
                 results[i] = tl::make_unexpected(handle.error());
                 continue;
@@ -984,10 +991,10 @@ KvClientObjectStorageAdapter::PutBatch(
             }
         }
     } catch (...) {
-        UnregisterBuffers(*kv_client_, handles);
+        UnregisterBuffers(handles);
         throw;
     }
-    UnregisterBuffers(*kv_client_, handles);
+    UnregisterBuffers(handles);
     return results;
 }
 ```
@@ -1030,8 +1037,8 @@ KvClientObjectStorageAdapter::GetBatch(
             results[i] = tl::make_unexpected(ErrorCode::INVALID_PARAMS);
             continue;
         }
-        auto handle = RegisterBuffers(*kv_client_, requests[i].buffer,
-                                      requests[i].size);
+        auto handle =
+            RegisterBuffers(requests[i].buffer, requests[i].size);
         if (!handle) {
             results[i] = tl::make_unexpected(handle.error());
             continue;
@@ -1056,7 +1063,7 @@ KvClientObjectStorageAdapter::GetBatch(
     kv::TaskId task_id = kv::kInvalidTaskId;
     const auto submit = kv_client_->LoadAsync(entries, task_id);
     if (!submit.ok()) {
-        UnregisterBuffers(*kv_client_, handles);
+        UnregisterBuffers(handles);
         for (size_t i : indices)
             results[i] = tl::make_unexpected(ToErrorCode(submit));
         return results;
@@ -1080,7 +1087,7 @@ KvClientObjectStorageAdapter::GetBatch(
                         : tl::make_unexpected(ToErrorCode(st));
         }
     }
-    UnregisterBuffers(*kv_client_, handles);
+    UnregisterBuffers(handles);
     return results;
 }
 ```
