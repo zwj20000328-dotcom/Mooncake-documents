@@ -623,6 +623,11 @@ classDiagram
         +UnregisterBuffers(client, handles)
     }
 
+    class SdkKvClient["kv::KvClient"] {
+        +RegisterRegions(regions, out) Status
+        +UnregisterRegions(handles) Status
+    }
+
     class DistributedStorageBackend {
         -ObjectStorageAdapter* object_storage_adapter_
         +BatchWrite(requests) results
@@ -651,7 +656,7 @@ classDiagram
 
     DistributedStorageBackend ..> KvClientObjectStorageAdapter : 提交/读取
     KvClientObjectStorageAdapter ..> BufferRegistration : 注册/注销
-    BufferRegistration ..> SdkKvClient["kv::KvClient"] : RegisterRegions / UnregisterRegions
+    BufferRegistration ..> SdkKvClient : RegisterRegions / UnregisterRegions
     KvClientObjectStorageAdapter ..> ObjectPutRequest : 读取 iov
     KvClientObjectStorageAdapter ..> ObjectGetRequest : 读取 buffer
     KvClientObjectStorageAdapter ..> Completion : 返回
