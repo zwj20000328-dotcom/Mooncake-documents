@@ -242,92 +242,99 @@ KvClientObjectStorageAdapter::PutBatch(
         return results;
     }
 
-    std::set<kv::BinaryKey> seen;   // 仅写侧：同批重复 key
-    std::vector<kv::KVBuffer> entries;
-    std::vector<size_t> indices;
     std::vector<uint64_t> handles;
-    entries.reserve(requests.size());
-    indices.reserve(requests.size());
     handles.reserve(requests.size());
-    for (size_t i = 0; i < requests.size(); ++i) {
-        if (requests[i].logical_key.empty() || requests[i].iov == nullptr ||
-            requests[i].iovcnt <= 0) {
-            results[i] = tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-            continue;
-        }
-        const auto binary_key = MakeCacheKey(requests[i].logical_key);
-        if (seen.find(binary_key) != seen.end()) {
-            results[i] = tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-            continue;
-        }
-        // 逐段求和：空段或回绕都会导致注册/提交区间错误。
-        size_t total = 0;
-        bool valid = true;
-        for (int j = 0; j < requests[i].iovcnt; ++j) {
-            const auto& segment = requests[i].iov[j];
-            if (segment.iov_base == nullptr || segment.iov_len == 0 ||
-                segment.iov_len >
-                    std::numeric_limits<size_t>::max() - total) {
-                valid = false;
-                break;
+    // 注册过的 handle 在批次异常展开时也必须释放。
+    try {
+        std::set<kv::BinaryKey> seen;   // 仅写侧：同批重复 key
+        std::vector<kv::KVBuffer> entries;
+        std::vector<size_t> indices;
+        entries.reserve(requests.size());
+        indices.reserve(requests.size());
+        for (size_t i = 0; i < requests.size(); ++i) {
+            if (requests[i].logical_key.empty() || requests[i].iov == nullptr ||
+                requests[i].iovcnt <= 0) {
+                results[i] = tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+                continue;
             }
-            total += segment.iov_len;
-        }
-        if (!valid || total == 0) {
-            results[i] = tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-            continue;
-        }
-        auto handle = RegisterBuffers(requests[i].iov[0].iov_base, total);
-        if (!handle) {
-            results[i] = tl::make_unexpected(handle.error());
-            continue;
-        }
-        // 只有完全受理的请求才认领 key，避免无效项挡住后续合法请求。
-        seen.insert(binary_key);
-        handles.push_back(*handle);
+            const auto binary_key = MakeCacheKey(requests[i].logical_key);
+            if (seen.find(binary_key) != seen.end()) {
+                results[i] = tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+                continue;
+            }
+            // 逐段求和：空段或回绕都会导致注册/提交区间错误。
+            size_t total = 0;
+            bool valid = true;
+            for (int j = 0; j < requests[i].iovcnt; ++j) {
+                const auto& segment = requests[i].iov[j];
+                if (segment.iov_base == nullptr || segment.iov_len == 0 ||
+                    segment.iov_len >
+                        std::numeric_limits<size_t>::max() - total) {
+                    valid = false;
+                    break;
+                }
+                total += segment.iov_len;
+            }
+            if (!valid || total == 0) {
+                results[i] = tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+                continue;
+            }
+            auto handle = RegisterBuffers(requests[i].iov[0].iov_base, total);
+            if (!handle) {
+                results[i] = tl::make_unexpected(handle.error());
+                continue;
+            }
+            // 先登记 handle，后续分配抛异常时 catch 仍能释放它；
+            // 只有完全受理的请求才认领 key，避免无效项挡住后续合法请求。
+            handles.push_back(*handle);
+            seen.insert(binary_key);
 
-        kv::KVBuffer entry;
-        entry.key = kv::CacheKey::FromBytes(binary_key);
-        entry.buffer.region = {
-            kv::MemoryType::HOST,
-            reinterpret_cast<uint64_t>(requests[i].iov[0].iov_base),
-            total, -1, -1};
-        entry.buffer.handle = *handle;
-        entry.offset = 0;
-        entry.mrKey = std::nullopt;      // SDK 按 handle 回填
-        entries.push_back(std::move(entry));
-        indices.push_back(i);
-    }
-    if (entries.empty()) return results;
+            kv::KVBuffer entry;
+            entry.key = kv::CacheKey::FromBytes(binary_key);
+            entry.buffer.region = {
+                kv::MemoryType::HOST,
+                reinterpret_cast<uint64_t>(requests[i].iov[0].iov_base),
+                total, -1, -1};
+            entry.buffer.handle = *handle;
+            entry.offset = 0;
+            entry.mrKey = std::nullopt;      // SDK 按 handle 回填
+            entries.push_back(std::move(entry));
+            indices.push_back(i);
+        }
 
-    kv::TaskId task_id = kv::kInvalidTaskId;
-    const auto submit = kv_client_->StoreAsync(entries, task_id);
-    if (!submit.ok()) {
+        if (!entries.empty()) {
+            kv::TaskId task_id = kv::kInvalidTaskId;
+            const auto submit = kv_client_->StoreAsync(entries, task_id);
+            if (!submit.ok()) {
+                for (size_t index : indices) {
+                    results[index] = tl::make_unexpected(ToErrorCode(submit));
+                }
+            } else {
+                const auto completion = waitForCompletion(task_id, entries.size());
+                if (completion.entryStatus.size() != entries.size()) {
+                    for (size_t index : indices) {
+                        results[index] =
+                            tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+                    }
+                } else if (!completion.terminal) {
+                    // Task 级错误：entryStatus 已被填成 task 状态，统一映射。
+                    const auto error = ToErrorCode(completion.entryStatus[0]);
+                    for (size_t index : indices) {
+                        results[index] = tl::make_unexpected(error);
+                    }
+                } else {
+                    for (size_t j = 0; j < entries.size(); ++j) {
+                        const auto& status = completion.entryStatus[j];
+                        results[indices[j]] =
+                            status.ok() ? tl::expected<void, ErrorCode>{}
+                                        : tl::make_unexpected(ToErrorCode(status));
+                    }
+                }
+            }
+        }
+    } catch (...) {
         UnregisterBuffers(handles);
-        for (size_t index : indices) {
-            results[index] = tl::make_unexpected(ToErrorCode(submit));
-        }
-        return results;
-    }
-
-    const auto completion = waitForCompletion(task_id, entries.size());
-    if (completion.entryStatus.size() != entries.size()) {
-        for (size_t index : indices) {
-            results[index] = tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
-        }
-    } else if (!completion.terminal) {
-        // Task 级错误：entryStatus 已被填成 task 状态，统一映射。
-        const auto error = ToErrorCode(completion.entryStatus[0]);
-        for (size_t index : indices) {
-            results[index] = tl::make_unexpected(error);
-        }
-    } else {
-        for (size_t j = 0; j < entries.size(); ++j) {
-            const auto& status = completion.entryStatus[j];
-            results[indices[j]] =
-                status.ok() ? tl::expected<void, ErrorCode>{}
-                            : tl::make_unexpected(ToErrorCode(status));
-        }
+        throw;
     }
     UnregisterBuffers(handles);
     return results;
@@ -340,6 +347,8 @@ KvClientObjectStorageAdapter::PutBatch(
 - 已确认 `StoreAsync` 覆盖写，不预删。
 - 提交失败与 Task 级错误只覆盖参与项，空 key / 重复 key / 注册失败的错误保留。
 - 每个参与项由 `RegisterBuffers` 注册；`Wait` 返回后、函数返回前统一用 `UnregisterBuffers` 注销。
+- 单一出口：正常路径与提前返回都经过结尾的 `UnregisterBuffers`；异常路径由 `catch` 注销后 rethrow，两者不会重复注销。
+- `handles` 在 `try` 外声明，`catch` 才可见；`handles.reserve` 保证 `push_back` 不抛，登记动作本身无异常窗口。
 - `Put` / `PutV` 只是单条包装，最终都汇聚到 `PutBatch`。
 
 ---
@@ -362,67 +371,79 @@ KvClientObjectStorageAdapter::GetBatch(
         return results;
     }
 
-    std::vector<kv::KVBuffer> entries;
-    std::vector<size_t> indices;
     std::vector<uint64_t> handles;
-    entries.reserve(requests.size());
-    indices.reserve(requests.size());
     handles.reserve(requests.size());
-    for (size_t i = 0; i < requests.size(); ++i) {
-        if (requests[i].logical_key.empty() || requests[i].buffer == nullptr ||
-            requests[i].size == 0) {
-            results[i] = tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-            continue;
-        }
-        auto handle =
-            RegisterBuffers(requests[i].buffer, requests[i].size);
-        if (!handle) {
-            results[i] = tl::make_unexpected(handle.error());
-            continue;
-        }
-        handles.push_back(*handle);
+    // 注册过的 handle 在批次异常展开时也必须释放。
+    try {
+        std::vector<kv::KVBuffer> entries;
+        std::vector<size_t> indices;
+        entries.reserve(requests.size());
+        indices.reserve(requests.size());
+        for (size_t i = 0; i < requests.size(); ++i) {
+            if (requests[i].logical_key.empty() ||
+                requests[i].buffer == nullptr || requests[i].size == 0) {
+                results[i] = tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+                continue;
+            }
+            // 整段目标 buffer 都注册；SDK 直接把对象写进这块内存。
+            auto handle =
+                RegisterBuffers(requests[i].buffer, requests[i].size);
+            if (!handle) {
+                results[i] = tl::make_unexpected(handle.error());
+                continue;
+            }
+            // 先登记 handle，后续分配抛异常时 catch 仍能释放它。
+            handles.push_back(*handle);
 
-        kv::KVBuffer entry;
-        entry.key =
-            kv::CacheKey::FromBytes(MakeCacheKey(requests[i].logical_key));
-        entry.buffer.region = {
-            kv::MemoryType::HOST,
-            reinterpret_cast<uint64_t>(requests[i].buffer), requests[i].size,
-            -1, -1};
-        entry.buffer.handle = *handle;
-        entry.offset = 0;
-        entry.mrKey = std::nullopt;
-        entries.push_back(std::move(entry));
-        indices.push_back(i);
-    }
-    if (entries.empty()) return results;
+            kv::KVBuffer entry;
+            entry.key =
+                kv::CacheKey::FromBytes(MakeCacheKey(requests[i].logical_key));
+            entry.buffer.region = {
+                kv::MemoryType::HOST,
+                reinterpret_cast<uint64_t>(requests[i].buffer),
+                requests[i].size, -1, -1};
+            entry.buffer.handle = *handle;
+            entry.offset = 0;
+            entry.mrKey = std::nullopt;   // SDK 按 handle 回填
+            entries.push_back(std::move(entry));
+            indices.push_back(i);
+        }
 
-    kv::TaskId task_id = kv::kInvalidTaskId;
-    const auto submit = kv_client_->LoadAsync(entries, task_id);
-    if (!submit.ok()) {
+        if (!entries.empty()) {
+            kv::TaskId task_id = kv::kInvalidTaskId;
+            const auto submit = kv_client_->LoadAsync(entries, task_id);
+            if (!submit.ok()) {
+                for (size_t i : indices)
+                    results[i] = tl::make_unexpected(ToErrorCode(submit));
+            } else {
+                const auto completion =
+                    waitForCompletion(task_id, entries.size());
+                if (completion.entryStatus.size() != entries.size()) {
+                    for (size_t i : indices)
+                        results[i] =
+                            tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+                } else if (!completion.terminal) {
+                    // Task 级错误：entryStatus 已被填成 task 状态，统一映射。
+                    const auto error = ToErrorCode(completion.entryStatus[0]);
+                    for (size_t i : indices)
+                        results[i] = tl::make_unexpected(error);
+                } else {
+                    for (size_t j = 0; j < entries.size(); ++j) {
+                        const auto& st = completion.entryStatus[j];
+                        const size_t index = indices[j];
+                        // 返回请求长度；后端用它比对以发现短读。
+                        results[index] =
+                            st.ok()
+                                ? tl::expected<size_t, ErrorCode>{
+                                      requests[index].size}
+                                : tl::make_unexpected(ToErrorCode(st));
+                    }
+                }
+            }
+        }
+    } catch (...) {
         UnregisterBuffers(handles);
-        for (size_t i : indices)
-            results[i] = tl::make_unexpected(ToErrorCode(submit));
-        return results;
-    }
-
-    const auto completion = waitForCompletion(task_id, entries.size());
-    if (completion.entryStatus.size() != entries.size()) {
-        for (size_t i : indices)
-            results[i] = tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
-    } else if (!completion.terminal) {
-        const auto error = ToErrorCode(completion.entryStatus[0]);
-        for (size_t i : indices)
-            results[i] = tl::make_unexpected(error);
-    } else {
-        for (size_t j = 0; j < entries.size(); ++j) {
-            const auto& st = completion.entryStatus[j];
-            const size_t index = indices[j];
-            results[index] =
-                st.ok() ? tl::expected<size_t, ErrorCode>{
-                              requests[index].size}
-                        : tl::make_unexpected(ToErrorCode(st));
-        }
+        throw;
     }
     UnregisterBuffers(handles);
     return results;
@@ -431,11 +452,14 @@ KvClientObjectStorageAdapter::GetBatch(
 
 ### 7.2 约束
 
-- 成功项返回 `request.size`（N），不是 SDK 传输长度；`DistributedStorageBackend` 会再比对 `request.size == N`。
+- 成功项返回 `request.size`（N），不是 SDK 传输长度；`DistributedStorageBackend` 会再比对 `request.size == N`，不等则判 `FILE_READ_FAIL`。
 - `Wait` 在 `GetBatch` 调用内完成；返回前用 `UnregisterBuffers` 注销 handle，buffer 随后可复用。
 - 多 slice 由后端 staging 承接，只在本调用内有效；`GetBatch` 返回后散回。
 - `entryStatus` 仅在 `OK` / `PARTIAL_FAILED` 时逐项可信；非终态统一映射 task 级状态。
 - 注册失败按项隔离；适配器不做 payload 拷贝。
+- 读路径**没有同批去重**：同一 key 读两次是合法的（各自独立的目标 buffer），因此不像 `PutBatch` 那样维护 `seen`。
+- 单一出口与 `PutBatch` 相同：`handles` 在 `try` 外声明，正常路径与 `catch` 各注销一次，互不重复。
+- **读 miss 的状态码与写/查询不同**：LOAD 用 `ENTRY_KEY_NOT_FOUND` / `ENTRY_DATA_NOT_EXIST` 报告未命中，QUERY 用 `ENTRY_KEY_NOT_EXIST`。PR1 的 `ToErrorCode` 只列了前两者中的 `ENTRY_KEY_NOT_FOUND`，本步骤补上 `ENTRY_DATA_NOT_EXIST`，否则 miss 会落到 `default` 变成 `INTERNAL_ERROR`，验收要求的 `OBJECT_NOT_FOUND` 不成立，PR3 的 miss 自愈也不会触发。这是对 PR1 已落地代码的一处修正，需在 PR 描述中说明。
 
 ---
 
@@ -483,32 +507,29 @@ tl::expected<bool, ErrorCode> KvClientObjectStorageAdapter::Exists(
     const auto submit = kv_client_->QueryAsync(keys, task_id);
     if (!submit.ok()) return tl::make_unexpected(ToErrorCode(submit));
 
-    kv::TaskResult result;
-    const auto wait = kv_client_->Wait(task_id, 0, result);
-    if (!wait.ok()) return tl::make_unexpected(ToErrorCode(wait));
-    if (result.status.code != kv::StatusCode::OK &&
-        result.status.code != kv::StatusCode::PARTIAL_FAILED) {
-        return tl::make_unexpected(ToErrorCode(result.status));
+    // key 不存在会让 task 级变成 PARTIAL_FAILED，但它仍携带可信的逐项结果，
+    // 因此不能当失败处理。复用 waitForCompletion 而不是裸调 Wait。
+    const auto completion = waitForCompletion(task_id, keys.size());
+    if (!completion.terminal) {
+        return tl::make_unexpected(ToErrorCode(completion.entryStatus[0]));
     }
-    if (result.entryStatus.size() != 1 ||
-        (result.queryResult &&
-         result.queryResult->exists.size() != 1)) {
-        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
-    }
-    switch (result.entryStatus[0].code) {
+    // 两种结果都由 Status::Error 产生，ok() 无法区分命中与未命中，必须按 code 分支。
+    switch (completion.entryStatus[0].code) {
         case kv::StatusCode::ENTRY_KEY_EXIST: return true;
         case kv::StatusCode::ENTRY_KEY_NOT_EXIST: return false;
         default:
-            return tl::make_unexpected(ToErrorCode(result.entryStatus[0]));
+            return tl::make_unexpected(ToErrorCode(completion.entryStatus[0]));
     }
 }
 ```
 
 约束：
 
-- **不能用 `entryStatus[0].ok()`**：查询成功的 entry 是 `ENTRY_KEY_EXIST`（非 `OK`），必须按 code 分支。
-- `queryResult->exists` 只做一致性校验；布尔值以 entryStatus 的明确 code 为准。
-- `Wait` 返回的失败按 SDK 状态映射；查询不注册 buffer，没有额外资源需要保留。
+- **不能用 `entryStatus[0].ok()`**：`ENTRY_KEY_EXIST` 与 `ENTRY_KEY_NOT_EXIST` 都由 `Status::Error(...)` 产生（SDK `trans_task_utils.cc:142-143`），两种结果都不是 `OK`，必须按 code 分支。
+- **不能用 `Wait` 的返回值当成功判据**：`WaitContext` 直接 `return result.status`，而 key 不存在时 `Finalize` 把 `finalStatus` 置为 `PARTIAL_FAILED`（`task_manager.cc:254-256`）。若写成 `if (!wait.ok()) return error`，每次 miss 都会返回错误，`false` 分支永远不可达。
+- 复用 `waitForCompletion`：它已把 `OK` / `PARTIAL_FAILED` 判为终态（entryStatus 可信），非终态则把 task 状态填满每个 entry；与 `DeleteBatch` / `PutBatch` 行为一致。
+- 不再做 `queryResult->exists.size()` 一致性校验：SDK 的 `CompleteTransportTask` 已校验条数并把不匹配转成 `INTERNAL_ERROR` 填进 entryStatus（`task_manager.cc:182-186`），落到本函数的 `default` 分支即映射为 `INTERNAL_ERROR`。
+- 查询不注册 buffer，没有额外资源需要保留；`Exists` 不需要 try/catch。
 - 空 key 本地拒绝，不发起 SDK 查询。
 
 ### 8.4 保持 `NOT_SUPPORTED`
