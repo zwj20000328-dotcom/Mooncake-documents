@@ -13,7 +13,10 @@
 | 项 | 值 |
 | --- | --- |
 | 分支 | `Mooncake_l3_pr2`（含 PR1 全部提交） |
-| 合并基线 | `e43ee9c4`（`git merge-base upstream/main HEAD`） |
+| upstream 基线 | `e43ee9c4`（`git merge-base upstream/main HEAD`） |
+| 当前 HEAD | `a2841229`（PR1 之后的 upstream 合并，**已越过 PR1 tip `95f88152`**） |
+| PR1 diff 基线 | `6076241e` = `git merge-base 95f88152 e43ee9c4`，也是 PR1 内部那个 upstream 合并 `21d0c268` 的第二父 |
+| 取 PR1 全量 diff | 两种基准都给出 15 文件 / +625 / −11（均已实测）：`git diff 6076241e..95f88152`（对 PR1 tip），或 `git diff e43ee9c4..HEAD`（对当前 HEAD，因 `e43ee9c4` 是其祖先且已含全部 upstream）。⚠️ 但 `git diff e43ee9c4..95f88152` 会给出 267 文件——`e43ee9c4` 不是 `95f88152` 的祖先，勿混用 |
 | PR1 提交 | `93ec9401`、`5c4162e4`、`757edd7c`、`86fe246e`、`f3c8ffd5`、`95f88152` |
 | 改动规模 | 15 个文件，+625 / −11 |
 | 目标 SDK | `tmp_pr1641/ucm-pr` 变体（分支 `feat/kvclient-typed-keys-namespaces`，HEAD `0149f2b`） |
@@ -21,16 +24,27 @@
 ### 0.2 行号规则
 
 - 链接格式 `../Mooncake/<仓库相对路径>#L<行号>`，点击直接跳转。
-- **其余 13 个文件**工作区与 PR1 提交版**完全一致**（已逐文件 `git diff --quiet HEAD` 验证），链接在任何情况下都能命中。
+- **其余 13 个文件**：本文记录的链接行号经机械校验**全部命中当前工作区**（126 个锚点，0 越界、0 缺文件、0 空行）。
+  但其中只有 **7 个**与 `95f88152` 逐字节相同（`kvclient_config.h`、`kvclient_adapter_factory.h`、`distributed_storage_config.h`、`distributed_storage_config.cpp`、`file_storage_config.cpp`、`storage_backend.cpp`、`distributed_storage_config_test.cpp`）。
+  另外 **6 个已被 PR1 之后的 upstream 合并（`c0607326` / `a2841229`）改动**：`environment_variables.h`(+8)、`distributed_storage_backend.h`(+25)、`src/CMakeLists.txt`(+18/−20)、`file_storage.cpp`(+219/−57)、`real_client.cpp`(+128/−51)、`tests/CMakeLists.txt`(+20)。
+  **合并未触碰任何 kvclient 相关行**，所以本文引用的行号恰好没动、仍然命中。
+  ⚠️ 三点提醒：
+  1. 不要据此认为它们与 `95f88152` 一致——`git diff --quiet 95f88152 -- <file>` 对这 6 个会报差异；请用 `git diff --quiet HEAD -- <file>`（HEAD 含该合并）。
+  2. 若你按下面配方 `git worktree add ../Mooncake-pr1 95f88152` 去看这 6 个文件，行号会偏 1~37 行（如 `file_storage.cpp` 本文引 L162，PR1 版实为 L125）。**worktree 配方只适用于两个适配器文件**，这 13 个请直接看工作区。
+  3. `tests/CMakeLists.txt` 是**第三个例外**：除合并外，它还含未提交的 PR2 改动（工作区 L485-493 的 `if(MOONCAKE_KVCLIENT_SDK_FOUND)` / `kvclient_object_storage_adapter_test` 块），与 HEAD 也不一致。
 - **两个适配器文件是例外**，因为工作区正含未提交且持续变动的 PR2 改动：
   - `kvclient_object_storage_adapter.h`（新增 `ToWriteErrorCode`、`RegisterBuffers`、`UnregisterBuffers` 声明）
   - `kvclient_object_storage_adapter.cpp`（`Put`/`PutV`/`PutBatch`/`Get`/`GetBatch`/`Exists` 已被 PR2 实现替换，新增 buffer 注册逻辑）
 
   工作区行号随每次编辑漂移，指向它无法稳定跳转。因此：
 
+  > **实测（2026-11-23）**：这两个文件的代码块共 229 处 `（HEAD:nn）` 标注，**229/229 与 `git show 95f88152:<path>` 的内容逐字吻合**，即链接目标全部正确；
+  > 而主行号 `// Lnn` 有 161 处已对不上**当前**工作区（PR2 在文档写完后又插入了代码，`.cpp` 整体上移约 6 行）。
+  > **结论：跳转一律看 `（HEAD:nn）`，不要看 `// Lnn`。**
+
   | 元素 | 编号基准 |
   | --- | --- |
-  | 代码块右侧标注的主行号 `// Lnn` | 编写时的工作区（仅作阅读参照） |
+  | 代码块右侧标注的主行号 `// Lnn` | **编写时**的工作区（仅作阅读参照，已随 PR2 继续编辑而漂移） |
   | 代码块右侧的 **（HEAD:nn）** | **PR1 提交版 `95f88152`** ← **链接指向这里** |
   | 正文 `**Lnn**` 与链接文字 | 与所在代码块的 `// Lnn` 一致 |
   | 标注 **【PR2，不属本 PR】** 的区域 | 工作区（无 HEAD 对应，链接仅作定位参考） |
@@ -43,16 +57,39 @@
 
 ### 0.3 验证状态
 
+**A. PR1 提交版 `95f88152` 的适配器 TU —— 2026-11-23 针对真实 SDK 重新实测**
+
+用保留在 WSL 的现成环境 `~/kv`（其中 `prefix/` 是**从 `tmp_pr1641/ucm-pr` 真实构建**出的 SDK，含 `libkv_client.so` / `libkv_transport.so` / `libkv_metrics.so`），以该构建的**原始编译命令**（取自 `mc_build/compile_commands.json`，含 `-DMOONCAKE_HAVE_KVCLIENT_SDK=1`、`-Wall -Wextra`、`-O3 -std=gnu++20`）编译 PR1 HEAD 版源码：
+
+| 验证项 | 结果 |
+| --- | --- |
+| 编译退出码 | **0** |
+| `error:` 计数 | **0** |
+| `warning:` 计数 | **0**（在 `-Wall -Wextra` 下） |
+| 产物 | `pr1_head.o`，43784 字节 |
+| PR1 符号存在 | `MakeCacheKey`、`DeleteBatch`、`waitForCompletion`、`ToErrorCode`、`CreateKvClientObjectStorageAdapter` ✓ |
+| PR2 符号缺席 | `RegisterBuffers`、`UnregisterBuffers`、`ToWriteErrorCode` 计数 **0** ✓（证明编的确实是 PR1 版，不是工作区 PR2 版） |
+| 所用 SDK tip | `0149f2b`（`prefix/include/kv_types.h` 已确认为新 API：有 `BinaryKey`/`FromBytes`/`keyResolution`，且 `KeyResolutionConfig` 只剩 `engine` 一个字段） |
+
+做法要点：PR1 HEAD 版源码由 `git show 95f88152:<path>` 导出到独立目录，再以 `-I/home/z00984767/pr1_check/inc` **前置**遮蔽工作区中已被 PR2 改写的三个头文件，因此编到的是 PR1 版而非工作区版。
+
+**B. 2026-11-20 的一次性全量构建（构建目录已按要求删除，仅存档）**
+
 | 验证项 | 结果 |
 | --- | --- |
 | CMake configure（SDK 缺失） | 通过，正确报告 `KVClient SDK not found: adapter disabled` |
 | CMake configure（SDK 存在） | 通过，报告 `KVClient SDK found: include=..., library=...` |
-| 适配器 TU 实际编译 | **通过**，生成 `kvclient_object_storage_adapter.cpp.o`（1.9 MB），零错误零警告 |
+| 适配器 TU 实际编译 | 通过，生成 `kvclient_object_storage_adapter.cpp.o`（1.9 MB），零错误零警告 |
 | `mooncake_store_client_objects` | exit 0，`error:` 计数 0 |
 | `mooncake_store` 静态库 | exit 0 |
 | `distributed_storage_config_test` | **18/18 通过** |
 
 编译环境：WSL Ubuntu，GCC 15，CMake 4.2.3 + Ninja，`Release`。
+
+> **时效说明**：B 表的构建目录随后已按「保持项目整洁」要求删除，故不可复现；且当时链接用的是 stub `.so`（只为驱动 CMake 检测），未与真实 SDK 链接。
+> A 表补上了这一点：**用真实构建的 SDK 头与库、针对 PR1 提交版源码**重新编译，结论仍然成立。
+> 若需重新完整验证，按 §0.3-B 的配置重建，并务必带 `-DMOONCAKE_KVCLIENT_REQUIRED=ON` 强制 SDK 检测——
+> 否则适配器 TU 会被静默跳过（`~/kv/README.md` 记录了 CI 正是这种情况：`.github/` 下 59 个文件无任何 `KVCLIENT` 字样，该文件在 CI 里**永不参与编译**），一次绿灯构建无法证明它能编过。
 
 ---
 
@@ -411,7 +448,12 @@ inline constexpr uint64_t kKvClientHashSeed = 5381;                    // L22（
 }  // namespace                                                        // L24（HEAD:30）
 ```
 
-- **L22** — 哈希种子。**5381 不是随意选的**：SDK `key_resolver.cc:29` 定义 `#define HASH_SEED_VALUE (5381)`，`:153` 用它调 `XXH64`。适配器必须用同一个种子，否则算出的 key 与 SDK 内部解析的 key 不一致 → **PR2 写入的对象 PR1 删不掉**。已逐字节比对确认一致（详见 §17.1）。
+- **L22** — 哈希种子 `5381`，与 SDK `key_resolver.cc:29` 的 `#define HASH_SEED_VALUE (5381)` 同值，`:153` 用它调 `XXH64`；打包方式也与 `:154-157` 逐字节一致（详见 §19.1）。
+
+  ⚠️ **但这个一致性并不是「PR2 写的对象 PR1 能删掉」的前提**——适配器四个调用点（[.cpp:273](../Mooncake/mooncake-store/src/storage/distributed/kvclient/kvclient_object_storage_adapter.cpp#L221)、`:383`、`:481`、`:550`）**全部**走 `CacheKey::FromBytes(MakeCacheKey(...))`，而 SDK 的 `KeyResolver::Resolve`（`key_resolver.cc:145-146`）对 `TryGetBinaryKey()` 命中的输入**直接短路直通**，根本不会调 `XXH64`。所以：
+  - PR1↔PR2 的键一致性来自**适配器自身只用同一个 `MakeCacheKey`**，与种子取什么值无关——即使种子改成 1234，写和删仍然配对。
+  - 匹配 5381 的真正意义是**与 SDK 原生的字符串键路径互通**：SDK 自己的 GENERIC 分支对同一个逻辑键算出的也是 `XXH64(key, 5381)` 的同样 8 字节，于是绕过 Mooncake、直接用引擎字符串键访问同一份 KV 数据的客户端，与经由本适配器访问的，会落在同一个物理键上。
+  - 因此这是一条**互通性/约定**约束，而非内部自洽性约束。写死 5381 仍然必要（否则互通断裂），但把它说成「否则删不掉」会误导后续维护者。
 - **L20 / L24** — 匿名命名空间给内部链接，避免与其他 TU 的同名符号冲突。
 
 **PR1 在此处还有一个 helper（HEAD:21-28），工作区已被 PR2 移除：**
@@ -502,7 +544,7 @@ tl::expected<void, ErrorCode> KvClientObjectStorageAdapter::Init() {    // L40�
 - **L51 用局部变量 `client` 而非直接写 `kv_client_`，是本函数最关键的设计。** 这是修复过的缺陷：原先直接赋值给成员，导致后续步骤失败时 `kv_client_` 已被污染，而 SDK 的 `Init` **不是幂等的**（`kv_client_impl.cc:167` 无条件设 `initialized_ = true`），重试会撞上"半初始化的客户端"从而假成功。
 - **L55** — 默认构造 `KvClientConfig`。SDK `kv_types.h:245-262` 的默认值：`maxInflightTasks=1024`、`defaultWaitTimeoutMs=100`、`timeoutMs=100`、`sharedProviderMode=INDEPENDENT`。
 - **L56-L57** — 从文件加载，SDK `kv_types.h:247` 声明 `static Status LoadFromFile(const std::string&, KvClientConfig&)`。这是出参式 API，失败时 `cfg` 可能部分填充，所以直接返回、不继续使用。配置文件错误 → `INVALID_PARAMS`。
-- **L58** — 值初始化 `KeyResolutionConfig`（SDK `kv_types.h:245-250`）。该结构在当前 tip `0149f2b` 上**只剩一个字段** `InferenceEngine engine{GENERIC}`（早期版本还有 `layerCount` / `layerSlotBytes`，已被删除），所以 `= {}` 等价于注释所说的“强制 GENERIC”。
+- **L58** — 值初始化 `KeyResolutionConfig`（SDK `kv_types.h:241-243`）。该结构在当前 tip `0149f2b` 上**只剩一个字段** `InferenceEngine engine{GENERIC}`（早期版本还有 `layerCount` / `layerSlotBytes`，已被删除），所以 `= {}` 等价于注释所说的“强制 GENERIC”。
   - `LoadFromFile` 会从配置文件解析 `keyResolution.engine`（SDK `config_utils.cc:166-173` 支持 `VLLM_ASCEND` / `SGLANG` / `GENERIC`），复位可覆盖配置文件里的任意取值。
   - **复位在当前 tip 上的可观测效果为零**（实测）：适配器只提交 `BinaryKey`，而 `KeyResolver::Resolve`（`key_resolver.cc:140-161`）对 `TryGetBinaryKey()` 命中的输入**直接短路**——`resolvedKey.keyBytes = *bytes;`，根本不会调用引擎相关的 `ParseEngineKey`。三个解析器（`VllmKeyResolver` :49、`SglangKeyResolver` :90、`GenericKeyResolver` :129）都只覆写 `ParseEngineKey`，`Resolve` 是基类单一实现，因此 engine 取值对二进制键没有影响。
   - 所以这一行现在是**防御性的**：它保证适配器不依赖 engine 配置，即使将来 SDK 让 `Resolve` 对二进制键也变得 engine-sensitive，行为也不会变。保留无害，`Force GENERIC` 的注释仍然准确。
@@ -592,11 +634,11 @@ ErrorCode KvClientObjectStorageAdapter::ToErrorCode(const kv::Status& status) { 
 
 - **L101-L104** — 调用方错误（参数非法、buffer 未注册 / 不支持）→ `INVALID_PARAMS`，不应重试。`BUFFER_*` 两项在 PR1 的 Delete 路径不会出现（Delete 不需要注册 buffer），是给 PR2 的 Put / Get 预留的正确映射。
 - **L105-L108** — 资源耗尽类：超出创建大小上限、资源忙。映射到 `NO_AVAILABLE_HANDLE`，上层可退避重试。
-- **L109-L110** — 兜底。**覆盖性核对**：SDK `StatusCode` 共 24 个枚举值，此 switch 显式覆盖 19 个，其余落入 default → `INTERNAL_ERROR`：
+- **L109-L110** — 兜底。**覆盖性核对**：SDK `StatusCode` 共 **34** 个枚举值（`kv_types.h:71-109`：基础 16 + `ENTRY_*` 7 + `CQE_*` 11），此 switch 有 **20** 个显式 `case` 标签（`OK` + 19 个错误码），其余 14 个落入 default → `INTERNAL_ERROR`：
 
   `PARTIAL_FAILED`、`TASK_NOT_FOUND`、`INTERNAL_ERROR`、`ENTRY_RETRY_ADVISED`、`ENTRY_NO_RETRY_ADVISED`、`ENTRY_DATA_NOT_EXIST`、`ENTRY_KEY_EXIST`、`CQE_INVALID_COMMAND_OPCODE`、`CQE_INVALID_FIELD_IN_COMMAND`、`CQE_INTERNAL_ERROR`、`CQE_WRITE_FAULT`、`CQE_UNRECOVERED_READ_ERROR`、`CQE_KEY_ALREADY_EXISTED`、`CQE_CHECK_RESULT_BUFFER`
 
-  已逐一核对：**没有把重要错误码误落 default 的情况**。`PARTIAL_FAILED` / `TASK_NOT_FOUND` 由 `waitForCompletion` 在调 `ToErrorCode` 之前就分流掉了。
+  已逐一核对（34 − 20 = 14，与下面列出的 14 个名字完全对应）：**没有把重要错误码误落 default 的情况**。`PARTIAL_FAILED` / `TASK_NOT_FOUND` 由 `waitForCompletion` 在调 `ToErrorCode` 之前就分流掉了。
 
 ---
 
@@ -703,7 +745,7 @@ KvClientObjectStorageAdapter::waitForCompletion(kv::TaskId task_id,    // L115�
 ```
 
 - **L152-L158** — **@ayaka836 规则的另一半，也是提交 `95f88152` 的核心修改。** 走到 default 的是任务级**终态错误**（`NOT_FOUND`、`CONNECTION_ERROR`、`IO_ERROR`、`NOT_INITIALIZED`、`INVALID_ARGUMENT` 等）。
-- **L153-L155** — 注释解释了为什么不能读 `entryStatus`：SDK 在提交时会把 `entryStatus` 预填为 `OK`（`trans_task_utils.cc:146-148` 的 `std::fill(entryStatus.begin(), entryStatus.end(), ... Status::OK())`）。若任务级失败后仍读它，会把**整体失败误判为逐条成功** → 假成功。这正是修改前的缺陷。
+- **L153-L155** — 注释解释了为什么不能读 `entryStatus`：SDK 在**提交期**就把 `entryStatus` 预填为 `OK`——`kv_client_impl.cc:510`（`DeleteAsync` 走的那个 `CacheKey` 重载）在 `taskManager_.Submit(...)` 之前执行 `ctx->entryStatus.assign(keys.size(), Status::OK());`（写入路径对应 `:446`）。若任务级失败后仍读它，会把**整体失败误判为逐条成功** → 假成功。这正是修改前的缺陷。完整证据见 §19.6。
 - **L156** — 终态：IO 已结束，资源可释放。
 - **L157** — 整体错误传播到每个已提交条目。
 
@@ -757,12 +799,13 @@ kv::BinaryKey KvClientObjectStorageAdapter::MakeCacheKey(              // L172�
   这个一致性是 PR1 Delete 能命中 PR2 写入对象的前提。
 - **L176-L178** — 全零 key 守卫。依据是 SDK `kv_protocol.cc:116-120` 的 `IsCacheKeyAllZero`：
   ```cpp
-  static bool IsCacheKeyAllZero(const CacheKey& key) {
-      return std::all_of(CacheKeyView(key).begin(), CacheKeyView(key).end(),
-                         [](char value) { return value == '\0'; });
+  static bool IsCacheKeyAllZero(const BinaryKey& key)
+  {
+      return std::all_of(key.begin(), key.end(),
+                         [](std::byte value) { return value == std::byte{0}; });
   }
   ```
-  在 `kv_protocol.cc` 的 **:216（Store）、:356（Retrieve）、:517（Batch）、:707（Batch）** 四处拒绝全零键，返回 `INVALID_ARGUMENT "key is all zeros"`。`XXH64` 有 2⁻⁶⁴ 概率返回 0；不加守卫，那个逻辑键将永远无法写入 / 删除。
+  在 `kv_protocol.cc` **六处**拒绝全零键，全部返回 `INVALID_ARGUMENT`：`:216` Store、`:356` Retrieve、`:517` BatchStore、`:707` BatchRetrieve、`:889` **Delete**（"key[i] is all zeros in Delete request"）、`:1040` **Exist**。`XXH64` 有 2⁻⁶⁴ 概率返回 0；不加守卫，那个逻辑键将永远无法写入 / 删除。
 
   **映射到 5381 而非引入第二个常量**，避免多一个需要维护的魔数——注释明确说明了这个取舍。代价是 `hash==0` 的键会与"哈希值恰为 5381"的键碰撞，但后者概率同为 2⁻⁶⁴，实际影响可忽略。
 - **L179** — `{}` 值初始化 8 字节数组。`kv::BinaryKey` = `std::array<std::byte, 8>`（SDK `kv_types.h:42-43`）。
@@ -795,7 +838,8 @@ tl::expected<void, ErrorCode> KvClientObjectStorageAdapter::Delete(     // L215�
 
 - **L217** — 栈上 1 元素数组。`std::span<const std::string>` 能从 `std::array<std::string, 1>` 隐式构造（span 有接受 contiguous range 的构造函数），**零堆分配**。
 - **L218** — **单键删除复用批量路径**，避免两套逻辑不一致。这是 @ayaka836 指出的缺陷：原先 `Delete` 与 `DeleteBatch` 行为不同。
-- **L219-L221** — `empty()` 在 `keys.size()==1` 时恒为假（`DeleteBatch` 两条返回路径都产出 1 个元素），所以是**防御性死分支**。保留它与姊妹适配器 `KvcsObjectStorageAdapter::Delete`（[kvcs_object_storage_adapter.cpp:221-227](../Mooncake/mooncake-store/src/storage/distributed/kvcs/kvcs_object_storage_adapter.cpp#L221)）写法一致。
+- **L219-L221** — `empty()` 在 `keys.size()==1` 时恒为假（`DeleteBatch` 两条返回路径都产出 1 个元素），所以是**防御性死分支**。
+  注：姊妹适配器 `KvcsObjectStorageAdapter::Delete`（[kvcs_object_storage_adapter.cpp:221-226](../Mooncake/mooncake-store/src/storage/distributed/kvcs/kvcs_object_storage_adapter.cpp#L221)）**并没有**这个守卫——它直接 `return std::move(result.front());`。所以这处是 kvclient 比 kvcs **更**保守，而非「写法一致」；两者共享的只是「`Delete` = `DeleteBatch` 单条包装」这一结构。
 - **L221** — `std::move(results.front())` 避免拷贝 `expected`。
 
 ---
@@ -1225,7 +1269,7 @@ option(MOONCAKE_KVCLIENT_REQUIRED                                         # L233
 - **L228** — 先置 OFF，后面各分支按需置 ON。
 - **L231-L232** — `CACHE PATH` 让用户可用 `-DMOONCAKE_KVCLIENT_SDK_ROOT=...` 指定，并在 CMake GUI / ccmake 里可见。默认空串。
 - **L233-L234** — `option` 创建布尔 cache 变量，默认 OFF（保持可选依赖的向后兼容）。
-- **L229-L230 的注释有一处不准确**：它建议指向"SDK source tree"，但源码树的 out-of-source 构建产物路径不在 `PATH_SUFFIXES` 里，照做会 FATAL（详见 §19.2）。
+- **L229-L230 的注释有一处不准确**：它建议指向"SDK source tree"，但源码树的 out-of-source 构建产物路径不在 `PATH_SUFFIXES` 里，照做会 FATAL（详见 §20.2【中】）。
 
 #### pkg-config 路径
 
@@ -1264,7 +1308,7 @@ else()                                                                   # L247
 
 - **L248** — 下划线前缀表示内部变量（CMake 惯例）。空列表初始化。
 - **L249-L251** — cache 变量形式的 root 作为 hint。
-- **L252-L254** — 环境变量形式的 root 也作为 hint。**但 L290 的 fail-loud 闸门只检查 L249 的 cache 变量**，这就是 §19.4 那条不一致的来源。
+- **L252-L254** — 环境变量形式的 root 也作为 hint。**但 L290 的 fail-loud 闸门只检查 L249 的 cache 变量**，这就是 §20.2【低】第 2 条那个不一致的来源。
 
 ```cmake
   find_path(MOONCAKE_KVCLIENT_INCLUDE_DIR                                 # L255
@@ -1283,10 +1327,10 @@ else()                                                                   # L247
                              build/src build)                            # L267-L268
 ```
 
-- **L256** — 探测头文件名 `kv_client.h`。**仅按文件名匹配，不校验 API 变体** → §19.1 里"指向旧 API SDK 会 configure 绿灯、编译红灯"的根源。
+- **L256** — 探测头文件名 `kv_client.h`。**仅按文件名匹配，不校验 API 变体** → §20.2【高】里"指向旧 API SDK 会 configure 绿灯、编译红灯"的根源。
 - **L258** — 三个后缀覆盖：标准 install 前缀（`include`）、SDK 源码树布局（`kv_semantics/include`，已确认两个快照都是这个布局）、反向布局（`include/kv_semantics`）。
 - **L260 / L265** — 库名不带 `lib` 前缀和 `.so` 后缀，`find_library` 会自动补全平台约定。
-- **L262-L263 / L267-L268** — 库搜索后缀。`kv_semantics/src` 和 `ucm/store/asu` 精确对应 SDK 的 install 规则（`kv_semantics/src/CMakeLists.txt:141-142`：`LIBRARY DESTINATION ${INSTALL_REL_PATH}` 和 `ucm/store/asu`）。`build/src` 对应单独构建 `kv_semantics` 子项目的布局。**缺 `build/kv_semantics/src`**（顶层构建的产物路径）→ §19.2。
+- **L262-L263 / L267-L268** — 库搜索后缀。`kv_semantics/src` 和 `ucm/store/asu` 精确对应 SDK 的 install 规则（`kv_semantics/src/CMakeLists.txt:142-143`：`LIBRARY DESTINATION ${INSTALL_REL_PATH}` 和 `ucm/store/asu`）。`build/src` 对应单独构建 `kv_semantics` 子项目的布局。**缺 `build/kv_semantics/src`**（顶层构建的产物路径）→ §20.2【中】。
 - `kv_transport` 单独查找是因为 SDK 把传输层拆成独立共享库（`kv_semantics/src/CMakeLists.txt:20`），`kv_client` 运行时依赖它。
 
 ```cmake
@@ -1343,7 +1387,7 @@ set(MOONCAKE_KVCLIENT_SDK_FOUND                                            # L30
     PARENT_SCOPE)                                                          # L307
 ```
 
-- **L290** — **fail-loud 闸门**：显式要求（`REQUIRED=ON`）或显式指定了 root（说明用户**打算**用 kvclient）却找不到 → 中止 configure。**这是消除"静默跳过"的核心机制。** 缺陷：只测 cache 变量，不测 `DEFINED ENV{...}`（§19.4）。
+- **L290** — **fail-loud 闸门**：显式要求（`REQUIRED=ON`）或显式指定了 root（说明用户**打算**用 kvclient）却找不到 → 中止 configure。**这是消除"静默跳过"的核心机制。** 缺陷：只测 cache 变量，不测 `DEFINED ENV{...}`（§20.2【低】第 2 条）。
 - **L293-L297** — 错误信息给出三条可操作的修复路径。
 - **L299-L303** — 未显式要求时降级为 STATUS，保持"可选依赖"语义。文案也告诉用户如何升级为致命。
 - **L305-L307** — `PARENT_SCOPE` 把结果传给 `mooncake-store/` 目录作用域。因为 `add_subdirectory(src)` 在 `add_subdirectory(tests)` **之前**（[mooncake-store/CMakeLists.txt:63](../Mooncake/mooncake-store/CMakeLists.txt#L63) vs [:80](../Mooncake/mooncake-store/CMakeLists.txt#L80)），所以 [tests/CMakeLists.txt:402](../Mooncake/mooncake-store/tests/CMakeLists.txt#L402) 能读到正确值。三条路径（pkg-config 找到 / find 找到 / 未找到）都会执行到这里，**变量总是被设置** ✓
@@ -1553,7 +1597,7 @@ TEST(DistributedStorageConfigValidationTest,                                 // 
 
 ## 19. 交叉验证证据
 
-### 19.1 key 编码一致性（最关键的正确性前提）
+### 19.1 key 编码一致性（互通性约定，**非** PR1↔PR2 自洽的前提）
 
 | 项 | 适配器 | SDK | 一致 |
 | --- | --- | --- | --- |
@@ -1562,7 +1606,11 @@ TEST(DistributedStorageConfigValidationTest,                                 // 
 | 字节序 | 显式小端（[.cpp:188-189](../Mooncake/mooncake-store/src/storage/distributed/kvclient/kvclient_object_storage_adapter.cpp#L188)） | `hash & 0xff; hash >>= 8`（`key_resolver.cc:154-157`） | ✓ |
 | 键长度 | 8 字节 | `kCacheKeySizeBytes = 8`（`kv_types.h:42`） | ✓ |
 
-**意义**：GENERIC 路径下 SDK 对 `BinaryKey` 输入**原样返回**（`key_resolver.cc:145-147` 的 `TryGetBinaryKey()` 命中即 `resolvedKey.keyBytes = *bytes;`）。所以适配器自算的键 == SDK 解析的键 → **PR2 写入的对象，PR1 的 Delete 能命中**。
+**意义（注意因果，勿读反）**：适配器四个调用点全部走 `CacheKey::FromBytes(MakeCacheKey(...))`，而 SDK 对 `BinaryKey` 输入**原样直通**（`key_resolver.cc:145-146` 的 `TryGetBinaryKey()` 命中即 `resolvedKey.keyBytes = *bytes;`，**不会**调用 `XXH64`）。
+
+- 所以「**PR2 写入的对象，PR1 的 Delete 能命中**」成立，但其依据是**适配器内部只用同一个 `MakeCacheKey`**（写与删自洽），**不是**种子与 SDK 相同。把种子改成任意值，写删仍然配对。
+- 上表四行「一致 ✓」的真正价值是**互通性**：SDK 自己的 GENERIC 字符串键分支（`key_resolver.cc:153-157`）对同一逻辑键算出的也是 `XXH64(key, 5381)` 的同样 8 字节，因此绕过 Mooncake、直接以引擎字符串键访问同一份 KV 数据的客户端，会与本适配器落在同一物理键上。
+- 结论：种子与字节序**必须**保持 5381 / 小端（否则互通断裂），但这是外部约定，不是 PR1↔PR2 自洽的前提。
 
 ### 19.2 `Wait(taskId, 0, ...)` 语义
 
@@ -1595,7 +1643,7 @@ Status ClientTaskManager::Wait(TaskId taskId, std::uint64_t waitTimeoutMs, TaskR
 
 ### 19.4 全零 key 被协议拒绝
 
-`kv_protocol.cc:116-120` 定义 `IsCacheKeyAllZero`，在 **:216（Store）、:356（Retrieve）、:517（Batch）、:707（Batch）** 四处拒绝，返回 `INVALID_ARGUMENT "key is all zeros"`。
+`kv_protocol.cc:116-120` 定义 `IsCacheKeyAllZero`，在 **:216（Store）、:356（Retrieve）、:517（BatchStore）、:707（BatchRetrieve）、:889（Delete）、:1040（Exist）** 六处拒绝，返回 `INVALID_ARGUMENT`。
 
 → 适配器 [.cpp:184](../Mooncake/mooncake-store/src/storage/distributed/kvclient/kvclient_object_storage_adapter.cpp#L184) 的 `hash == 0 → 5381` 守卫**必要**。
 
@@ -1620,16 +1668,27 @@ if (opType == AsuOpType::DELETE) {
 
 ### 19.6 `entryStatus` 预填为 OK 的证据
 
-`trans_task_utils.cc:146-148`：
+**证据在提交期，不在完成期**（本条曾引错出处，已更正）。真正的预填发生在 `KvClientImpl::SubmitAsync`，就在 `taskManager_.Submit(...)` **之前**：
 
 ```cpp
-if (status.ok()) {
-    std::fill(entryStatus.begin(), entryStatus.end(), isQuery ? keyExist : Status::OK());
-    return;
-}
+// kv_client_impl.cc:446  —— SubmitAsync(opType, const std::vector<KVBuffer>& entries, ...)
+ctx->entryStatus.assign(entries.size(), Status::OK());
+
+auto status = taskManager_.Submit(std::move(ctx), taskId);
+```
+```cpp
+// kv_client_impl.cc:510  —— SubmitAsync(opType, const std::vector<CacheKey>& keys, ...)
+ctx->entryStatus.assign(keys.size(), Status::OK());
+ctx->queryResult.exists.assign(opType == AsuOpType::QUERY ? keys.size() : 0, 0);
+
+auto status = taskManager_.Submit(std::move(ctx), taskId);
 ```
 
-→ 任务级失败时 `entryStatus` 可能仍持有提交期的 `OK`，所以 [.cpp:158-164](../Mooncake/mooncake-store/src/storage/distributed/kvclient/kvclient_object_storage_adapter.cpp#L158) 的 default 分支**必须**用整体错误覆盖，不能读它。
+PR1 的 `DeleteBatch` 走 `DeleteAsync` → `:510` 那个 `CacheKey` 重载，所以提交后 `entryStatus` 里**每一项都是 `OK`**。
+
+→ 若任务级最终失败而适配器仍去读 `entryStatus`，就会把**整体失败误判为逐条成功**。这正是 [.cpp:158-164](../Mooncake/mooncake-store/src/storage/distributed/kvclient/kvclient_object_storage_adapter.cpp#L158) 的 default 分支必须用整体错误覆盖、而不能读它的原因。
+
+⚠️ 早前版本在此引用 `trans_task_utils.cc:146-148` 的 `std::fill(..., Status::OK())`，那是**错误证据**：它位于 `FillEntryStatusFromCqeResult`（定义 `:139`，由 `trans_task_executor.cc:438` 在 **CQE 完成期**调用），且该 `fill` 只在 `if (status.ok())` 分支内执行——失败时 `:159-160` 反而用错误覆盖。用它证明「失败后仍是 OK」与其自身代码相悖。
 
 ---
 
@@ -1660,19 +1719,23 @@ PR1 依赖的三个符号（[adapter .h:54](../Mooncake/mooncake-store/include/s
 
 [CMakeLists.txt:262-263](../Mooncake/mooncake-store/src/CMakeLists.txt#L262) 与 [:267-268](../Mooncake/mooncake-store/src/CMakeLists.txt#L267) 的库搜索后缀为 `lib lib64 kv_semantics/src ucm/store/asu src build/src build`。
 
-但 SDK 顶层构建（`BUILD_UCM_ASU=ON`，默认 OFF，见 SDK `CMakeLists.txt:13,72-73`）会把 `libkv_client.so` 输出到 `<sdk>/build/kv_semantics/src`（`kv_semantics/src/CMakeLists.txt:120` 无 `LIBRARY_OUTPUT_DIRECTORY` 覆盖）。而 [CMakeLists.txt:229-230](../Mooncake/mooncake-store/src/CMakeLists.txt#L229) 的注释恰恰建议"point this at the SDK source tree"。
+但 SDK 顶层构建（`BUILD_UCM_ASU=ON`，默认 OFF，见 SDK `CMakeLists.txt:13,72-73`）会把 `libkv_client.so` 输出到 `<sdk>/build/kv_semantics/src`（`kv_semantics/src/CMakeLists.txt:121` 的 `add_library(kv_client SHARED ...)` 无 `LIBRARY_OUTPUT_DIRECTORY` 覆盖）。而 [CMakeLists.txt:229-230](../Mooncake/mooncake-store/src/CMakeLists.txt#L229) 的注释恰恰建议"point this at the SDK source tree"。
 
-结果：`find_path` 命中头文件，`find_library` 失败，`SDK_ROOT` 非空 → [L290-L297](../Mooncake/mooncake-store/src/CMakeLists.txt#L290) FATAL_ERROR，**即使 SDK 已正常构建**。指向 `<sdk>/build` 也不行——SDK 的 install 规则（`kv_semantics/src/CMakeLists.txt:141-142`）只装库不装头文件。
+结果：`find_path` 命中头文件，`find_library` 失败，`SDK_ROOT` 非空 → [L290-L297](../Mooncake/mooncake-store/src/CMakeLists.txt#L290) FATAL_ERROR，**即使 SDK 已正常构建**。指向 `<sdk>/build` 也不行——SDK 的 install 规则（`kv_semantics/src/CMakeLists.txt:142-143`）只装库不装头文件。
 
 **修复**：两处 `PATH_SUFFIXES` 各加 `build/kv_semantics/src`。
 
 #### 【低】两项小缺陷
 
-1. **`Completion::terminal` 是只写不读的死字段** — [adapter .h:50](../Mooncake/mooncake-store/include/storage/distributed/kvclient/kvclient_object_storage_adapter.h#L50) 声明，[.cpp:136](../Mooncake/mooncake-store/src/storage/distributed/kvclient/kvclient_object_storage_adapter.cpp#L136) / [:142](../Mooncake/mooncake-store/src/storage/distributed/kvclient/kvclient_object_storage_adapter.cpp#L142) / [:155](../Mooncake/mooncake-store/src/storage/distributed/kvclient/kvclient_object_storage_adapter.cpp#L155) / [:162](../Mooncake/mooncake-store/src/storage/distributed/kvclient/kvclient_object_storage_adapter.cpp#L162) 四处赋值，但 `DeleteBatch`（[L258-L265](../Mooncake/mooncake-store/src/storage/distributed/kvclient/kvclient_object_storage_adapter.cpp#L236-L243)）只读 `entryStatus`。全仓库 grep `.terminal` / `->terminal` 在适配器外无任何命中。它承载的是"非终态需保留 buffer / handle"语义，但 PR1 没有需要保留的资源（Delete 不注册 buffer）。属为 PR2 预留的死代码。
+1. **`Completion::terminal` 在 PR1 中只写不读（PR2 已开始使用）** — [adapter .h:50](../Mooncake/mooncake-store/include/storage/distributed/kvclient/kvclient_object_storage_adapter.h#L50) 声明；PR1 提交版 [.cpp:136](../Mooncake/mooncake-store/src/storage/distributed/kvclient/kvclient_object_storage_adapter.cpp#L136) / [:142](../Mooncake/mooncake-store/src/storage/distributed/kvclient/kvclient_object_storage_adapter.cpp#L142) / [:155](../Mooncake/mooncake-store/src/storage/distributed/kvclient/kvclient_object_storage_adapter.cpp#L155) / [:162](../Mooncake/mooncake-store/src/storage/distributed/kvclient/kvclient_object_storage_adapter.cpp#L162) 四处赋值，但 `DeleteBatch`（[L258-L265](../Mooncake/mooncake-store/src/storage/distributed/kvclient/kvclient_object_storage_adapter.cpp#L236-L243)）只读 `entryStatus`。在 `95f88152` 上 grep `.terminal` 只有这 4 处写入、**0 处读取**。
+
+   它承载的是「非终态需保留 buffer / handle」语义，而 PR1 没有需要保留的资源（`Delete` 不注册 buffer），所以在 PR1 里确属预留的死代码。
+
+   ✅ **更新（2026-11-23）**：当前工作区的 PR2 实现**已经在读**该字段——`kvclient_object_storage_adapter.cpp:411`、`:508`、`:558` 三处 `if (!completion.terminal)`，用于在任务非终态时不释放已注册的 buffer handle。所以本条**只对 PR1 成立，PR2 无需再补**。
 
 2. **env var 形式的 `SDK_ROOT` 不触发 fail-loud** — [L252-L253](../Mooncake/mooncake-store/src/CMakeLists.txt#L252) 把 `ENV{MOONCAKE_KVCLIENT_SDK_ROOT}` 当作搜索 hint，但 [L290](../Mooncake/mooncake-store/src/CMakeLists.txt#L290) 的闸门只测 cache 变量。CMake 不会把环境变量灌进同名 cache 变量，所以 `export MOONCAKE_KVCLIENT_SDK_ROOT=<源码树>` 时只走 [L299-L303](../Mooncake/mooncake-store/src/CMakeLists.txt#L299) 的 STATUS 跳过分支——这正是 `f3c8ffd5` 声称要消除的"静默跳过"场景。**修复**：条件里加 `OR DEFINED ENV{MOONCAKE_KVCLIENT_SDK_ROOT}`。
 
-另有一处**不算缺陷**：`Delete` 的 `results.empty()`（[.cpp:197](../Mooncake/mooncake-store/src/storage/distributed/kvclient/kvclient_object_storage_adapter.cpp#L197)）在 `keys.size()==1` 时恒为假，是防御性死分支，但与姊妹适配器写法一致，保留无妨。
+另有一处**不算缺陷**：`Delete` 的 `results.empty()`（[.cpp:197](../Mooncake/mooncake-store/src/storage/distributed/kvclient/kvclient_object_storage_adapter.cpp#L197)）在 `keys.size()==1` 时恒为假，是防御性死分支，保留无妨。（更正：kvcs 的 `Delete` 其实**没有**这个守卫——它直接 `return std::move(result.front());`，所以这不是「与姊妹适配器写法一致」，而是 kvclient 单方面更保守；两者一致的是「`Delete` 包装 `DeleteBatch`」这一结构。）
 
 ### 20.3 需确认的分期问题
 
@@ -1683,9 +1746,9 @@ if (dfs_storage_backend_ && dfs_storage_backend_->UsesKvcs() && !removed_keys.em
     const auto deleted = dfs_storage_backend_->BatchDeleteObjects(removed_keys);
 ```
 
-`Client::BatchRemove` 对 kvclient 走不到这里，所以 **PR1 的 Delete / DeleteBatch 目前没有生产调用路径**。在 PR1 阶段无害（Put 还是 `NOT_SUPPORTED`，没有对象被写入，不存在泄漏），但 PR2 落地写入后**必须**把这个门控扩成 `UsesKvcs() || UsesKvClient()`，否则对象只写不删。
+`Client::BatchRemove` 对 kvclient 走不到这里，所以 **PR1 的 Delete / DeleteBatch 目前没有生产调用路径**。在 PR1 阶段无害（`Put` 还是 `NOT_SUPPORTED`，没有对象被写入，不存在泄漏），但 PR2 落地写入后**必须**把这个门控扩成 `UsesKvcs() || UsesKvClient()`，否则对象只写不删。（复核：2026-11-23 工作区该门控仍为 `UsesKvcs()`，尚未扩到 kvclient。）
 
-同类门控清单（全部待 PR2 / PR3 处理）：
+同类门控清单（2026-11-23 复核，逐项标注归属与现状）：
 
 | 位置 | 用途 | 是否需扩到 kvclient |
 | --- | --- | --- |
@@ -1695,7 +1758,7 @@ if (dfs_storage_backend_ && dfs_storage_backend_->UsesKvcs() && !removed_keys.em
 | [client_service.cpp:3912](../Mooncake/mooncake-store/src/client_service.cpp#L3912) | `RemoveAll` 返回 `NOT_SUPPORTED` | 待定 |
 | [client_service.cpp:3947](../Mooncake/mooncake-store/src/client_service.cpp#L3947) | `BatchRemove` 调 `BatchDeleteObjects` | **PR2 必须** |
 | [client_service.cpp:5491](../Mooncake/mooncake-store/src/client_service.cpp#L5491) | `ReconcileMissingKvcsReplica` | PR3（miss 自愈） |
-| [master_service.cpp:832-833](../Mooncake/mooncake-store/src/master_service.cpp#L832) | master 侧 `enable_dfs_` | **PR2 必须**（否则 master 不启用 DFS） |
+| [master_service.cpp:833-834](../Mooncake/mooncake-store/src/master_service.cpp#L833) | master 侧 `enable_dfs_` | ✅ **PR2 已完成**（2026-11-23 实测）：工作区该处已是 `DfsEnablementConfig::FromEnvironment().enabled \|\| dfs_config.UsesKvcs() \|\| dfs_config.UsesKvClient();`，PR1 提交版尚无 kvclient 分支 |
 
 ---
 
