@@ -33,7 +33,7 @@
   2. 若你按下面配方 `git worktree add ../Mooncake-pr1 95f88152` 去看这 6 个文件，行号会偏 1~37 行（如 `file_storage.cpp` 本文引 L162，PR1 版实为 L125）。**worktree 配方只适用于两个适配器文件**，这 13 个请直接看工作区。
   3. `tests/CMakeLists.txt` 是**第三个例外**：除合并外，它还含未提交的 PR2 改动（工作区 L485-493 的 `if(MOONCAKE_KVCLIENT_SDK_FOUND)` / `kvclient_object_storage_adapter_test` 块），与 HEAD 也不一致。
 - **两个适配器文件是例外**，因为工作区正含未提交且持续变动的 PR2 改动：
-  - `kvclient_object_storage_adapter.h`（新增 `ToWriteErrorCode`、`RegisterBuffers`、`UnregisterBuffers` 声明）
+  - `kvclient_object_storage_adapter.h`（`ToErrorCode` 增加 `bool is_write` 参数，新增 `RegisterBuffers`、`UnregisterBuffers` 声明）
   - `kvclient_object_storage_adapter.cpp`（`Put`/`PutV`/`PutBatch`/`Get`/`GetBatch`/`Exists` 已被 PR2 实现替换，新增 buffer 注册逻辑）
 
   工作区行号随每次编辑漂移，指向它无法稳定跳转。因此：
@@ -68,7 +68,7 @@
 | `warning:` 计数 | **0**（在 `-Wall -Wextra` 下） |
 | 产物 | `pr1_head.o`，43784 字节 |
 | PR1 符号存在 | `MakeCacheKey`、`DeleteBatch`、`waitForCompletion`、`ToErrorCode`、`CreateKvClientObjectStorageAdapter` ✓ |
-| PR2 符号缺席 | `RegisterBuffers`、`UnregisterBuffers`、`ToWriteErrorCode` 计数 **0** ✓（证明编的确实是 PR1 版，不是工作区 PR2 版） |
+| PR2 符号缺席 | `RegisterBuffers`、`UnregisterBuffers` 计数 **0** ✓，且 `ToErrorCode` 只有单参版本（工作区 PR2 版是双参）——证明编的确实是 PR1 版，不是工作区 PR2 版 |
 | 所用 SDK tip | `0149f2b`（`prefix/include/kv_types.h` 已确认为新 API：有 `BinaryKey`/`FromBytes`/`keyResolution`，且 `KeyResolutionConfig` 只剩 `engine` 一个字段） |
 
 做法要点：PR1 HEAD 版源码由 `git show 95f88152:<path>` 导出到独立目录，再以 `-I/home/z00984767/pr1_check/inc` **前置**遮蔽工作区中已被 PR2 改写的三个头文件，因此编到的是 PR1 版而非工作区版。
@@ -369,16 +369,16 @@ class KvClientObjectStorageAdapter final : public ObjectStorageAdapter {  // L20
                                                                        // L54
     kv::BinaryKey MakeCacheKey(std::string_view logical_key) const;     // L55（HEAD:54）
     Completion waitForCompletion(kv::TaskId task_id, size_t entry_count);  // L56（HEAD:55）
-    static ErrorCode ToErrorCode(const kv::Status& status);            // L57（HEAD:56）
     // Store entries share the SDK's entry decoder with loads, so the codes
-    // that mean "object missing" on a read mean "store failed" on a write.  // L58-L59
-    static ErrorCode ToWriteErrorCode(const kv::Status& status);        // L60
+    // that mean "object missing" on a read mean "store failed" on a write.
+    // Callers must state the direction; the parameter deliberately has no
+    // default.                                                       // L58-L60
+    static ErrorCode ToErrorCode(const kv::Status& status, bool is_write);  // L61
     // Registers one host range with the SDK; the returned handle stays valid
-    // until it is passed to UnregisterBuffers.                        // L61-L62
-    tl::expected<uint64_t, ErrorCode> RegisterBuffers(void* ptr, size_t size);  // L63
-    // Releases the handles, logging any failure the SDK cannot retry.  // L64
-    void UnregisterBuffers(const std::vector<uint64_t>& handles);       // L65
-                                                                       // L66
+    // until it is passed to UnregisterBuffers.                        // L62-L63
+    tl::expected<uint64_t, ErrorCode> RegisterBuffers(void* ptr, size_t size);  // L64
+    // Releases the handles, logging any failure the SDK cannot retry.  // L65
+    void UnregisterBuffers(const std::vector<uint64_t>& handles);       // L66
     KvClientAdapterConfig config_;                                     // L67（HEAD:58）
     std::unique_ptr<kv::KvClient> kv_client_;                          // L68（HEAD:59）
     bool initialized_ = false;                                         // L69（HEAD:60）
@@ -391,7 +391,7 @@ class KvClientObjectStorageAdapter final : public ObjectStorageAdapter {  // L20
 - **L55** — 逻辑键 → 8 字节 SDK 键。`const` 因不修改实例状态。返回 `kv::BinaryKey`（SDK `kv_types.h:43` = `std::array<std::byte, 8>`）。
 - **L56** — **非 const**：调用 SDK 的 `Wait`，而 `Wait` 在 SDK 侧是非 const 方法（`kv_client.h:60`，它会在内部 `Remove` 任务）。
 - **L57** — `static`：纯映射函数，不依赖实例状态。
-- **L58-L65** — **【PR2，不属本 PR】** `ToWriteErrorCode`、`RegisterBuffers`、`UnregisterBuffers` 三个声明由未提交的 PR2 改动引入。
+- **L58-L66** — **【PR2，不属本 PR】** 工作区的 PR2 改动把 `ToErrorCode` 改成双参（`bool is_write`，无默认值），并新增 `RegisterBuffers`、`UnregisterBuffers` 两个声明。PR1 版只有单参 `ToErrorCode`。
 - **L67-L69** — 三个数据成员：
   - `config_` 按值持有配置副本，不依赖调用方生命周期。
   - `kv_client_` 用 `unique_ptr` 独占，析构时自动释放。

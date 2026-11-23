@@ -123,10 +123,9 @@ KVClient 写路径在适配器内部为每个请求注册 buffer，用返回的 
     // 调用一次 SDK Wait；OK/PARTIAL_FAILED 的 entryStatus 有效，
     // 其他状态把 task 级状态填满每个 entry。超时由 SDK 判定。
     Completion waitForCompletion(kv::TaskId task_id, size_t entry_count);
-    static ErrorCode ToErrorCode(const kv::Status& status);
     // Store 与 Load 共用 SDK 的 entry 解码器，所以读侧表示「对象不存在」的码
-    // 在写侧表示「写入失败」。
-    static ErrorCode ToWriteErrorCode(const kv::Status& status);
+    // 在写侧表示「写入失败」。方向由调用方显式表态，不设默认值。
+    static ErrorCode ToErrorCode(const kv::Status& status, bool is_write);
     // 注册单块 host 内存；返回的 handle 在交给 UnregisterBuffers 前保持有效。
     tl::expected<uint64_t, ErrorCode> RegisterBuffers(void* ptr, size_t size);
     // 释放 handle；SDK 无法重试的失败只记日志。
@@ -140,7 +139,7 @@ KVClient 写路径在适配器内部为每个请求注册 buffer，用返回的 
 约束：
 
 - `Completion`、`waitForCompletion`、`MakeCacheKey`、`ToErrorCode`、构造函数与 `config_/kv_client_/initialized_` 在 PR1 已存在，**不要重复声明**。
-- PR2 新增三个私有成员声明：`ToWriteErrorCode`（写侧映射，见 §4.1）、`RegisterBuffers`、`UnregisterBuffers`。后两者是成员而非匿名命名空间函数，因此直接用 `kv_client_`，调用点不需要传 client。
+- PR2 新增三个私有成员声明：`RegisterBuffers` / `UnregisterBuffers`（详见 §5），并把 `ToErrorCode` 的签名改成 `(status, bool is_write)`（详见 §4.1）。后两个是成员而非匿名命名空间函数，因此直接用 `kv_client_`，调用点不需要传 client。
 - 该头文件只有自己的 `.cpp` 一个包含者，改动不会触发其他 TU 重编。
 - 适配器没有 `BufferPlan`，也不新增 `RegisterBuffer` / `UnregisterBuffer` / `RequiresBufferHandle` 这三个公共虚函数。
 - `GetBatch` 已在 base override（PR1 返回 `NOT_SUPPORTED`），PR2 改为真实实现；不新增 `GetBatchAsync` / `ObjectReadCompletion`。
@@ -165,7 +164,13 @@ PR1 的 `ToErrorCode` 只覆盖控制面用到的状态码。数据面落地后�
 //    报告未命中，QUERY 用 ENTRY_KEY_NOT_EXIST。PR1 缺 ENTRY_DATA_NOT_EXIST，
 //    读 miss 会落到 default → INTERNAL_ERROR，§13 验收要求的 OBJECT_NOT_FOUND
 //    不成立，PR3 的 miss 自愈也不会触发。
-case StatusCode::ENTRY_DATA_NOT_EXIST:      // 加进 OBJECT_NOT_FOUND 组
+case StatusCode::CQE_KEY_NOT_EXIST:
+case StatusCode::ENTRY_KEY_NOT_EXIST:       // QUERY 专用，写侧不会出现
+    return ErrorCode::OBJECT_NOT_FOUND;
+case StatusCode::ENTRY_KEY_NOT_FOUND:
+case StatusCode::ENTRY_DATA_NOT_EXIST:      // PR2 补
+    return is_write ? ErrorCode::FILE_WRITE_FAIL
+                    : ErrorCode::OBJECT_NOT_FOUND;
 
 // ② SDK 标注可重试的两个 entry 码。原先落到 default → INTERNAL_ERROR，而单条
 //    LOAD 下同一 raw 值经 EntryStatusCode(LOAD, raw) 变成 IO_ERROR →
@@ -175,26 +180,16 @@ case StatusCode::ENTRY_NO_RETRY_ADVISED:    // → INTERNAL_ERROR（显式声明
 ```
 
 ```cpp
-// ③ 写侧专用映射。BATCH_STORE 与 BATCH_LOAD 共用 SDK 的 entry 解码器，所以
-//    ① 里新增的两个码在写侧也会出现，但含义是「写入失败」而非「对象不存在」。
-ErrorCode KvClientObjectStorageAdapter::ToWriteErrorCode(
-    const kv::Status& status) {
-    using kv::StatusCode;
-    switch (status.code) {
-        case StatusCode::ENTRY_KEY_NOT_FOUND:
-        case StatusCode::ENTRY_DATA_NOT_EXIST:
-            return ErrorCode::FILE_WRITE_FAIL;
-        default:
-            return ToErrorCode(status);   // 其余全部委托读侧映射
-    }
-}
+// ③ 读写方向由调用方显式表态，不再拆成两个函数。
+static ErrorCode ToErrorCode(const kv::Status& status, bool is_write);
 ```
 
 约束：
 
 - ①② 改的是 PR1 已落地代码，属于 PR2 的修正，需在 PR 描述中说明。
-- ③ 用新函数而非给 `ToErrorCode` 加读写标志参数：后者要改 `DeleteBatch`/`Exists`/`GetBatch` 共 8 处调用点，前者只在 `PutBatch` 改 3 处，且读/删/查路径完全不受影响。
-- `PutBatch` 的逐项映射一律用 `ToWriteErrorCode`；`GetBatch` 仍用 `ToErrorCode`（读路径需要 miss 语义）。
+- ③ **`is_write` 不加默认值**：带默认值会让新增写调用点漏传时静默拿到读语义——编译通过、行为错；无默认值则编译器强制每处表态。与仓库既有约定一致：`MapNvmeKvStatus(uint32_t status, bool is_write)`（`executor_util.h:62`）同样无默认值。
+- **只有 `PutBatch` 的终态逐项映射传 `true`**——那是唯一能收到 `BATCH_STORE` entry 状态的分支。同一函数的提交状态（只可能是 `NOT_INITIALIZED`/`INVALID_ARGUMENT`/resolver 错误/`INTERNAL_ERROR`/`RESOURCE_BUSY`）与非终态 fan-out（只填 `TIMEOUT`/`IN_PROGRESS`/`CANCELED` 或合成 `INTERNAL_ERROR`）都不可能携带 `ENTRY_*`，两者传 `false`。
+- `DeleteBatch` / `GetBatch` / `Exists` 的全部调用点传 `false`。
 
 ---
 
@@ -360,7 +355,8 @@ KvClientObjectStorageAdapter::PutBatch(
             const auto submit = kv_client_->StoreAsync(entries, task_id);
             if (!submit.ok()) {
                 for (size_t index : indices) {
-                    results[index] = tl::make_unexpected(ToErrorCode(submit));
+                    results[index] =
+                        tl::make_unexpected(ToErrorCode(submit, false));
                 }
             } else {
                 const auto completion = waitForCompletion(task_id, entries.size());
@@ -371,7 +367,8 @@ KvClientObjectStorageAdapter::PutBatch(
                     }
                 } else if (!completion.terminal) {
                     // Task 级错误：entryStatus 已被填成 task 状态，统一映射。
-                    const auto error = ToErrorCode(completion.entryStatus[0]);
+                    const auto error =
+                        ToErrorCode(completion.entryStatus[0], false);
                     for (size_t index : indices) {
                         results[index] = tl::make_unexpected(error);
                     }
@@ -380,7 +377,7 @@ KvClientObjectStorageAdapter::PutBatch(
                         const auto& status = completion.entryStatus[j];
                         results[indices[j]] =
                             status.ok() ? tl::expected<void, ErrorCode>{}
-                                        : tl::make_unexpected(ToErrorCode(status));
+                                        : tl::make_unexpected(ToErrorCode(status, true));
                     }
                 }
             }
@@ -401,7 +398,7 @@ KvClientObjectStorageAdapter::PutBatch(
 - 读路径不需要该校验：后端 `BatchReadOnce` 已把多 slice 读 staging 成一段连续 `vector<char>` 再调 `GetBatch`。
 - 已确认 `StoreAsync` 覆盖写，不预删。
 - 提交失败与 Task 级错误只覆盖参与项，空 key / 重复 key / 注册失败的错误保留。
-- **逐项映射用 `ToWriteErrorCode` 而非 `ToErrorCode`**：SDK 的 `ResultBufferEntryToStatus` 对 `BATCH_STORE` 与 `BATCH_LOAD` 共用解码，`ENTRY_KEY_NOT_FOUND` / `ENTRY_DATA_NOT_EXIST` 在写侧的含义是「写入失败」，映射成 `OBJECT_NOT_FOUND` 会污染调用方分类与写错误指标。`ToWriteErrorCode` 把这两个码转成 `FILE_WRITE_FAIL`，其余委托 `ToErrorCode`。读路径仍用 `ToErrorCode`（需要 miss 语义）。
+- **逐项映射必须显式表态读写方向**：SDK 的 `ResultBufferEntryToStatus` 对 `BATCH_STORE` 与 `BATCH_LOAD` 共用解码，`ENTRY_KEY_NOT_FOUND` / `ENTRY_DATA_NOT_EXIST` 在写侧的含义是「写入失败」，映射成 `OBJECT_NOT_FOUND` 会污染调用方分类与写错误指标。`PutBatch` 的终态逐项映射传 `is_write=true`（转成 `FILE_WRITE_FAIL`）；提交状态与非终态 fan-out 传 `false`（它们不可能携带 `ENTRY_*`）；`GetBatch` / `DeleteBatch` / `Exists` 全部传 `false`。
 - 每个参与项由 `RegisterBuffers` 注册；`Wait` 返回后、函数返回前统一用 `UnregisterBuffers` 注销。
 - 单一出口：正常路径与提前返回都经过结尾的 `UnregisterBuffers`；异常路径由 `catch` 注销后 rethrow，两者不会重复注销。
 - `handles` 在 `try` 外声明，`catch` 才可见；`handles.reserve` 保证 `push_back` 不抛，登记动作本身无异常窗口。
@@ -470,7 +467,8 @@ KvClientObjectStorageAdapter::GetBatch(
             const auto submit = kv_client_->LoadAsync(entries, task_id);
             if (!submit.ok()) {
                 for (size_t i : indices)
-                    results[i] = tl::make_unexpected(ToErrorCode(submit));
+                    results[i] =
+                        tl::make_unexpected(ToErrorCode(submit, false));
             } else {
                 const auto completion =
                     waitForCompletion(task_id, entries.size());
@@ -480,7 +478,8 @@ KvClientObjectStorageAdapter::GetBatch(
                             tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
                 } else if (!completion.terminal) {
                     // Task 级错误：entryStatus 已被填成 task 状态，统一映射。
-                    const auto error = ToErrorCode(completion.entryStatus[0]);
+                    const auto error =
+                        ToErrorCode(completion.entryStatus[0], false);
                     for (size_t i : indices)
                         results[i] = tl::make_unexpected(error);
                 } else {
@@ -492,7 +491,7 @@ KvClientObjectStorageAdapter::GetBatch(
                             st.ok()
                                 ? tl::expected<size_t, ErrorCode>{
                                       requests[index].size}
-                                : tl::make_unexpected(ToErrorCode(st));
+                                : tl::make_unexpected(ToErrorCode(st, false));
                     }
                 }
             }
@@ -523,14 +522,18 @@ KvClientObjectStorageAdapter::GetBatch(
 
 ### 8.1 单条入口
 
-单条写入口已在步骤 5 实现为 `Put` → `PutV` → `PutBatch` 的包装，这里不再重复。读路径的 `Get` 随 `GetBatch` 在步骤 6 实现，当前保持 `NOT_SUPPORTED`：
+单条写入口已在步骤 5 实现为 `Put` → `PutV` → `PutBatch` 的包装。读路径的 `Get` 在步骤 6 落地 `GetBatch` 后同样改为单元素包装，与写路径对称：
 
 ```cpp
 tl::expected<size_t, ErrorCode> KvClientObjectStorageAdapter::Get(
-    const std::string&, void*, size_t) {
-    return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+    const std::string& logical_key, void* buf, size_t len) {
+    auto results = GetBatch({{logical_key, buf, len}});
+    return results.empty() ? tl::make_unexpected(ErrorCode::INVALID_PARAMS)
+                           : std::move(results.front());
 }
 ```
+
+`Get` 不单独实现 I/O：单条读与 `Put` 一样走批量协议（`useBatchIoForSingleKey` 已强制），才能拿到 miss 的 `ENTRY_*` entry 级状态。
 
 ### 8.2 析构
 
@@ -561,20 +564,23 @@ tl::expected<bool, ErrorCode> KvClientObjectStorageAdapter::Exists(
         kv::CacheKey::FromBytes(MakeCacheKey(logical_key))};
     kv::TaskId task_id = kv::kInvalidTaskId;
     const auto submit = kv_client_->QueryAsync(keys, task_id);
-    if (!submit.ok()) return tl::make_unexpected(ToErrorCode(submit));
+    if (!submit.ok())
+        return tl::make_unexpected(ToErrorCode(submit, false));
 
     // key 不存在会让 task 级变成 PARTIAL_FAILED，但它仍携带可信的逐项结果，
     // 因此不能当失败处理。复用 waitForCompletion 而不是裸调 Wait。
     const auto completion = waitForCompletion(task_id, keys.size());
     if (!completion.terminal) {
-        return tl::make_unexpected(ToErrorCode(completion.entryStatus[0]));
+        return tl::make_unexpected(
+            ToErrorCode(completion.entryStatus[0], false));
     }
     // 两种结果都由 Status::Error 产生，ok() 无法区分命中与未命中，必须按 code 分支。
     switch (completion.entryStatus[0].code) {
         case kv::StatusCode::ENTRY_KEY_EXIST: return true;
         case kv::StatusCode::ENTRY_KEY_NOT_EXIST: return false;
         default:
-            return tl::make_unexpected(ToErrorCode(completion.entryStatus[0]));
+            return tl::make_unexpected(
+                ToErrorCode(completion.entryStatus[0], false));
     }
 }
 ```
@@ -907,7 +913,7 @@ pre-commit run --files <本次改动文件>
 | --- | --- |
 | 写路径 | 零拷贝提交；适配器内按请求 `RegisterBuffers` 并只用返回的 handle；逐段校验切片连续 |
 | 切片连续性 | 不连续的 iovec（跨分配）逐项 `INVALID_PARAMS`，不注册、不提交；连续的按总长注册 |
-| 写失败判定 | SDK 返回的错误按 `ToWriteErrorCode` 映射（写侧 `ENTRY_KEY_NOT_FOUND`/`ENTRY_DATA_NOT_EXIST` → `FILE_WRITE_FAIL`）；适配器不做请求业务校验 |
+| 写失败判定 | SDK 返回的错误按 `ToErrorCode(status, is_write)` 映射：仅 `PutBatch` 终态逐项映射传 `true`（写侧 `ENTRY_KEY_NOT_FOUND`/`ENTRY_DATA_NOT_EXIST` → `FILE_WRITE_FAIL`）；提交状态与非终态 fan-out 传 `false`；适配器不做请求业务校验 |
 | 读路径 | `GetBatch` 内注册目标 buffer → `LoadAsync` + `waitForCompletion`，成功项返回 N |
 | `Exists` | `QueryAsync` 的 `ENTRY_KEY_EXIST` / `ENTRY_KEY_NOT_EXIST` → `true` / `false`；错误正确映射；`ListKeys` 仍 `NOT_SUPPORTED` |
 | buffer handle | `RegisterBuffers` 在 batch 内注册、返回前用 `UnregisterBuffers` 逐个注销；上层接口不变 |

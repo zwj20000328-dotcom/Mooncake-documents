@@ -834,10 +834,12 @@ PR1 的 `ToErrorCode`（§1.6.4）只覆盖控制面用到的状态码。PR2 实
 //    缺 ENTRY_DATA_NOT_EXIST 会让读 miss 落到 default → INTERNAL_ERROR，
 //    §2.7 验收要求的 OBJECT_NOT_FOUND 不成立，PR3 的 miss 自愈也不会触发。
 case StatusCode::CQE_KEY_NOT_EXIST:
+case StatusCode::ENTRY_KEY_NOT_EXIST:       // QUERY 专用，写侧不会出现
+    return ErrorCode::OBJECT_NOT_FOUND;
 case StatusCode::ENTRY_KEY_NOT_FOUND:
 case StatusCode::ENTRY_DATA_NOT_EXIST:      // PR2 补
-case StatusCode::ENTRY_KEY_NOT_EXIST:
-    return ErrorCode::OBJECT_NOT_FOUND;
+    return is_write ? ErrorCode::FILE_WRITE_FAIL
+                    : ErrorCode::OBJECT_NOT_FOUND;
 
 // ② SDK 标注可重试的两个 entry 码。原先落到 default → INTERNAL_ERROR，
 //    而单条 LOAD 下同一 raw 值经 EntryStatusCode(LOAD, raw) 变成 IO_ERROR →
@@ -849,28 +851,16 @@ case StatusCode::ENTRY_NO_RETRY_ADVISED:    // PR2 补：显式声明，不静�
 ```
 
 ```cpp
-// ③ 写侧专用映射。BATCH_STORE 与 BATCH_LOAD 共用 SDK 的 entry 解码器，
-//    所以 ① 里新增的两个码在写侧也会出现，但含义是「写入失败」而非「对象
-//    不存在」。沿用 ToErrorCode 会把写失败报成 OBJECT_NOT_FOUND，污染调用方
-//    分类与写错误指标。PutBatch 的逐项映射一律改用本函数。
-ErrorCode KvClientObjectStorageAdapter::ToWriteErrorCode(
-    const kv::Status& status) {
-    using kv::StatusCode;
-    switch (status.code) {
-        case StatusCode::ENTRY_KEY_NOT_FOUND:
-        case StatusCode::ENTRY_DATA_NOT_EXIST:
-            return ErrorCode::FILE_WRITE_FAIL;
-        default:
-            return ToErrorCode(status);   // 其余全部委托读侧映射
-    }
-}
+// ③ 读写方向由调用方表态，不再拆成两个函数。
+static ErrorCode ToErrorCode(const kv::Status& status, bool is_write);
 ```
 
 约束：
 
 - ①② 改的是 PR1 已落地代码，属于 PR2 的修正，需在 PR 描述中说明。
-- ③ 用新函数而非给 `ToErrorCode` 加读写标志参数：后者要改 `DeleteBatch`/`Exists`/`GetBatch` 共 8 处调用点，前者只在 `PutBatch` 改 3 处，且读/删/查路径完全不受影响。
-- `GetBatch` 的逐项映射仍用 `ToErrorCode`（读路径需要 miss 语义），只有 `PutBatch` 用 `ToWriteErrorCode`。
+- ③ **`is_write` 不加默认值**。带默认值的参数会让新增写调用点在漏传时静默拿到读语义——编译通过、行为错；无默认值则编译器强制每处表态。这与仓库既有约定一致：`MapNvmeKvStatus(uint32_t status, bool is_write)`（`executor_util.h:62`）同样是显式 bool、无默认值。
+- **只有 `PutBatch` 的终态逐项映射传 `true`**——那是唯一能收到 `BATCH_STORE` entry 状态的地方。同一函数里另外两处传 `false`：`StoreAsync` 的提交状态只可能是 `NOT_INITIALIZED` / `INVALID_ARGUMENT` / resolver 错误 / `INTERNAL_ERROR` / `RESOURCE_BUSY`；`waitForCompletion` 的非终态 fan-out 只填 `TIMEOUT` / `IN_PROGRESS` / `CANCELED` 或合成的 `INTERNAL_ERROR`。两者都不可能携带 `ENTRY_*`，在那里用写侧映射是空转。
+- `DeleteBatch` / `GetBatch` / `Exists` 的全部调用点传 `false`。
 
 #### 2.6.1 适配器内部 buffer 注册
 
@@ -1030,8 +1020,11 @@ KvClientObjectStorageAdapter::PutBatch(
             kv::TaskId task_id = kv::kInvalidTaskId;
             const auto submit = kv_client_->StoreAsync(entries, task_id);
             if (!submit.ok()) {
+                // 提交状态只可能是 NOT_INITIALIZED / INVALID_ARGUMENT /
+                // resolver 错误 / INTERNAL_ERROR / RESOURCE_BUSY，不含 ENTRY_*。
                 for (size_t i : indices)
-                    results[i] = tl::make_unexpected(ToErrorCode(submit));
+                    results[i] =
+                        tl::make_unexpected(ToErrorCode(submit, false));
             } else {
                 const auto completion =
                     waitForCompletion(task_id, entries.size());
@@ -1040,15 +1033,20 @@ KvClientObjectStorageAdapter::PutBatch(
                         results[i] =
                             tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
                 } else if (!completion.terminal) {
-                    const auto error = ToErrorCode(completion.entryStatus[0]);
+                    // 非终态只填 TIMEOUT / IN_PROGRESS / CANCELED 或合成的
+                    // INTERNAL_ERROR，同样不含 ENTRY_*。
+                    const auto error =
+                        ToErrorCode(completion.entryStatus[0], false);
                     for (size_t i : indices)
                         results[i] = tl::make_unexpected(error);
                 } else {
+                    // 唯一能收到 BATCH_STORE entry 状态的分支，故传 true。
                     for (size_t j = 0; j < entries.size(); ++j) {
                         const auto& st = completion.entryStatus[j];
                         results[indices[j]] =
                             st.ok() ? tl::expected<void, ErrorCode>{}
-                                    : tl::make_unexpected(ToErrorCode(st));
+                                    : tl::make_unexpected(
+                                          ToErrorCode(st, true));
                     }
                 }
             }
@@ -1131,7 +1129,8 @@ KvClientObjectStorageAdapter::GetBatch(
             const auto submit = kv_client_->LoadAsync(entries, task_id);
             if (!submit.ok()) {
                 for (size_t i : indices)
-                    results[i] = tl::make_unexpected(ToErrorCode(submit));
+                    results[i] =
+                        tl::make_unexpected(ToErrorCode(submit, false));
             } else {
                 const auto completion =
                     waitForCompletion(task_id, entries.size());
@@ -1140,7 +1139,8 @@ KvClientObjectStorageAdapter::GetBatch(
                         results[i] =
                             tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
                 } else if (!completion.terminal) {
-                    const auto error = ToErrorCode(completion.entryStatus[0]);
+                    const auto error =
+                        ToErrorCode(completion.entryStatus[0], false);
                     for (size_t i : indices)
                         results[i] = tl::make_unexpected(error);
                 } else {
@@ -1151,7 +1151,7 @@ KvClientObjectStorageAdapter::GetBatch(
                             st.ok()
                                 ? tl::expected<size_t, ErrorCode>{
                                       requests[index].size}
-                                : tl::make_unexpected(ToErrorCode(st));
+                                : tl::make_unexpected(ToErrorCode(st, false));
                     }
                 }
             }
@@ -1194,20 +1194,23 @@ tl::expected<bool, ErrorCode> KvClientObjectStorageAdapter::Exists(
         kv::CacheKey::FromBytes(MakeCacheKey(logical_key))};
     kv::TaskId task_id = kv::kInvalidTaskId;
     const auto submit = kv_client_->QueryAsync(keys, task_id);
-    if (!submit.ok()) return tl::make_unexpected(ToErrorCode(submit));
+    if (!submit.ok())
+        return tl::make_unexpected(ToErrorCode(submit, false));
 
     // key 不存在会让 task 级变成 PARTIAL_FAILED，但它仍携带可信的逐项结果，
     // 因此不能当失败处理。复用 waitForCompletion 而不是裸调 Wait。
     const auto completion = waitForCompletion(task_id, keys.size());
     if (!completion.terminal) {
-        return tl::make_unexpected(ToErrorCode(completion.entryStatus[0]));
+        return tl::make_unexpected(
+            ToErrorCode(completion.entryStatus[0], false));
     }
     // 两种结果都由 Status::Error 产生，ok() 无法区分命中与未命中，必须按 code 分支。
     switch (completion.entryStatus[0].code) {
         case kv::StatusCode::ENTRY_KEY_EXIST: return true;
         case kv::StatusCode::ENTRY_KEY_NOT_EXIST: return false;
         default:
-            return tl::make_unexpected(ToErrorCode(completion.entryStatus[0]));
+            return tl::make_unexpected(
+                ToErrorCode(completion.entryStatus[0], false));
     }
 }
 ```
@@ -1251,7 +1254,7 @@ tl::expected<size_t, ErrorCode> KvClientObjectStorageAdapter::Get(
 约束：
 
 - `Put` 把 `span` 转成单个 iovec 调 `PutV`；`PutV` 构造单元素 `PutBatch` 并取回唯一结果，两者都不单独实现 I/O。
-- `Get` 在当前步骤保持 `NOT_SUPPORTED`，读路径随 `GetBatch` 在步骤 6 落地。
+- `Get` 在本步骤保持 `NOT_SUPPORTED`；步骤 6 落地 `GetBatch` 后改为单元素包装：`GetBatch({{logical_key, buf, len}})` 取首项，语义与 `Put`/`PutV` 对称——单条读同样走批量协议。
 
 #### 2.6.4 Master 门控
 
@@ -1350,7 +1353,8 @@ auto target_pred = [this, replica_type, &client_id, expected_replica_id](
 | SDK 拒绝无效请求 | 适配器不做业务参数校验、不补齐；按 SDK 状态映射 | 适配器单测 |
 | 同批重复 key | 第一条受理，后续条目 `INVALID_PARAMS` | 适配器单测 |
 | buffer 注册失败 | 该参与项 `INVALID_PARAMS` / `DFS_SERVICE_UNAVAILABLE`，不提交、不占用 key；其余项不受影响 | 适配器单测 |
-| 写 entry 级失败 | 逐项按 `ToWriteErrorCode` 映射：`ENTRY_KEY_NOT_FOUND` / `ENTRY_DATA_NOT_EXIST` → `FILE_WRITE_FAIL`（不是 `OBJECT_NOT_FOUND`）；`ENTRY_RETRY_ADVISED` → `DFS_SERVICE_UNAVAILABLE` | 适配器单测 |
+| 写 entry 级失败 | `PutBatch` 终态逐项映射传 `is_write=true`：`ENTRY_KEY_NOT_FOUND` / `ENTRY_DATA_NOT_EXIST` → `FILE_WRITE_FAIL`（不是 `OBJECT_NOT_FOUND`）；`ENTRY_RETRY_ADVISED` → `DFS_SERVICE_UNAVAILABLE` | 适配器单测 |
+| 写提交/非终态状态 | 这两处传 `is_write=false`：提交状态与非终态 fan-out 都不可能携带 `ENTRY_*`，用写侧映射是空转 | 代码审查 |
 | 写 task 级错误 | 参与项统一映射 task 状态；`PutBatch` 返回前用 `UnregisterBuffers` 注销全部 handle | 适配器单测 |
 | 注销失败 | 只 `LOG(WARNING)`，不影响逐项结果、不重试 | 适配器单测 |
 | 单条 `Put` / `PutV` | `Put` 转成单 iovec 调 `PutV`；`PutV` 走单元素 `PutBatch`，结果与批量路径一致；`Get` 仍 `NOT_SUPPORTED` | 适配器单测 |
@@ -1358,7 +1362,7 @@ auto target_pred = [this, replica_type, &client_id, expected_replica_id](
 | 空 key / N=0 | 逐项 `INVALID_PARAMS`，不进入提交 | 适配器单测 |
 | Init 前调用 `PutBatch` / `GetBatch` | 逐项 `DFS_SERVICE_UNAVAILABLE`，不空指针 | 适配器单测 |
 | 读成功 | `GetBatch` → 注册目标 buffer → `LoadAsync` + `Wait`；逐项返回 N；返回前注销 handle | 适配器单测 |
-| 读提交失败 | 逐项 `ToErrorCode(submit)`；调用方 buffer 未被触碰 | 适配器单测 |
+| 读提交失败 | 逐项 `ToErrorCode(submit, false)`；调用方 buffer 未被触碰 | 适配器单测 |
 | 读 task 级错误 | 不读 `entryStatus`；逐项统一映射 task 状态；返回前注销 handle | 适配器单测 |
 | 读 miss | 适配器返回 `OBJECT_NOT_FOUND`；触发 miss 清理属于 PR3 | 单测 + PR3 集成 |
 | `Exists` 存在/不存在 | `QueryAsync` entry 为 `ENTRY_KEY_EXIST` / `ENTRY_KEY_NOT_EXIST` → `true` / `false`；不得用 `ok()` 判断 | 适配器单测 |

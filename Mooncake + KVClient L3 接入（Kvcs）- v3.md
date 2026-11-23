@@ -45,8 +45,8 @@ v4.10 是设计期文档，以下条目在实现时发生了变更，本版已�
 | 1 | **基类新增 `RegisterBuffer` / `UnregisterBuffer` / `RequiresBufferHandle`，请求结构新增 `buffer_handle`，由后端预注册并透传** | **完全废弃**。基类与 `ObjectPutRequest` / `ObjectGetRequest` **未改动**；注册在**适配器内部**完成（私有 `RegisterBuffers` / `UnregisterBuffers`） | §2.1、§2.2、§2.3、§3.2、§3.4、§3.6、SFMEA-05/18/19/20 |
 | 2 | 伪代码用 `SumIov()` 求和，无连续性检查 | 新增**逐段物理连续性校验**（`uintptr_t` 比较），不连续即 `INVALID_PARAMS` 且**不注册** | §3.2.3 |
 | 3 | 同批重复 key 用 `seen.insert(...).second` 一步判重占位 | 查重在注册**前**，占位（`seen.insert`）在注册**成功后**；注册失败不占用 key 槽 | §3.2.3 |
-| 4 | 写路径用 `ToErrorCode` | 新增 `ToWriteErrorCode`，把 `ENTRY_KEY_NOT_FOUND` / `ENTRY_DATA_NOT_EXIST` 映射为 `FILE_WRITE_FAIL` | §3.2.3 |
-| 5 | `Get` 单 key 包成 batch | `Get` **仍是 `NOT_SUPPORTED`**，只有 `Put` / `PutV` / `Delete` 包成 batch | §3.2.3 |
+| 4 | 写路径用 `ToErrorCode` | `ToErrorCode` 增加 `bool is_write` 参数（**无默认值**，强制每个调用点表态），把 `ENTRY_KEY_NOT_FOUND` / `ENTRY_DATA_NOT_EXIST` 在写方向映射为 `FILE_WRITE_FAIL`；只有 `PutBatch` 的终态逐项分支传 `true` | §3.2.3 |
+| 5 | `Get` 单 key 包成 batch | `Get` 与 `Put`/`PutV`/`Delete` 一样包成 batch：`GetBatch({{logical_key, buf, len}})` 取首项 | §3.2.3 |
 | 6 | `waitForCompletion` 只分「OK/PARTIAL_FAILED」与「TIMEOUT/CANCELED/IN_PROGRESS」两支 | 新增 `TASK_NOT_FOUND` 分支（非终态）；default 分支为**终态**并扇出 task 状态；额外校验 `entryStatus.size() == entry_count` | §2.3.2、§2.3.3 |
 | 7 | `Exists` 手工 `Wait` 并校验 `queryResult->exists` | 复用 `waitForCompletion`，**不检查** `queryResult` | §3.2.3 |
 | 8 | `enable_oplog=true` 时 Master `LOG(FATAL)` | 改为 `LOG(ERROR)` + `throw std::invalid_argument`，与相邻 filesystem DFS 分支风格一致 | §1.2.2、§3.5、SFMEA-13 |
@@ -262,8 +262,7 @@ classDiagram
         +DeleteBatch(keys)
         -MakeCacheKey(logical_key)
         -waitForCompletion(task_id, entry_count)
-        -ToErrorCode(status)$
-        -ToWriteErrorCode(status)$
+        -ToErrorCode(status, is_write)
         -RegisterBuffers(ptr, size)
         -UnregisterBuffers(handles)
     }
@@ -694,7 +693,7 @@ sequenceDiagram
 
 ### 2.3.2 写入阶段
 
-写路径只有一条：零拷贝。`PutBatch` 的守卫为：空 key、`iov == nullptr`、`iovcnt <= 0`、段首地址空、段长 0、求和溢出、**段间物理不连续**、总长 0、同批重复 key；违约项 `results[i] = INVALID_PARAMS`，其余继续。一次 `StoreAsync` 提交整批（SDK 内部按 `batchStoreIoNum`（默认 110）在对象边界切分 transport 子批），再用 `waitForCompletion` 映射逐条结果，写路径经 `ToWriteErrorCode` 转换。不做 staging、不补齐。
+写路径只有一条：零拷贝。`PutBatch` 的守卫为：空 key、`iov == nullptr`、`iovcnt <= 0`、段首地址空、段长 0、求和溢出、**段间物理不连续**、总长 0、同批重复 key；违约项 `results[i] = INVALID_PARAMS`，其余继续。一次 `StoreAsync` 提交整批（SDK 内部按 `batchStoreIoNum`（默认 110）在对象边界切分 transport 子批），再用 `waitForCompletion` 映射逐条结果，写路径经 `ToErrorCode(status, is_write=true)` 转换。不做 staging、不补齐。
 
 ```mermaid
 sequenceDiagram
@@ -725,13 +724,13 @@ sequenceDiagram
         SDK->>SDK: 按 nodeId 路由拆分 transport task<br/>按 batchStoreIoNum（默认 110）切子批
         SDK->>S: Host RDMA write（buffer.region.size = N）
         alt 提交失败
-            AD->>AD: 参与项置 ToWriteErrorCode(submit)<br/>守卫错误保持不变，跳过 Wait
+            AD->>AD: 参与项置 ToErrorCode(submit, false)<br/>守卫错误保持不变，跳过 Wait
         else 已受理
             AD->>SDK: Wait(task_id, 0, result)<br/>0 = 用 SDK 默认超时，适配器不叠加第二层超时
             AD->>AD: waitForCompletion 判定 terminal
             alt OK / PARTIAL_FAILED（终态，entryStatus 逐条可信）
                 SDK-->>AD: TaskResult{status, entryStatus[]}
-                AD->>AD: 校验 entryStatus.size() == entries.size()<br/>逐项 ToWriteErrorCode；PARTIAL_FAILED 不整批置错
+                AD->>AD: 校验 entryStatus.size() == entries.size()<br/>逐项 ToErrorCode(status, true)；PARTIAL_FAILED 不整批置错
             else TASK_NOT_FOUND
                 Note over AD: ⚠️ Wait 超时后也会移除 task，<br/>未知 task 不能证明 I/O 已结束
                 AD->>AD: terminal=false，逐项 INTERNAL_ERROR
@@ -749,7 +748,7 @@ sequenceDiagram
     C->>C: HasExpectedReplicaAllocation &&<br/>AllAllocatedTransfersSucceeded?<br/>→ PutEnd(ALL) 或 PutRevoke(ALL)
 ```
 
-**异常安全**：整个批处理体包在 `try { ... } catch (...) { UnregisterBuffers(handles); throw; }` 中（`:325-432`），所以中途抛异常也会释放已注册 handle。handle 在 `push_back` **之后**才 `seen.insert`，保证「注册失败不占用重复 key 槽」（测试 `RegisterFailureDoesNotClaimKey` 锁定）。
+**异常安全**：整个批处理体包在 `try { ... } catch (...) { UnregisterBuffers(handles); throw; }` 中（`:313-424`），所以中途抛异常也会释放已注册 handle。handle 在 `push_back` **之后**才 `seen.insert`，保证「注册失败不占用重复 key 槽」（测试 `RegisterFailureDoesNotClaimKey` 锁定）。
 
 ### 2.3.3 读取阶段
 
@@ -801,7 +800,7 @@ sequenceDiagram
     Note over C: 只有 OBJECT_NOT_FOUND 触发 miss 清理【PR3 未接通】
 ```
 
-**返回长度语义**：SDK 不暴露实际传输字节数，所以适配器成功时返回**请求长度**而非真实读取量（`:518-526` 的注释已说明）。这意味着**截断读在适配器层不可检测**，只能靠上层 checksum 发现。后端的 `*result == request.size` 比对因此恒真（对成功项而言），它防的是适配器返回错值，不是防截断。
+**返回长度语义**：SDK 不暴露实际传输字节数，所以适配器成功时返回**请求长度**而非真实读取量（`:512-515` 的注释已说明）。这意味着**截断读在适配器层不可检测**，只能靠上层 checksum 发现。后端的 `*result == request.size` 比对因此恒真（对成功项而言），它防的是适配器返回错值，不是防截断。
 
 ### 2.3.4 删除阶段
 
@@ -856,9 +855,9 @@ sequenceDiagram
     C-->>APP: 逐 key expected
 ```
 
-**`Delete` 单 key**（`:246-252`）只是把 key 包成长度 1 的 `std::array` 转调 `DeleteBatch`，取 `results.front()`；`results` 为空时返回 `INVALID_PARAMS`。
+**`Delete` 单 key**（`:234-240`）只是把 key 包成长度 1 的 `std::array` 转调 `DeleteBatch`，取 `results.front()`；`results` 为空时返回 `INVALID_PARAMS`。
 
-**删除侧的错误映射与读写不同**：`ENTRY_DELETE_FAILED` 映射为 `DFS_SERVICE_UNAVAILABLE` 而非 `OBJECT_NOT_FOUND`；`ENTRY_KEY_NOT_EXIST` 才是删除的幂等成功信号（该码只由 QUERY 与 DELETE 产生）。代码注释已明确这一点（`:103-105`）。
+**删除侧的错误映射与读写不同**：`ENTRY_DELETE_FAILED` 映射为 `DFS_SERVICE_UNAVAILABLE` 而非 `OBJECT_NOT_FOUND`；`ENTRY_KEY_NOT_EXIST` 才是删除的幂等成功信号（该码只由 QUERY 与 DELETE 产生）。代码注释已明确这一点（`:107-109`）。
 
 ### 2.3.5 miss 清理阶段
 
@@ -941,12 +940,12 @@ sequenceDiagram
 | SFMEA-20 | 调用方在 `GetBatch` / `PutBatch` 返回前释放或改写 buffer | use-after-free / 数据错位 | 同步语义：适配器返回前完成 I/O 与注销；基类契约已要求「buffer 与 iovec 在同步调用返回前保持有效且不变」 | ✅ 由基类契约保证（`object_storage_adapter.h` 注释） |
 | SFMEA-21 | 调用方提交的 value 长度不满足 SDK 协议约束（`length % 512 == 0`、`length != 0`、`length <= 0xFFFFFF`），而适配器把 `region.size` 直接填成 N | SDK 协议层拒绝（`INVALID_ARGUMENT`）；违规在 `PackSqe` 阶段中止整个 transport task——批次 >110 条跨子批时，先前已构建子批的 entry 会**报假 OK** | **裁决 D-1：对齐是调用方契约，适配器不校验、不补齐、不对齐 descriptor，成败由 KvClient 判定** | ✅ 已裁决（§0.3、§6.1）。⚠️ 假 OK 是**契约违约的后果**，不是可在适配器内消除的缺陷——部署前须由调用方保证对齐，并用真机验证违约时的实际表现 |
 | SFMEA-22 | `enable_health_check=true` 时后端 `Init` 调用 `CheckHealth()`，而适配器未 override | 基类返回 `NOT_SUPPORTED` → **后端初始化直接失败** | **裁决 D-2：不 override `CheckHealth()`**，保持基类默认。适配器没有可上报的健康信息，伪造「永远健康」会让该开关变成假开关 | ✅ 已裁决（§0.3、§6.2）。**部署约束**：kvclient 下保持 `MOONCAKE_DISTRIBUTED_HEALTH_CHECK=false`（默认值） |
-| SFMEA-23 | 写路径把 `ENTRY_KEY_NOT_FOUND` / `ENTRY_DATA_NOT_EXIST` 当 miss 上报 | 写失败被误分类为「对象不存在」，上层可能据此删元数据或淘汰活副本 | 新增 `ToWriteErrorCode`：这两个码在写路径映射为 `FILE_WRITE_FAIL`，其余委托 `ToErrorCode`。根因是 BATCH_STORE 与 BATCH_LOAD 共用 SDK 的 entry 解码器 | ✅ PR2 |
+| SFMEA-23 | 写路径把 `ENTRY_KEY_NOT_FOUND` / `ENTRY_DATA_NOT_EXIST` 当 miss 上报 | 写失败被误分类为「对象不存在」，上层可能据此删元数据或淘汰活副本 | `ToErrorCode` 增加 `bool is_write`（无默认值）：这两个码在写方向映射为 `FILE_WRITE_FAIL`，读方向仍是 `OBJECT_NOT_FOUND`。根因是 BATCH_STORE 与 BATCH_LOAD 共用 SDK 的 entry 解码器 | ✅ PR2 |
 | SFMEA-24 | `Wait` 返回 `TASK_NOT_FOUND` 被当作「I/O 已结束」 | 提前释放 handle 与 staging → 设备访问已注销内存 | `waitForCompletion` 把它判为**非终态**，逐项填 `INTERNAL_ERROR`，调用方保留资源 | ✅ PR2 |
 
 ## 2.5 可定位设计
 
-> **【未实现】本节整体尚未落地。** 当前适配器代码里只有两条日志：`Init` 成功时的 `LOG(INFO) << "KVClient adapter initialized"`（`:70`，**不含 SDK 版本**）和注销失败时的 `LOG(WARNING)`（`:241-242`，只含 handle 数量与 error message）。没有任何 metric，没有 `cache_key` / `task_id` / `buffer_addr` / `batch_index` 的结构化输出。
+> **【未实现】本节整体尚未落地。** 当前适配器代码里只有两条日志：`Init` 成功时的 `LOG(INFO) << "KVClient adapter initialized"`（`:70`，**不含 SDK 版本**）和注销失败时的 `LOG(WARNING)`（`:228-231`，只含 handle 数量与 error message）。没有任何 metric，没有 `cache_key` / `task_id` / `buffer_addr` / `batch_index` 的结构化输出。
 >
 > 下面两张表是**待补的设计目标**，不是现状描述。PR2 的评审范围内刻意不含可观测性，需在后续 PR 补齐——尤其 `cache_key` 日志是 SFMEA-01（key 碰撞静默损坏）**唯一**的事后排查手段，缺失时该失效模式在生产上不可诊断。
 
@@ -998,7 +997,7 @@ sequenceDiagram
 | 请求返回 `NO_AVAILABLE_HANDLE` | 设备侧空间不足（`CQE_OUT_OF_CREATE_SIZE`）或资源忙（`RESOURCE_BUSY` / `CQE_RESOURCE_BUSY`），见 SFMEA-08 |
 | 请求返回 `DFS_SERVICE_UNAVAILABLE` | `RegisterBuffers` 失败；或 SDK 侧 `NOT_FOUND`（路由/配置/视图错误）/ `NOT_INITIALIZED` / `CONNECTION_ERROR` / `IO_ERROR` / `UNSUPPORTED` / `ENTRY_DELETE_FAILED` / `ENTRY_RETRY_ADVISED`；或未 `Init` |
 | 请求返回 `INTERNAL_ERROR` | `IN_PROGRESS` / `CANCELED` / `TASK_NOT_FOUND` / entry 数不匹配 / `ENTRY_NO_RETRY_ADVISED`（显式不可重试）/ 未知 SDK 码 |
-| 写失败报 `FILE_WRITE_FAIL` | SDK 在写路径回了 `ENTRY_KEY_NOT_FOUND` / `ENTRY_DATA_NOT_EXIST`，由 `ToWriteErrorCode` 专门区分（SFMEA-23）——是**写失败**，不是对象不存在 |
+| 写失败报 `FILE_WRITE_FAIL` | SDK 在写路径回了 `ENTRY_KEY_NOT_FOUND` / `ENTRY_DATA_NOT_EXIST`，由 `ToErrorCode(..., is_write=true)` 专门区分（SFMEA-23）——是**写失败**，不是对象不存在 |
 | 每批延迟偏高 | 每请求一次 `RegisterRegions` + 每批一次 `UnregisterRegions`；批越大注册往返越多。查批大小 |
 | Remove 返回错误且对象变为不可读 | **【PR3】落地后**才是已知窗口（SFMEA-10）。当前 kvclient 走 metadata-first，症状相反：Remove 成功但 value 残留（永久泄漏） |
 | Get 持续 `OBJECT_NOT_FOUND` 但目录有记录 | **【PR3】未接通**：Client 的 `ReconcileMissingKvcsReplica` 门控仍是 `UsesKvcs()`，不会清理。PR3 落地后若仍如此，查 `EvictDiskReplicaIfCurrent` 是否返回 `INVALID_PARAMS`——说明 Master 白名单漏改（`master_service.cpp:6331/6348`） |
@@ -1078,7 +1077,7 @@ kv::BinaryKey KvClientObjectStorageAdapter::MakeCacheKey(
 
 ### 3.2.1 类定义
 
-以下是**实际头文件**（工作区版，PR2 已在 PR1 基础上加了 `ToWriteErrorCode` / `RegisterBuffers` / `UnregisterBuffers` 三个私有成员）：
+以下是**实际头文件**（工作区版，PR2 已在 PR1 基础上给 `ToErrorCode` 加了 `is_write` 参数，并新增 `RegisterBuffers` / `UnregisterBuffers` 两个私有成员）：
 
 ```cpp
 #pragma once
@@ -1137,10 +1136,11 @@ class KvClientObjectStorageAdapter final : public ObjectStorageAdapter {
 
     kv::BinaryKey MakeCacheKey(std::string_view logical_key) const;
     Completion waitForCompletion(kv::TaskId task_id, size_t entry_count);
-    static ErrorCode ToErrorCode(const kv::Status& status);
+    static ErrorCode ToErrorCode(const kv::Status& status, bool is_write);
     // Store entries share the SDK's entry decoder with loads, so the codes
     // that mean "object missing" on a read mean "store failed" on a write.
-    static ErrorCode ToWriteErrorCode(const kv::Status& status);
+    // The parameter has no default so a new write site cannot silently
+    // inherit the read mapping.
     // Registers one host range with the SDK; the returned handle stays valid
     // until it is passed to UnregisterBuffers.
     tl::expected<uint64_t, ErrorCode> RegisterBuffers(void* ptr, size_t size);
@@ -1159,7 +1159,7 @@ class KvClientObjectStorageAdapter final : public ObjectStorageAdapter {
 
 ### 3.2.2 内部注册与注销
 
-两个私有薄封装（`:217-244`），**不是** 基类 override：
+两个私有薄封装（`:205-232`），**不是** 基类 override：
 
 ```cpp
 tl::expected<uint64_t, ErrorCode> KvClientObjectStorageAdapter::RegisterBuffers(
@@ -1208,7 +1208,7 @@ void KvClientObjectStorageAdapter::UnregisterBuffers(
 
 **公共前置**：三条路径入口都检查 `!initialized_ || !kv_client_`，成立时把**每一项**结果填 `DFS_SERVICE_UNAVAILABLE` 后直接返回（`PutBatch:315-320`、`GetBatch:446-451`、`Exists:541-543`、`DeleteBatch:256-260`）。空批返回空/全默认结果，不触碰 SDK。
 
-#### `waitForCompletion`：四分支的终态判定（`:146-200`）
+#### `waitForCompletion`：四分支的终态判定（`:134-188`）
 
 这是三条路径共用的完成语义核心。设计期只有两支，实现分成四支：
 
@@ -1283,7 +1283,7 @@ KvClientObjectStorageAdapter::waitForCompletion(kv::TaskId task_id,
 
 **超时归属**：`Wait(task_id, 0, result)` 的 `0` 表示使用 SDK 配置的 `defaultWaitTimeoutMs`；适配器不叠加第二层超时。`Wait` 本身返回失败时（`wait_status` 非 ok），取 `wait_status.code` 而非 `result.status.code`，并用 `wait_status` 作为扇出的状态。
 
-#### 写路径 `PutBatch`（`:311-435`）
+#### 写路径 `PutBatch`（`:300-425`）
 
 ```cpp
 // 入口：!initialized_ || !kv_client_ → 每项 DFS_SERVICE_UNAVAILABLE
@@ -1355,21 +1355,21 @@ try {
         const auto submit = kv_client_->StoreAsync(entries, task_id);
         if (!submit.ok()) {
             for (size_t index : indices)                 // 只覆盖参与项
-                results[index] = tl::make_unexpected(ToWriteErrorCode(submit));
+                results[index] = tl::make_unexpected(ToErrorCode(submit, false));
         } else {
             const auto completion = waitForCompletion(task_id, entries.size());
             if (completion.entryStatus.size() != entries.size()) {
                 for (size_t index : indices)
                     results[index] = tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
             } else if (!completion.terminal) {
-                const auto error = ToWriteErrorCode(completion.entryStatus[0]);
+                const auto error = ToErrorCode(completion.entryStatus[0], false);
                 for (size_t index : indices) results[index] = tl::make_unexpected(error);
             } else {
                 for (size_t j = 0; j < entries.size(); ++j) {
                     const auto& status = completion.entryStatus[j];
                     results[indices[j]] = status.ok()
                         ? tl::expected<void, ErrorCode>{}
-                        : tl::make_unexpected(ToWriteErrorCode(status));
+                        : tl::make_unexpected(ToErrorCode(status, true));
                 }
             }
         }
@@ -1388,10 +1388,10 @@ return results;
 - **查重在注册前、占位在注册后**：`seen.find()` 在第 2 步，`seen.insert()` 在第 5 步（`handles.push_back` 之后）。这样注册失败的 key 不会占住重复槽——同一 key 在注册恢复后仍可写入。测试 `RegisterFailureDoesNotClaimKey` 锁定该顺序。
 - **溢出检查用 `numeric_limits<size_t>::max() - total`** 而不是先加后比，避免自身 UB。注释指出：空段或回绕的 total 会导致注册与提交错误的范围。
 - **提交失败只覆盖参与项**（`indices`），守卫项的 `INVALID_PARAMS` 得以保留。测试 `WriteSubmitFailureKeepsGuardErrors` 断言 `results[0] == NO_AVAILABLE_HANDLE` 而 `results[1] == INVALID_PARAMS`，且 `wait_calls_ == 0`。
-- **`ToWriteErrorCode` 而非 `ToErrorCode`**（`:130-144`）：BATCH_STORE 与 BATCH_LOAD 共用 SDK 的 entry 解码器，所以 `ENTRY_KEY_NOT_FOUND` / `ENTRY_DATA_NOT_EXIST` 也会到达写路径——在那里它们的含义是「store 失败」而非「对象不存在」。上报 `OBJECT_NOT_FOUND` 会让调用方与指标误分类，更糟的是 PR3 可能据此删元数据。这两个码在写路径映射为 `FILE_WRITE_FAIL`，其余委托 `ToErrorCode`。
+- **写方向只在一处表态**：`ToErrorCode(status, is_write)`（`:74-132`）在 `ENTRY_KEY_NOT_FOUND` / `ENTRY_DATA_NOT_EXIST` 两个 case 上按方向分流。BATCH_STORE 与 BATCH_LOAD 共用 SDK 的 entry 解码器，所以这两个码也会到达写路径——在那里它们的含义是「store 失败」而非「对象不存在」。上报 `OBJECT_NOT_FOUND` 会让调用方与指标误分类，更糟的是 PR3 可能据此删元数据。**只有本函数的终态逐项分支传 `true`**；提交状态与非终态 fan-out 传 `false`（它们只可能是 task 级码）。参数无默认值：新增写调用点漏传会编译失败，而不是静默拿到读语义。
 - **注销在两个出口都有**：`catch (...)` 内一次、正常返回前一次，都是「一次批量」。
 
-#### 读路径 `GetBatch`（`:442-537`）
+#### 读路径 `GetBatch`（`:434-532`）
 
 与写路径同构，差异只有四处：
 
@@ -1400,14 +1400,14 @@ return results;
 | 守卫 | 空 key / iov 空 / iovcnt<=0 / 段校验 / 连续性 / 总长 0 / **同批重复 key** | 空 key / `buffer == nullptr` / `size == 0`（**无连续性校验**——后端已把多 slice 收敛为一段；**无查重**——重复读无害） |
 | 注册范围 | `iov[0].iov_base` + `total` | `requests[i].buffer` + `requests[i].size` |
 | opcode | `StoreAsync` | `LoadAsync` |
-| 错误映射 | `ToWriteErrorCode` | `ToErrorCode`（`ENTRY_KEY_NOT_FOUND` 等正是要报 `OBJECT_NOT_FOUND`） |
+| 错误映射 | `ToErrorCode(status, true)` | `ToErrorCode(status, false)`（`ENTRY_KEY_NOT_FOUND` 等正是要报 `OBJECT_NOT_FOUND`） |
 | 成功值 | `expected<void>` | `expected<size_t>{requests[index].size}` |
 
 成功项返回**请求长度**，注释已写明理由（`:518-521`）：SDK 不暴露传输字节数，所以截断读在此层不可检测，交由上层 checksum 验证。这也意味着后端的 `*result == request.size` 比对对成功项恒真（SFMEA-16）。
 
 读路径同样有 `try/catch(...)` + 批末 `UnregisterBuffers`，异常安全语义一致。测试 `ReadSubmitFailureLeavesBufferUntouched` 额外断言提交失败时**目标 buffer 未被触碰**（16 字节仍全 0）且 handle 仍被释放。
 
-#### `Exists`（`:539-571`）
+#### `Exists`（`:534-569`）
 
 ```cpp
 tl::expected<bool, ErrorCode> KvClientObjectStorageAdapter::Exists(
@@ -1422,20 +1422,20 @@ tl::expected<bool, ErrorCode> KvClientObjectStorageAdapter::Exists(
         kv::CacheKey::FromBytes(MakeCacheKey(logical_key))};
     kv::TaskId task_id = kv::kInvalidTaskId;
     const auto submit = kv_client_->QueryAsync(keys, task_id);
-    if (!submit.ok()) return tl::make_unexpected(ToErrorCode(submit));
+    if (!submit.ok()) return tl::make_unexpected(ToErrorCode(submit, false));
 
     // A missing key leaves the task PARTIAL_FAILED, which still carries a
     // trustworthy per-entry result, so it must not be treated as a failure.
     const auto completion = waitForCompletion(task_id, keys.size());
     if (!completion.terminal)
-        return tl::make_unexpected(ToErrorCode(completion.entryStatus[0]));
+        return tl::make_unexpected(ToErrorCode(completion.entryStatus[0], false));
     // Both outcomes are reported as Error statuses, so ok() cannot tell a hit
     // from a miss; branch on the code instead.
     switch (completion.entryStatus[0].code) {
         case kv::StatusCode::ENTRY_KEY_EXIST:     return true;
         case kv::StatusCode::ENTRY_KEY_NOT_EXIST: return false;
         default:
-            return tl::make_unexpected(ToErrorCode(completion.entryStatus[0]));
+            return tl::make_unexpected(ToErrorCode(completion.entryStatus[0], false));
     }
 }
 ```
@@ -1446,7 +1446,7 @@ tl::expected<bool, ErrorCode> KvClientObjectStorageAdapter::Exists(
 - **不检查 `queryResult`**：设计期伪代码会校验 `result.queryResult->exists.size()`，实现改用 `waitForCompletion` 后不再读 `queryResult`。布尔值只以 entryStatus 的明确 code 为准。
 - 空 key 在本地拒绝，不产生任何 SDK 调用（测试断言 `TotalSdkCalls()` 不变）。
 
-#### `DeleteBatch`（`:254-296`）与 `Delete`（`:246-252`）
+#### `DeleteBatch`（`:242-285`）与 `Delete`（`:234-240`）
 
 PR1 落地的控制面。不注册 buffer，因此没有 handle 生命周期问题：
 
@@ -1455,7 +1455,7 @@ PR1 落地的控制面。不注册 buffer，因此没有 handle 生命周期问�
 - `waitForCompletion` 后逐项映射，按 `indices[j]` 回填 `results`。
 - `Delete` 单 key 用 `std::array<std::string, 1>` 转调 `DeleteBatch`，取 `results.front()`；空结果返回 `INVALID_PARAMS`。
 
-#### `ToErrorCode`：完整映射表（`:74-128`）
+#### `ToErrorCode`：完整映射表（`:74-132`）
 
 SDK 的 `StatusCode` 枚举共 **34** 个成员（16 个通用码 + 7 个 `ENTRY_*` + 11 个 `CQE_*`）。适配器全文件用到其中 **27** 个：`ToErrorCode` 的 switch 覆盖 **23** 个 case，另外 4 个（`PARTIAL_FAILED`、`TASK_NOT_FOUND` 在 `waitForCompletion` 里判终态，`INTERNAL_ERROR` 用于本地构造的填充状态，`ENTRY_KEY_EXIST` 只在 `Exists` 的 code 分支）不经 `ToErrorCode`。
 
@@ -1466,32 +1466,33 @@ SDK 的 `StatusCode` 枚举共 **34** 个成员（16 个通用码 + 7 个 `ENTRY
 | `OK` | `OK` | — |
 | `TIMEOUT`、`CQE_IO_TIMEOUT` | `RPC_TIMEOUT` | 超时 |
 | `IN_PROGRESS`、`CANCELED` | `INTERNAL_ERROR` | 非终态，不应外泄为具体 I/O 结果 |
-| `CQE_KEY_NOT_EXIST`、`ENTRY_KEY_NOT_FOUND`、`ENTRY_DATA_NOT_EXIST`、`ENTRY_KEY_NOT_EXIST` | `OBJECT_NOT_FOUND` | **只有 entry 级 key-not-found 算 miss**。LOAD 报前两者之一，QUERY 报 `ENTRY_KEY_NOT_EXIST` |
+| `CQE_KEY_NOT_EXIST`、`ENTRY_KEY_NOT_EXIST` | `OBJECT_NOT_FOUND` | **QUERY 专用**的 miss 码，写路径不会出现，因此不参与读写分流 |
+| `ENTRY_KEY_NOT_FOUND`、`ENTRY_DATA_NOT_EXIST` | `is_write ? FILE_WRITE_FAIL : OBJECT_NOT_FOUND` | **唯一的读写分流点**。LOAD 报这两个码是 miss；BATCH_STORE 报同样的码是「写入失败」。映射成 `OBJECT_NOT_FOUND` 会污染调用方分类与写错误指标，且 PR3 可能据此删元数据（SFMEA-23） |
 | `NOT_FOUND`、`NOT_INITIALIZED`、`CONNECTION_ERROR`、`IO_ERROR`、`UNSUPPORTED`、`ENTRY_DELETE_FAILED`、`ENTRY_RETRY_ADVISED` | `DFS_SERVICE_UNAVAILABLE` | **task 级 `NOT_FOUND` 是路由/配置/视图错误，不是对象缺失**——映射成 `OBJECT_NOT_FOUND` 会让 PR3 删元数据、PR2 淘汰活元数据。`ENTRY_DELETE_FAILED` 归此（`ENTRY_KEY_NOT_EXIST` 只由 QUERY 产生）。`ENTRY_RETRY_ADVISED` 是 SDK 标记的可重试存储侧状况；单 entry LOAD 会把同一状况报成 `IO_ERROR`，这样映射让单条与批量路径一致 |
 | `ENTRY_NO_RETRY_ADVISED` | `INTERNAL_ERROR` | 显式不可重试：重试不可能成功，**不能**读作临时服务故障 |
 | `INVALID_ARGUMENT`、`BUFFER_NOT_REGISTERED`、`BUFFER_NOT_SUPPORTED` | `INVALID_PARAMS` | 参数/注册问题 |
 | `CQE_OUT_OF_CREATE_SIZE`、`RESOURCE_BUSY`、`CQE_RESOURCE_BUSY` | `NO_AVAILABLE_HANDLE` | 设备侧资源 |
 | 其他（`default`） | `INTERNAL_ERROR` | 未知码不静默吞掉成 OK |
 
-`ToWriteErrorCode`（`:130-144`）在此之上只改两条：`ENTRY_KEY_NOT_FOUND` / `ENTRY_DATA_NOT_EXIST` → `FILE_WRITE_FAIL`。
+`is_write` 只在 `ENTRY_KEY_NOT_FOUND` / `ENTRY_DATA_NOT_EXIST` 两个 case 上起作用，其余映射与方向无关。全部调用点里只有 `PutBatch` 的终态逐项分支传 `true`（见 §3.2.3）。
 
 #### 单 key 入口的包装情况
 
 | 入口 | 实现 | 说明 |
 | --- | --- | --- |
-| `Put(key, span)` | ✅ 转 `PutV`（`:298-302`） | 构造单元素 `iovec`；空 span 因 `iov_len == 0` 被守卫拒绝，不产生 SDK 调用 |
-| `PutV(key, iov, iovcnt)` | ✅ 转 `PutBatch`（`:304-309`） | 取 `results.front()`；空结果 → `INVALID_PARAMS` |
-| `Delete(key)` | ✅ 转 `DeleteBatch`（`:246-252`） | 同上 |
-| `Get(key, buf, len)` | ❌ **`NOT_SUPPORTED`**（`:437-440`） | 未包装成 `GetBatch`。单 key 读必须走 `GetBatch` |
-| `ListKeys()` | ❌ `NOT_SUPPORTED`（`:573-576`） | SDK 无枚举接口 |
+| `Put(key, span)` | ✅ 转 `PutV`（`:287-291`） | 构造单元素 `iovec`；空 span 因 `iov_len == 0` 被守卫拒绝，不产生 SDK 调用 |
+| `PutV(key, iov, iovcnt)` | ✅ 转 `PutBatch`（`:293-298`） | 取 `results.front()`；空结果 → `INVALID_PARAMS` |
+| `Delete(key)` | ✅ 转 `DeleteBatch`（`:234-240`） | 同上 |
+| `Get(key, buf, len)` | ✅ 转 `GetBatch`（`:427-432`） | `GetBatch({{logical_key, buf, len}})` 取 `results.front()`；空目标指针被守卫拒绝 |
+| `ListKeys()` | ❌ `NOT_SUPPORTED`（`:571-574`） | SDK 无枚举接口 |
 | `GetRange` | ❌ 未 override | 沿用基类 `NOT_SUPPORTED` |
 | `CheckHealth` | ❌ 未 override | 沿用基类 `NOT_SUPPORTED` → **`enable_health_check=true` 会让后端 Init 失败**（SFMEA-22） |
 
-**写/读是两份类型化实现**：`PutBatch` 与 `GetBatch` 分别处理 `ObjectPutRequest` / `ObjectGetRequest`，不能合成一个运行期 `is_store` 分支。两者共用 `waitForCompletion`、`MakeCacheKey`、`RegisterBuffers` / `UnregisterBuffers`，但错误映射函数不同（`ToWriteErrorCode` vs `ToErrorCode`）。
+**写/读是两份类型化实现**：`PutBatch` 与 `GetBatch` 分别处理 `ObjectPutRequest` / `ObjectGetRequest`，不能合成一个运行期 `is_store` 分支。两者共用 `waitForCompletion`、`MakeCacheKey`、`RegisterBuffers` / `UnregisterBuffers`，也共用 `ToErrorCode`——只是传的 `is_write` 不同。
 
 **多 slice 读**：后端在 `BatchReadOnce` 内为多 slice 请求分配 `staging_buffers[i]`（`distributed_storage_backend.cpp:1059-1064`），`GetBatch` 只看到一段连续目标 buffer；返回后后端 `memcpy` 散回各 slice（`:1080-1087`）。这段逻辑与 KVCS/OSS/S3 共用，**不是 kvclient 特化**。
 
-#### 工厂（`:578-583`）
+#### 工厂（`:576-583`）
 
 ```cpp
 tl::expected<std::unique_ptr<ObjectStorageAdapter>, ErrorCode>
@@ -1634,7 +1635,7 @@ bool UsesKvClient() const { return fs_adapter_type == "kvclient"; }
 - 适配器只做**结构性**守卫（key 非空、iov 形状、物理连续性、总长非 0、同批重复 key）；请求参数是否可接受、超时与设备错误全部由 KvClient SDK 判定。
 - `aligned_size` 与 `object_size` 都等于 N（对象路径不读取 `aligned_size`）。
 - 读成功项必须返回 N；`DistributedStorageBackend` 会比对 `*result == request.size`（`:1077-1079`），不符 → `FILE_READ_FAIL`。
-- 写路径的错误映射经 `ToWriteErrorCode`，与读路径的 `ToErrorCode` 在两个 entry 码上不同（SFMEA-23）。
+- 写路径的错误映射经 `ToErrorCode(..., is_write=true)`，与读路径只在两个 entry 码上不同（SFMEA-23）。
 
 **多 slice**：
 
@@ -2227,7 +2228,7 @@ endif()
 | T-12 | 单元 | 析构时 SDK 内部仍有 pending task | 只调 SDK `Shutdown()`；适配器无需外部消费的资源 | SFMEA-15 | 缺口（`shutdown_calls_` 已有计数字段，但无用例断言） |
 | T-22 | 单元 | `waitForCompletion` 的 `TASK_NOT_FOUND` 分支 | 非终态；逐项 `INTERNAL_ERROR`；调用方保留资源 | SFMEA-24 | **缺口**（PR2 新增的分支，无测试覆盖） |
 | T-27 | 单元 | `waitForCompletion` 的 entry 数不匹配分支 | 逐项 `INTERNAL_ERROR`，不读取条数不符的向量 | SFMEA-06 | 缺口 |
-| T-28 | 单元 | 写路径 `ENTRY_KEY_NOT_FOUND` / `ENTRY_DATA_NOT_EXIST` | 映射为 **`FILE_WRITE_FAIL`**（不是 `OBJECT_NOT_FOUND`） | SFMEA-23 | **缺口**（`ToWriteErrorCode` 无专属测试） |
+| T-28 | 单元 | 写路径 `ENTRY_KEY_NOT_FOUND` / `ENTRY_DATA_NOT_EXIST` | 映射为 **`FILE_WRITE_FAIL`**（不是 `OBJECT_NOT_FOUND`） | SFMEA-23 | **缺口**（`is_write=true` 分支无专属测试；已有用例只覆盖 `ENTRY_RETRY_ADVISED`） |
 | T-29 | 单元 | 求和溢出（`iov_len` 接近 `SIZE_MAX`） | `INVALID_PARAMS`，不注册、不提交 | SFMEA-02 | 缺口 |
 | T-30 | 单元 | 跨对象合批：3 对象 250 entry，SDK 子批 110 | 适配器一次 `StoreAsync` 提交全部 entry；结果按原下标回填 | §3.2.3 | 缺口（fake SDK 不模拟子批切分，需真机或更复杂的 fake） |
 | T-14 | 集成 | 两副本 Put → 淘汰 memory → 另一 Client Get；DFS-only 全流程 | 数据逐字节一致；DFS-only 成功 | S1 / S2 | **【PR3】** |
@@ -2293,7 +2294,7 @@ endif()
 | 环节 | 行为 |
 | --- | --- |
 | Master 铸 descriptor（`master_service.cpp:4990-4991`） | `object_size = aligned_size = value_length`，**不对齐** |
-| 适配器注册/提交（`:384-387`、`:482-485`） | `region.size = N`，**不对齐、不补齐** |
+| 适配器注册/提交（`:361`、`:462`） | `region.size = N`，**不对齐、不补齐** |
 | `aligned_size` 字段 | 对象存储路径**根本不读取它**——`aligned_size` 只出现在 shard/bucket 的 range 校验里（`distributed_storage_backend.cpp:64-95`），`ValidateReadRequest` 在 `UsesObjectStorage()` 下走 capacity 分支（`:897-903`） |
 
 > **这否决了「Master 对齐 descriptor」这条路**：既然对象路径不读 `aligned_size`，把它对齐到 512 也不会改变适配器提交的 `region.size`（后者来自 `object_size` 与调用方 buffer）。要真正对齐就得改注册长度并让读侧截取，代价是零拷贝失效——与裁决相反。
@@ -2375,7 +2376,7 @@ cd "$MC_BUILD" && ninja mooncake-store/src/CMakeFiles/mooncake_store_client_obje
 
 # 5) 证明编出来的确实是你的代码（别只看退出码）
 nm -C "$MC_BUILD"/mooncake-store/src/CMakeFiles/mooncake_store_client_objects.dir/storage/distributed/kvclient/kvclient_object_storage_adapter.cpp.o \
-  | grep -E "RegisterBuffers|UnregisterBuffers|MakeCacheKey|ToWriteErrorCode"
+  | grep -E "RegisterBuffers|UnregisterBuffers|MakeCacheKey|ToErrorCode"
 ```
 
 要跑单元测试，第 3 步改成 `-DBUILD_UNIT_TESTS=ON`，然后 `ninja kvclient_object_storage_adapter_test && ctest -R KvClientAdapterTest`。
