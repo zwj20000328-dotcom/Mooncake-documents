@@ -1287,20 +1287,17 @@ if (dfs_config.UsesKvClient()) {
     return;
 }
 
-// DFS 可用性门（实际 master_service.cpp:5154-5156）：保留 !enable_dfs_ 前缀
+// DFS 可用性门（实际 master_service.cpp:5146-5154）：保留 !enable_dfs_ 前缀
 if (config.dfs_replica_num > 0 &&
     (!enable_dfs_ ||
      (!use_kvcs_ && !use_kvclient_ &&
       (!dfs_allocator_ || !dfs_allocator_->IsInitialized())))) {
-    // 现有实现返回 DFS_SERVICE_UNAVAILABLE（:5160），不要改成 INVALID_PARAMS。
+    // 现有实现返回 DFS_SERVICE_UNAVAILABLE（:5153），不要改成 INVALID_PARAMS。
     return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
 }
 
-// PrepareWriteStart：只保留 NOF 拒绝（覆盖 PutStart / UpsertStart / BatchPutStart）
-if (config.dfs_replica_num > 0 && use_kvclient_ &&
-    config.nof_replica_num > 0) {
-    return INVALID_PARAMS;   // NOF 与 kvclient 不共存
-}
+// PrepareWriteStart 不新增 nof 拒绝：NOF 与 use_kvclient_ 正交，
+// nof_replica_num > 0 由既有 #ifndef USE_NOF 门（:5163-5170）拦截。
 
 // descriptor 铸造：kvclient 与 KVCS 形状一致
 if (config.dfs_replica_num > 0) {
@@ -1321,7 +1318,7 @@ const bool supports_dfs_condition =
     expected_replica_id != nullptr &&
     (use_kvcs_ || use_kvclient_);
 
-// 白名单 2：target_pred 里同样要放宽（实际 :6345-6360）
+// 白名单 2：target_pred 里同样要放宽（实际 :6328-6343）
 auto target_pred = [this, replica_type, &client_id, expected_replica_id](
                        const Replica& r) {
     if (replica_type == ReplicaType::DFS) {
@@ -1339,7 +1336,7 @@ auto target_pred = [this, replica_type, &client_id, expected_replica_id](
 > - 不新增请求参数预检；参数合法性由 SDK 判定。
 > - descriptor 与 KVCS 形状一致（`aligned_size = value_length`），不需要 `CheckedAlignUp` 或 `kvclient_config.h`。
 > - 恢复门（`master_service.cpp:3434 / 3726 / 4014`）保持 KVCS-only，**不要**并入 `use_kvclient_`；kvclient 的恢复能力由启动期 `throw std::invalid_argument` 拒绝 `enable_oplog_` 兜底。
-> - `nof_replica_num > 0` 的拒绝在默认构建已有 `#ifndef USE_NOF` 分支（`:5170-5177`），kvclient 需要**无条件**拒绝，避免 `-DUSE_NOF=ON` 构建下漏拦。
+> - **不新增 nof 拒绝**。NOF 副本由 `nof_segment_manager_` 独立分配、经 `WriteMemoryAndNofReplicas` 传输，从不进对象存储后端，与 `use_kvclient_` 正交；`nof_replica_num > 0` 在非 `USE_NOF` 构建已由既有 `#ifndef USE_NOF` 分支（`:5163-5170`）拦截，在 `USE_NOF` 构建下未挂载 NOF segment 时由 `HasExpectedReplicaAllocation` 返回 `NO_AVAILABLE_HANDLE`。kvcs 后端从无等价门，新增一条只会造成后端不对称。
 > - `PrepareWriteStart` 同时覆盖 `PutStart`、`UpsertStart` 与 `BatchPutStart`。
 > - `EvictDiskReplica` / `BatchEvictDiskReplica` 以 `expected_replica_id = nullptr` 调用共享实现，DFS 永远被拒；PR2 不改变该行为，只有 `EvictDiskReplicaIfCurrent` 可用。
 

@@ -50,7 +50,7 @@ v4.10 是设计期文档，以下条目在实现时发生了变更，本版已�
 | 6 | `waitForCompletion` 只分「OK/PARTIAL_FAILED」与「TIMEOUT/CANCELED/IN_PROGRESS」两支 | 新增 `TASK_NOT_FOUND` 分支（非终态）；default 分支为**终态**并扇出 task 状态；额外校验 `entryStatus.size() == entry_count` | §2.3.2、§2.3.3 |
 | 7 | `Exists` 手工 `Wait` 并校验 `queryResult->exists` | 复用 `waitForCompletion`，**不检查** `queryResult` | §3.2.3 |
 | 8 | `enable_oplog=true` 时 Master `LOG(FATAL)` | 改为 `LOG(ERROR)` + `throw std::invalid_argument`，与相邻 filesystem DFS 分支风格一致 | §1.2.2、§3.5、SFMEA-13 |
-| 9 | nof 拒绝写成嵌套 if，error=`kvclient_rejects_nof_with_dfs` | 合并为单个 if，error=`nof_not_supported_with_kvclient` | §3.5 |
+| 9 | nof 拒绝写成嵌套 if，error=`kvclient_rejects_nof_with_dfs` | **整条删除**。NOF 与 `use_kvclient_` 正交：NOF 由 `nof_segment_manager_` 独立分配、走 `WriteMemoryAndNofReplicas`，从不进对象存储后端；且该门要求 `dfs_replica_num > 0`，kvclient 下 NOF-only Put 本来就放行，条件与注释自相矛盾。默认（`USE_NOF=OFF`）构建下它还被既有 `#ifndef USE_NOF` 门（`:5163`）完全覆盖，只改日志字符串。kvcs 后端从无等价门 | §3.5、SFMEA-13 |
 | 10 | 两个 metric + ERROR/VLOG 分级日志 + `cache_key`/`task_id`/`buffer_addr` 关联字段 | **均未实现**，当前只有 1 条 INFO + 1 条 WARNING | §2.5 |
 | 11 | 同一 `(ptr,size)` 只注册一次、多请求复用同一 handle | **每个请求各注册一次**，批末一次批量注销 | §3.4、§5 |
 | 12 | 全文行号锚定 main `46c5eca8` | 已重锚到 `a2841229` + 工作区 | 全文 |
@@ -122,7 +122,6 @@ L3 当前的 `DistributedStorageBackend` 已支持 `hf3fs` / `posix` / `oss` / `
 | `RemoveAll` / `RemoveByRegex` | 依赖 key 枚举；只删元数据会泄漏全部 L3 value | 应返回 `NOT_SUPPORTED` 且**元数据不删** | **【PR3】** 当前仍为 `UsesKvcs()` only（`client_service.cpp:3891/3912`） |
 | 元数据恢复 | 不支持恢复裁决 | `recovery_enabled`（= `enable_oplog_`）为真时 Master 启动期 `LOG(ERROR)` + `throw std::invalid_argument`（`master_service.cpp:896-908`） | ✅（PR2） |
 | 容量水位淘汰 | SDK 无容量查询接口 | Master 侧不创建 capacity provider、不启用淘汰（分支直接 `return`） | ✅（PR2） |
-| NOF 副本与 kvclient 共存 | 对象存储后端无 NOF 通路 | `PrepareWriteStart` 拒绝 `dfs_replica_num > 0 && nof_replica_num > 0`，返回 `INVALID_PARAMS`（`master_service.cpp:5155-5164`） | ✅（PR2） |
 | 多租户 | raw key 不加租户前缀会跨租户碰撞（见 §5） | `DistributedStorageConfig::Validate()` 要求 `single_tenant=true`（`:78-92`） | ✅（PR1） |
 
 ---
@@ -394,7 +393,7 @@ Master 查询自身对象目录，Client 根据返回的描述符经 `Distribute
 
 | 类 | 改动与职责 | 状态 |
 | --- | --- | --- |
-| `MasterService` | 新增私有 `use_kvclient_`（`master_service.h:2065`，与 `use_kvcs_` 平级）。改动：`enable_dfs_` 判定（`:833-834`）、初始化新增分支（`:896-911`）、descriptor 铸造（`:4988`）、`PrepareWriteStart` 两道门（`:5147`、`:5155-5164`）、`EvictDiskReplicaImpl` 白名单两处（`:6331`、`:6348`） | ✅ PR2 |
+| `MasterService` | 新增私有 `use_kvclient_`（`master_service.h:2065`，与 `use_kvcs_` 平级）。改动：`enable_dfs_` 判定（`:833-834`）、初始化新增分支（`:896-911`）、descriptor 铸造（`:4988`）、`PrepareWriteStart` DFS 可用性门（`:5147`）、`EvictDiskReplicaImpl` 白名单两处（`:6321`、`:6338`） | ✅ PR2 |
 | `DistributedStorageConfig` | 解析 KVClient 配置，提供与 `UsesKvcs()` 平级的能力判断 | ✅ PR1 |
 | `ObjectMetadata` / `Replica` | 保存 key、写入 Client、副本身份、状态和读取租约，沿用既有元数据持久化方式 | 复用 |
 | `Replica::Descriptor` / `DistributedFSDescriptor` | 向 Client 返回对象长度、ReplicaID 和状态。KVClient 模式下 `file_path` 为空、`offset` 为 0、`shard_idx` 为 -1，`object_size = N`、`aligned_size = N`（与 KVCS 一致） | ✅ PR2 |
@@ -529,7 +528,7 @@ flowchart TB
 
 普通 `Client::Query` 使用本地查询起始时间加 `lease_ttl_ms` 计算租约截止时间，完整对象 Get 在 `GetBatch` 返回后检查有效期。
 
-> **【PR3】图中 ⑨⑩ 尚未接通**：适配器已把 entry 级 key-not-found 映射为 `OBJECT_NOT_FOUND`（PR2），Master 白名单也已放宽到 `use_kvclient_`（PR2，`master_service.cpp:6331/6348`），但 Client 侧的触发点 `ReconcileMissingKvcsReplica`（`client_service.cpp:5491`）门控仍是 `UsesKvcs()` only。所以当前 kvclient 读 miss **不会**清理失效记录，只会把 miss 返回给调用方。
+> **【PR3】图中 ⑨⑩ 尚未接通**：适配器已把 entry 级 key-not-found 映射为 `OBJECT_NOT_FOUND`（PR2），Master 白名单也已放宽到 `use_kvclient_`（PR2，`master_service.cpp:6321/6338`），但 Client 侧的触发点 `ReconcileMissingKvcsReplica`（`client_service.cpp:5491`）门控仍是 `UsesKvcs()` only。所以当前 kvclient 读 miss **不会**清理失效记录，只会把 miss 返回给调用方。
 
 ### 2.2.3 删除流程（S3，value-first）
 
@@ -633,7 +632,7 @@ flowchart TB
 
  **仅 MEMORY 的对象无法经 Upsert 补 DFS 副本**，需先 Remove 再 Put。
 
-Upsert 与 Put 共用 `PrepareWriteStart`（`master_service.cpp:5147` 的 `!use_kvcs_ && !use_kvclient_ && ...` 与 `:5155-5164` 的 nof 拒绝）和 `AllocateReplicas`（`:4988` 的 descriptor 铸造），PR2 已同时放宽这两处，因此 Upsert 的门无需额外改动。
+Upsert 与 Put 共用 `PrepareWriteStart`（`master_service.cpp:5147` 的 `!use_kvcs_ && !use_kvclient_ && ...`）和 `AllocateReplicas`（`:4988` 的 descriptor 铸造），PR2 已同时放宽这两处，因此 Upsert 的门无需额外改动。
 
 ## 2.3 运行设计
 
@@ -863,7 +862,7 @@ sequenceDiagram
 
 清理是条件性的：Client 携带本次读取**观察到**的 ReplicaID，Master 在 key 锁内核对，只有仍为当前记录时才移除。读到 R1 而目录已是 R2 时返回不匹配，R2 原样保留。
 
-> **【PR3】Client 侧未接通**。Master 侧白名单已在 PR2 放宽（`master_service.cpp:6329-6331` 的 `supports_dfs_condition` 与 `:6345-6352` 的目标谓词都改成 `use_kvcs_ || use_kvclient_`），所以 RPC 到达 Master 后能正确处理；缺的是 Client 端根本不发起这个 RPC。
+> **【PR3】Client 侧未接通**。Master 侧白名单已在 PR2 放宽（`master_service.cpp:6319-6321` 的 `supports_dfs_condition` 与 `:6337-6340` 的目标谓词都改成 `use_kvcs_ || use_kvclient_`），所以 RPC 到达 Master 后能正确处理；缺的是 Client 端根本不发起这个 RPC。
 
 ```mermaid
 sequenceDiagram
@@ -879,7 +878,7 @@ sequenceDiagram
     C->>MC: EvictDiskReplicaIfCurrent(key, tenant, DFS, ReplicaID)
     MC->>M: RPC
     M->>META: key 锁内取 metadata
-    M->>M: 白名单校验（PR2 已落地，:6329-6331）<br/>DFS && expected_replica_id != nullptr<br/>&& (use_kvcs_ || use_kvclient_)
+    M->>M: 白名单校验（PR2 已落地，:6319-6321）<br/>DFS && expected_replica_id != nullptr<br/>&& (use_kvcs_ || use_kvclient_)
     alt ReplicaID 匹配
         M->>META: EraseReplicasWithCacheTotalAccounting(target_pred)
         M->>M: !metadata.IsValid() → accessor.Erase()
@@ -930,7 +929,7 @@ sequenceDiagram
 | SFMEA-10 | 删除中间态：value 已删而元数据残留（`BatchRemove` 失败 / `CheckRemovable` 拒绝 / Client 崩溃），或 value 删除失败 | 已发布对象不可读；或两者同时保留 | 失败项不进元数据删除集合 → 可安全重试；残留由读取 miss 自愈 | **【PR3】** value-first 与 miss 清理必须同时落地 |
 | SFMEA-11 | 迟到 Delete 误删新 value（同 key 重写） | 旧删除请求命中新写入的 value | 无专门机制；调用方须串行组织同 key 的删除 / 重建 / 更新。适配器侧 `StoreAsync` 本身是 upsert，覆盖写不预删（测试 `OverwriteDoesNotPreDelete`） | 调用方契约，非本方案引入 |
 | SFMEA-12 | `RemoveAll` / `RemoveByRegex` 被调用 | 若只删元数据不删 value → **一次性泄漏整个 L3** | 门控放宽到 KVClient，返回 `NOT_SUPPORTED` 且**不删元数据** | **【PR3】** 当前 `client_service.cpp:3891/3912` 仍是 `UsesKvcs()` only |
-| SFMEA-13 | 不支持的配置：Master 重启无恢复、误配 `enable_oplog=true`、`dfs + nof` 共存 | 目录全丢且不可恢复；或 nof 变为必需导致整 Put 失败 | 恢复门保持 `use_kvcs_` only，kvclient + recovery 在启动期 `LOG(ERROR)` + `throw std::invalid_argument`；`PrepareWriteStart` 拒绝 `nof_replica_num > 0`（该检查**不能**只放在 `#ifndef USE_NOF` 下） | ✅ PR2 |
+| SFMEA-13 | 不支持的配置：Master 重启无恢复、误配 `enable_oplog=true` | 目录全丢且不可恢复 | 恢复门保持 `use_kvcs_` only，kvclient + recovery 在启动期 `LOG(ERROR)` + `throw std::invalid_argument` | ✅ PR2 |
 | SFMEA-14 | miss 清理 CAS 不匹配（读到 R1，目录已是 R2） | 无 | `EvictDiskReplicaIfCurrent` 返回 false，R2 原样保留 | ✅ PR2 白名单已放宽；触发 **【PR3】** |
 | SFMEA-15 | 析构时仍有未返回的同步 batch，或 handle 未释放 | 提前注销会让设备访问已注销内存；漏注销会泄漏 SDK 注册 | `PutBatch` / `GetBatch` 在返回前完成 `Wait` 并批量注销；`try/catch(...)` 保证异常路径也注销；析构只调 SDK `Shutdown()` | ✅ PR2。测试 `UnregisterFailureIsLoggedNotFatal` |
 | SFMEA-16 | 读回长度 != `object_size` | 数据不完整 | 适配器成功项返回 `requests[index].size`；后端比对 `*result == request.size`（`distributed_storage_backend.cpp:1077-1079`），不符 → `FILE_READ_FAIL` | ✅ PR2。**注意**：SDK 不提供实际传输字节数，所以该比对对成功项恒真，**截断读检测不出来**，只能靠上层 checksum |
@@ -1000,11 +999,10 @@ sequenceDiagram
 | 写失败报 `FILE_WRITE_FAIL` | SDK 在写路径回了 `ENTRY_KEY_NOT_FOUND` / `ENTRY_DATA_NOT_EXIST`，由 `ToErrorCode(..., is_write=true)` 专门区分（SFMEA-23）——是**写失败**，不是对象不存在 |
 | 每批延迟偏高 | 每请求一次 `RegisterRegions` + 每批一次 `UnregisterRegions`；批越大注册往返越多。查批大小 |
 | Remove 返回错误且对象变为不可读 | **【PR3】落地后**才是已知窗口（SFMEA-10）。当前 kvclient 走 metadata-first，症状相反：Remove 成功但 value 残留（永久泄漏） |
-| Get 持续 `OBJECT_NOT_FOUND` 但目录有记录 | **【PR3】未接通**：Client 的 `ReconcileMissingKvcsReplica` 门控仍是 `UsesKvcs()`，不会清理。PR3 落地后若仍如此，查 `EvictDiskReplicaIfCurrent` 是否返回 `INVALID_PARAMS`——说明 Master 白名单漏改（`master_service.cpp:6331/6348`） |
+| Get 持续 `OBJECT_NOT_FOUND` 但目录有记录 | **【PR3】未接通**：Client 的 `ReconcileMissingKvcsReplica` 门控仍是 `UsesKvcs()`，不会清理。PR3 落地后若仍如此，查 `EvictDiskReplicaIfCurrent` 是否返回 `INVALID_PARAMS`——说明 Master 白名单漏改（`master_service.cpp:6321/6338`） |
 | Master 重启后 L3 全部读不到 | 预期行为（不支持恢复裁决，SFMEA-13）。目录不可恢复，value 不可枚举 |
 | Master 启动即 `throw std::invalid_argument` | `enable_oplog=true` + kvclient 被启动期拒绝（`master_service.cpp:899-907`）。改成 `false` |
 | Put/Upsert 返回 `DFS_SERVICE_UNAVAILABLE` 且日志 `error=dfs_service_unavailable` | `enable_dfs_` 为假，或 `use_kvcs_`/`use_kvclient_` 都为假且无 dfs allocator（`:5146-5154`）。查 Master 启动日志有无 "KVClient distributed object storage initialized" |
-| Put/Upsert 返回 `INVALID_PARAMS` 且日志 `error=nof_not_supported_with_kvclient` | `dfs_replica_num > 0` 与 `nof_replica_num > 0` 同时请求（`:5155-5164`）。二选一 |
 
 ---
 
@@ -1666,9 +1664,8 @@ bool UsesKvClient() const { return fs_adapter_type == "kvclient"; }
 | `:4007-4008` | **仅加注释**：同上 | standby 描述符重建 |
 | `:4988` | `if (use_kvcs_ \|\| use_kvclient_) {` | descriptor 铸造 |
 | `:5146-5149` | `(!use_kvcs_ && !use_kvclient_ && (!dfs_allocator_ \|\| ...))` | 放行「无 allocator」的对象存储后端 |
-| `:5155-5164` | 新增 `dfs + nof` 拒绝 | 两副本硬逻辑裁决 |
-| `:6329-6331` | `(use_kvcs_ \|\| use_kvclient_)`（`supports_dfs_condition`） | miss 清理白名单 |
-| `:6345-6352` | `(use_kvcs_ \|\| use_kvclient_) && expected_replica_id != nullptr && ...` | miss 清理目标谓词 |
+| `:6319-6321` | `(use_kvcs_ \|\| use_kvclient_)`（`supports_dfs_condition`） | miss 清理白名单 |
+| `:6337-6340` | `(use_kvcs_ \|\| use_kvclient_) && expected_replica_id != nullptr && ...` | miss 清理目标谓词 |
 | **不改** `:3422`、`:3719`、`:4009` 的**条件本身** | 恢复门保持 `!use_kvcs_` | 不支持恢复裁决 |
 
 > 注意 `:3422`/`:3717`/`:4007` 三处只加了注释、没改逻辑——因为它们检查的是 `!use_kvcs_`，而 kvclient 已在启动期被拒绝与恢复共存，所以 kvclient 运行**永远走不到**这些路径。注释正是为了把这条推理固定下来。
@@ -1706,7 +1703,7 @@ if (dfs_config.UsesKvClient()) {
 - KVCS 走自己的 capacity provider 初始化，不受影响；
 - kvclient 抢在 filesystem 分支之前 return，避免被误当作 filesystem DFS 而创建 allocator。
 
-**`PrepareWriteStart` 的两道门**（`:5146-5164`，**实际代码**）：
+**`PrepareWriteStart` 的门**（`:5146-5154`，**实际代码**）：
 
 ```cpp
 if (config.dfs_replica_num > 0 &&
@@ -1718,24 +1715,15 @@ if (config.dfs_replica_num > 0 &&
                << ", error=dfs_service_unavailable";
     return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
 }
-// NOF replicas cannot coexist with the kvclient object-storage backend.
-// This check must not live under #ifndef USE_NOF only, or a NOF-enabled
-// build would accept a combination that cannot work.
-if (config.dfs_replica_num > 0 && use_kvclient_ &&
-    config.nof_replica_num > 0) {
-    LOG(ERROR) << "key=" << key
-               << ", nof_replica_num=" << config.nof_replica_num
-               << ", error=nof_not_supported_with_kvclient";
-    return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-}
 ```
 
-- 第一道：在原有的 `!use_kvcs_ &&` 后插入 `!use_kvclient_ &&`，**保留了 `!enable_dfs_ ||` 前缀**。语义是「dfs 未启用，或既非对象存储后端又没有可用 allocator」才拒绝。
-- 第二道：**新增的 nof 拒绝**。写成单个扁平 if（不是嵌套在 `use_kvclient_` 判断里），且**刻意放在 `#ifndef USE_NOF` 之外**——代码注释已说明理由：若只在 `#ifndef USE_NOF` 下检查，NOF-enabled 的构建就会接受一个根本无法工作的组合。
+在原有的 `!use_kvcs_ &&` 后插入 `!use_kvclient_ &&`，**保留了 `!enable_dfs_ ||` 前缀**。语义是「dfs 未启用，或既非对象存储后端又没有可用 allocator」才拒绝。
 
 放在 `PrepareWriteStart` 而非 `AllocateReplicas`，因为 Put 与 Upsert 都过这道门（`AllocateReplicas` 只在分配阶段，Upsert 的原地复用分支会绕过它）。
 
-**Master 侧不做请求参数预检**：长度、对齐、可写性等都由 SDK 判定。`PrepareWriteStart` 只加了两副本硬逻辑所需的**拓扑**约束（nof 互斥），没有加任何长度类校验。
+**不新增 nof 拒绝**：NOF 与 `use_kvclient_` 正交——NOF 副本由 `nof_segment_manager_` 独立分配（`:4906-4934`）、经 `WriteMemoryAndNofReplicas` 传输，从不进对象存储后端；kvclient 适配器内 grep `nof` 命中 0 次。`dfs_replica_num > 0` 使写模式落到 `RELIABLE_MULTI_REPLICA`（`replica.h:313-324`），该模式的所有消费方都逐层校验三层副本（`AllAllocatedTransfersSucceeded`、`DetermineFinalizeDecision`、`PutEnd(ALL)` / `PutRevoke(ALL)` 的 memory∪nof∪dfs 谓词），不存在漏算一层导致部分成功的失效。`nof_replica_num > 0` 的拦截完全由既有门承担：非 `USE_NOF` 构建走 `:5163-5170` 的 `nof_pool_disabled`，`USE_NOF` 构建下未挂载 NOF segment 时由 `HasExpectedReplicaAllocation` 返回 `NO_AVAILABLE_HANDLE`。kvcs 后端从无等价门，新增一条只会造成后端不对称。
+
+**Master 侧不做请求参数预检**：长度、对齐、可写性等都由 SDK 判定。
 
 **descriptor 铸造**（`:4987-4994`，**实际代码**）：
 
@@ -1756,7 +1744,7 @@ if (config.dfs_replica_num > 0) {
 
 > **`aligned_size = value_length` 不对齐到 512，这是有意的**（裁决 D-1）：512B 对齐属调用方契约，适配器不校验、不补齐。且对象存储路径**根本不读取 `aligned_size`**（该字段只用于 shard/bucket 的 range 校验），所以对 wire 上的 `length` 没有影响。契约内容与违约后果见 §6.1。
 
-**`EvictDiskReplicaImpl` 白名单**（`:6329-6331` 与 `:6345-6352`，**实际代码**）：
+**`EvictDiskReplicaImpl` 白名单**（`:6319-6321` 与 `:6337-6340`，**实际代码**）：
 
 ```cpp
 const bool supports_dfs_condition = replica_type == ReplicaType::DFS &&
@@ -1834,7 +1822,7 @@ void Client::ReconcileMissingKvReplica(
 
 调用点 `:1670`、`:1995` 同步改名，声明 `client_service.h:1099` 同步。触发条件不变：仅 `OBJECT_NOT_FOUND`。
 
-> Master 侧的白名单（`master_service.cpp:6331/6348`）已在 PR2 放宽，所以 PR3 只需改 Client 侧发起端。
+> Master 侧的白名单（`master_service.cpp:6321/6338`）已在 PR2 放宽，所以 PR3 只需改 Client 侧发起端。
 
 **改动 2：`BatchRemove` 的 KVClient 分支改 value-first**（value-first 删除裁决）
 
@@ -2237,7 +2225,7 @@ endif()
 | T-17 | 集成 | 删除：元数据失败 / lease 保护 / value 删除失败 / 部分成功；删除幂等 | 失败项两者保留可重试；成功项元数据删除；miss 自愈 | SFMEA-10 | **【PR3】** |
 | T-18 | 集成 | `RemoveAll()` / `RemoveByRegex()` | `NOT_SUPPORTED`，**且 Master 侧元数据完全未变** | SFMEA-12 | **【PR3】** |
 | T-31 | 集成 | Master 侧门控：`enable_oplog=true` + kvclient | 启动期 `throw std::invalid_argument` | SFMEA-13 | 缺口（PR2 的 Master 改动无测试） |
-| T-32 | 集成 | Master 侧门控：`dfs_replica_num > 0 && nof_replica_num > 0` | `PrepareWriteStart` 返回 `INVALID_PARAMS`，日志 `error=nof_not_supported_with_kvclient` | SFMEA-13 | 缺口 |
+| T-32 | 集成 | kvclient 下三层副本 `replica_num=1, nof_replica_num=1, dfs_replica_num=1`（`USE_NOF=ON` + 挂载 NOF segment）；以及默认 `USE_NOF=OFF` 构建下同配置 | 前者：三层各自分配成功、`PutEnd(ALL)` 提交、读取按 memory > nof > dfs 优先；后者：`PrepareWriteStart` 返回 `INVALID_PARAMS`，日志 `error=nof_pool_disabled`（既有门，非 kvclient 专属） | SFMEA-13 | 缺口（三层组合无任何测试） |
 | T-33 | 集成 | `EvictDiskReplicaIfCurrent` 白名单 | kvclient 下 ReplicaID 匹配 → 清理；不匹配 → false | SFMEA-14 | 缺口 |
 | T-19 | 真机 | 覆盖写；零拷贝读写返回后调用方 buffer 生命周期；跨节点合批路由；**512B 对齐契约的实际表现**（含违约时 >110 条大批次的假 OK 边界） | 分别确认 | 决定 buffer 归还时机；确认 §6.1 的失败形态 | 未开始 |
 

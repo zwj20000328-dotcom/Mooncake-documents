@@ -347,23 +347,29 @@ PR1 已有，PR2 未改动，但它是理解上面那张「哪个调用点传 `t
 | [L5147-5150](../Mooncake/mooncake-store/src/master_service.cpp#L5147-L5150) | 加入 `!use_kvclient_ &&` | 原条件要求「非 KVCS 时必须有已初始化的 allocator」；kvclient 同样没有 allocator，必须一并豁免，否则 [L5146](../Mooncake/mooncake-store/src/master_service.cpp#L5146) 恒真、所有写被拒 |
 | [L5151-5154](../Mooncake/mooncake-store/src/master_service.cpp#L5151-L5154) | 日志与 `DFS_SERVICE_UNAVAILABLE` | **保持原返回码不变**，按要求不改成 `INVALID_PARAMS` |
 
-### 4.6 NOF 拒绝（[L5155-5164](../Mooncake/mooncake-store/src/master_service.cpp#L5155-L5164)）
+### 4.6 不新增 NOF 拒绝
+
+`PrepareWriteStart` **没有** kvclient 专属的 `dfs + nof` 拒绝。曾加过一道（`error=nof_not_supported_with_kvclient`），已删除，理由是它拦不住任何真实失效：
+
+| 问题 | 核实结果 |
+| --- | --- |
+| 条件与注释自相矛盾 | 门要求 `dfs_replica_num > 0`，所以 kvclient 下「只申请 NOF」（`nof=1, dfs=0`）本来就放行；若 NOF 真无法与 kvclient 共存，就不该有这个前置条件 |
+| 默认构建下是死代码 | [L5163-5170](../Mooncake/mooncake-store/src/master_service.cpp#L5163-L5170) 的既有 `#ifndef USE_NOF` 门已拒掉任何 `nof_replica_num > 0`，返回同一个 `INVALID_PARAMS`；新门只是抢在前面执行、把日志原因换成 `nof_not_supported_with_kvclient` |
+| NOF 与 kvclient 正交 | NOF 由 `nof_segment_manager_` 独立分配（[L4906-4934](../Mooncake/mooncake-store/src/master_service.cpp#L4906-L4934)）、经 `WriteMemoryAndNofReplicas` 传输，从不进对象存储后端；kvclient 适配器内 grep `nof` 命中 0 次 |
+| 三层组合本身可用 | `dfs>0` 落到 `RELIABLE_MULTI_REPLICA`（`replica.h:313-324`），其消费方逐层校验三层副本（`AllAllocatedTransfersSucceeded`、`DetermineFinalizeDecision`、`PutEnd(ALL)` / `PutRevoke(ALL)` 的 memory∪nof∪dfs 谓词），不会漏算一层 |
+| 后端不对称 | kvcs 从无等价门（`master_service.cpp` 内 `use_kvcs_` 的 10 处无一与 `nof_replica_num` 相关），memory+nof+dfs 在 kvcs 下本来就允许 |
+| 错误语义不当 | 对格式良好且全链路支持的请求返回 `INVALID_PARAMS`；且会抢在 [L5155](../Mooncake/mooncake-store/src/master_service.cpp#L5155) 的 `prefer_alloc_in_same_node` 检查之前返回，掩盖更准确的错误 |
+
+`nof_replica_num > 0` 的拦截由既有机制承担：非 `USE_NOF` 构建走 [L5163-5170](../Mooncake/mooncake-store/src/master_service.cpp#L5163-L5170) 的 `nof_pool_disabled`；`USE_NOF` 构建下未挂载 NOF segment 时由 `HasExpectedReplicaAllocation` 返回 `NO_AVAILABLE_HANDLE`。
+
+`PrepareWriteStart` 覆盖 `PutStart` / `UpsertStart` / `BatchPutStart`——已核实这三者都调它，所以 [L5147](../Mooncake/mooncake-store/src/master_service.cpp#L5147) 的一处改动即可覆盖。
+
+### 4.7 驱逐白名单（[L6319-6321](../Mooncake/mooncake-store/src/master_service.cpp#L6319-L6321)、[L6337-6340](../Mooncake/mooncake-store/src/master_service.cpp#L6337-L6340)）
 
 | 行 | 代码 | 解释 |
 | --- | --- | --- |
-| [L5155-5157](../Mooncake/mooncake-store/src/master_service.cpp#L5155-L5157) | 注释 | 说明为什么**不能**只依赖 `#ifndef USE_NOF`：那种写法在 `-DUSE_NOF=ON` 构建下会漏拦 |
-| [L5158-5159](../Mooncake/mooncake-store/src/master_service.cpp#L5158-L5159) | `if (dfs_replica_num > 0 && use_kvclient_ && nof_replica_num > 0)` | **无条件检查**，位于 `#ifndef USE_NOF` 块（[L5173](../Mooncake/mooncake-store/src/master_service.cpp#L5173)）之前，所以两种构建都生效 |
-| [L5160-5162](../Mooncake/mooncake-store/src/master_service.cpp#L5160-L5162) | `LOG(ERROR)` 带 `error=nof_not_supported_with_kvclient` | 沿用该函数既有的 `key=... error=...` 日志风格，便于按标记检索 |
-| [L5163](../Mooncake/mooncake-store/src/master_service.cpp#L5163) | `return INVALID_PARAMS` | 与文档一致 |
-
-`PrepareWriteStart` 覆盖 `PutStart` / `UpsertStart` / `BatchPutStart`——已核实这三者都调它，所以一处改动即可覆盖。
-
-### 4.7 驱逐白名单（[L6329-6331](../Mooncake/mooncake-store/src/master_service.cpp#L6329-L6331)、[L6347-6350](../Mooncake/mooncake-store/src/master_service.cpp#L6347-L6350)）
-
-| 行 | 代码 | 解释 |
-| --- | --- | --- |
-| [L6331](../Mooncake/mooncake-store/src/master_service.cpp#L6331) | `(use_kvcs_ \|\| use_kvclient_)` | `supports_dfs_condition`：`replica_type` 校验。不加则 `EvictDiskReplicaIfCurrent(DFS)` 在 [L6333](../Mooncake/mooncake-store/src/master_service.cpp#L6333) 被判 `INVALID_PARAMS` |
-| [L6348-6350](../Mooncake/mooncake-store/src/master_service.cpp#L6348-L6350) | `(use_kvcs_ \|\| use_kvclient_) && expected_replica_id != nullptr && ...` | `target_pred` 内的**第二处**白名单，必须与第一处同步放宽，否则前置校验通过但匹配不到副本 |
+| [L6321](../Mooncake/mooncake-store/src/master_service.cpp#L6321) | `(use_kvcs_ \|\| use_kvclient_)` | `supports_dfs_condition`：`replica_type` 校验。不加则 `EvictDiskReplicaIfCurrent(DFS)` 在 [L6322-6326](../Mooncake/mooncake-store/src/master_service.cpp#L6322-L6326) 被判 `INVALID_PARAMS` |
+| [L6338-6340](../Mooncake/mooncake-store/src/master_service.cpp#L6338-L6340) | `(use_kvcs_ \|\| use_kvclient_) && expected_replica_id != nullptr && ...` | `target_pred` 内的**第二处**白名单，必须与第一处同步放宽，否则前置校验通过但匹配不到副本 |
 
 两处都在 `EvictDiskReplicaImpl` 内。`EvictDiskReplica` / `BatchEvictDiskReplica` 传 `expected_replica_id = nullptr`，所以 DFS 分支仍为假、仍被拒——**PR2 不改变该行为**。
 

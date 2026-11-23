@@ -20,7 +20,7 @@ PR2 在 PR1 的控制面之上补齐数据面与 Master 门控：
 - 读路径：`GetBatch` 内注册目标 buffer 后提交 `LoadAsync`，`waitForCompletion` 等到终态后逐项返回 N；返回前注销 handle。
 - 超时、业务参数校验（对齐、设备可写性）与设备错误全部由 KvClient SDK 负责；适配器不设超时、不保留额外资源，只保留结构性守卫与切片连续性校验。
 - 读接口不变：`BatchRead`/`BatchGet`/`ReadDfsReplica` 保持同步，不新增完成句柄。
-- Master：`use_kvclient_`、`enable_dfs_`、kvclient 早退分支、descriptor 铸造、NOF 校验、驱逐白名单。
+- Master：`use_kvclient_`、`enable_dfs_`、kvclient 早退分支、descriptor 铸造、驱逐白名单。
 - 测试：PR2 自带适配器、注册/注销与读结果单测。
 
 PR2 不做：
@@ -678,7 +678,7 @@ if (config.dfs_replica_num > 0) {
 
 ### 9.5 DFS 可用性门
 
-`master_service.cpp:5154-5156`：
+`master_service.cpp:5146-5154`：
 
 ```cpp
 if (config.dfs_replica_num > 0 &&
@@ -690,27 +690,23 @@ if (config.dfs_replica_num > 0 &&
 }
 ```
 
-### 9.6 NOF 拒绝
+### 9.6 不新增 NOF 拒绝
 
-在 `PrepareWriteStart`（`:5129` 起）内，放在 `dfs_replica_num` / default tenant 校验之后：
+`PrepareWriteStart` 内**不要**加 `dfs + nof` 的 kvclient 专属拒绝。NOF 与 `use_kvclient_` 正交：
 
-```cpp
-if (config.dfs_replica_num > 0 && use_kvclient_) {
-    if (config.nof_replica_num > 0) {
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-    }
-}
-```
+- NOF 副本由 `nof_segment_manager_` 独立分配（`:4906-4934`），经 `WriteMemoryAndNofReplicas` 传输，从不进对象存储后端；kvclient 适配器内 grep `nof` 命中 0 次。
+- `dfs_replica_num > 0` 使写模式落到 `RELIABLE_MULTI_REPLICA`（`replica.h:313-324`），该模式的消费方逐层校验三层副本（`AllAllocatedTransfersSucceeded`、`DetermineFinalizeDecision`、`PutEnd(ALL)` / `PutRevoke(ALL)` 的 memory∪nof∪dfs 谓词），不会漏算一层。
+- `nof_replica_num > 0` 的拦截已由既有门承担：非 `USE_NOF` 构建走 `:5163-5170` 的 `nof_pool_disabled`；`USE_NOF` 构建下未挂载 NOF segment 时由 `HasExpectedReplicaAllocation` 返回 `NO_AVAILABLE_HANDLE`。
+- kvcs 后端从无等价门；只对 kvclient 加会造成后端不对称，且对一个格式良好、全链路都支持的请求返回 `INVALID_PARAMS` 是错误语义。
 
 约束：
 
 - 适配器与 Master 都不预检请求参数；参数合法性由 SDK 判定并返回错误。
-- NOF 拒绝必须无条件，不能只依赖 `#ifndef USE_NOF` 分支。
 - `PrepareWriteStart` 覆盖 `PutStart`、`UpsertStart`、`BatchPutStart`。
 
 ### 9.7 驱逐白名单
 
-`master_service.cpp:6335-6337`：
+`master_service.cpp:6319-6321`：
 
 ```cpp
 const bool supports_dfs_condition =
@@ -719,7 +715,7 @@ const bool supports_dfs_condition =
     (use_kvcs_ || use_kvclient_);
 ```
 
-`master_service.cpp:6353-6355`：
+`master_service.cpp:6337-6340`：
 
 ```cpp
 } else if (replica_type == ReplicaType::DFS) {
@@ -868,7 +864,6 @@ ctest --test-dir build --output-on-failure
 | `fs_adapter_type=kvclient` + `enable_oplog=false` | Master 正常启动，日志出现 `KVClient distributed object storage initialized` |
 | `fs_adapter_type=kvclient` + `enable_oplog=true` | Master 启动期 `throw std::invalid_argument`，不进入运行态 |
 | `dfs_replica_num=1` 写 | 铸造 `object_size=N` / `aligned_size=N` / `shard_idx=-1` 的 DFS descriptor |
-| `dfs_replica_num=1` 且 `nof_replica_num>0` | `INVALID_PARAMS` |
 | `EvictDiskReplicaIfCurrent(ReplicaType::DFS)` | 白名单放行；`EvictDiskReplica` 仍返回 `INVALID_PARAMS` |
 
 ### 11.4 端到端联调说明
@@ -922,7 +917,7 @@ pre-commit run --files <本次改动文件>
 | 配置 | 只有 `config_path`，不校验数值配置 |
 | Master 启动 | kvclient 早退分支生效；oplog 时 FATAL |
 | descriptor | `object_size == aligned_size == N`；`shard_idx=-1` |
-| Master 门控 | NOF 拒绝、DFS 可用性门、驱逐白名单生效 |
+| Master 门控 | DFS 可用性门、驱逐白名单生效；不新增 NOF 拒绝 |
 | 恢复门 | 保持 KVCS-only |
 | 测试 | 22 个用例全部通过；SDK 缺失构建不受影响 |
 | 回归 | 既有 KVCS / OSS / S3 / DFS 测试全绿 |
