@@ -1,6 +1,6 @@
 # Mooncake + KVClient L3 接入（Kvcs）— PR1 串讲文档
 
-版本：v1.2　日期：2026-11-24
+版本：v1.3　日期：2026-11-24
 
 ---
 
@@ -30,22 +30,28 @@ Mooncake Store 是分层 KV cache：热数据驻留在 DRAM 内存池（L2，本
 
 ### 为什么用 ObjectStorage 形态的 DFS
 
-| 维度 | 本机 SSD（FileStorage / `local_disk`） | ObjectStorage 形态的 DFS（kvclient） |
-| --- | --- | --- |
-| 可见范围 | 本机进程私有 | 经 Master 目录跨 Client 共享 |
-| 容量 | 受本机盘容量约束 | 远端弹性，随设备扩容 |
-| 数据路径 | 本地 O_DIRECT 文件 I/O，配合预注册 staging buffer | SDK RDMA 直连 KV，不需要 POSIX 文件语义 |
-| Master 元数据 | 只记录 `LOCAL_DISK` 副本归属 | 维护 key → 逻辑 DFS 副本目录，不做字节级 offset 分配 |
-| 冗余 | 单盘，无副本 | 由 KvClient 设备侧负责 |
-| 淘汰 | 本机盘水位 LRU | Master 目录 + 远端自主 |
-| 接入改动 | 改 FileStorage / offload 子系统 | 新增一个 `fs_adapter_type` + 一个 `ObjectStorageAdapter` 实现；数据分支与 oss / s3 / kvcs-lowlevel 完全共用 |
+| 维度 | 本机 SSD（`local_disk` / FileStorage） | 分布式文件存储（`hf3fs` / `posix`） | ObjectStorage 形态的 DFS（kvclient） |
+| --- | --- | --- | --- |
+| 可见范围 | 本机进程私有 | 跨 Client 共享 | 经 Master 目录跨 Client 共享 |
+| 容量 | 受本机盘容量约束 | 取决于分布式文件系统 | 远端弹性，随设备扩容 |
+| 定位方式 | 本地文件路径 | 文件路径 + 字节 offset + shard（[replica.h:350](mooncake-store/include/replica.h#L350)） | 整对象 key → value，无 offset |
+| 读粒度 | 整对象 | 支持 range read（`value_offset`） | 只能整对象 |
+| 读缓冲 | 预注册 staging buffer | `posix` 适配器可直接读入任意 host 内存 | 必须经适配器注册缓冲 |
+| Master 元数据 | 只记录 `LOCAL_DISK` 副本归属 | key → 物理副本（file_path / offset / shard_idx） | key → 逻辑 DFS 副本目录 |
+| 分配器与配置 | 无 | `allocator_type` = `shard` / `bucket`，需配置容量、对齐、淘汰水位 | 无需分配器；PR1 的 `Validate()` 提前返回正是跳过这些校验 |
+| 部署依赖 | 本机盘 | 需挂载点（`fsdir`，默认 `/mnt/3fs/mooncake`） | 只需 SDK 配置文件 |
+| 冗余 | 单盘，无副本 | 取决于文件系统 | 由 KvClient 设备侧负责 |
+| 接入改动 | 改 FileStorage / offload 子系统 | 改 fs adapter 与分配器 | 新增一个 `fs_adapter_type` + 一个 `ObjectStorageAdapter` 实现，数据分支与 oss / s3 / kvcs-lowlevel 完全共用 |
 
 表里的 `local_disk` 与 FileStorage 是同一层的两种称呼：FileStorage 是客户端侧的 SSD 卸载子系统，`LOCAL_DISK` 是它在 Master 侧对应的副本类型——Master 为每个 client 维护一个 `LOCAL_DISK` segment（[file_storage.cpp:1319](mooncake-store/src/file_storage.cpp#L1319)）；其下按文件布局又分 `kFilePerKey` / `kBucket` / `kOffsetAllocator` 三种后端。
 
-本机 SSD 解决的是「单机内存不够」，容量上限仍是本机磁盘，且其他 Client 读不到；远端 KV 存储解决的是「多机共享一份更大的冷数据池」。选 DFS 形态而非新写一条存储链路，是因为对象存储的数据分支已经通用化：新增介质只需实现 `ObjectStorageAdapter` 的 8 个纯虚方法（`Put`/`PutV`/`Get`/`Exists`/`Delete`/`ListKeys`/`Init`/`GetName`），批量接口有默认实现、可按需覆盖。
+本机 SSD 解决「单机内存不够」，容量上限仍是本机盘，其他 Client 读不到。分布式文件存储与 kvclient 都解决「多机共享更大的冷数据池」，区别在介质接口本身：
 
-代价也要说清：对象存储形态下 `SupportsArbitraryHostReadBuffers()` 返回 false，读必须经适配器、需要注册缓冲区；且不做字节级 offset，只按整对象读写。这两点由 KVClient 的接口形态决定，换来的是跨 Client 共享与容量弹性。
+- **KvClient 设备只暴露 CacheKey → value 的 KV 接口**，没有文件与 offset 语义。要接成分布式文件存储，得在其上再造一层文件布局和字节级分配器，把 KV 语义重新拆成偏移——多一层映射，没有任何收益。
+- **对象存储分支不走 shard / bucket 分配器**。`UsesObjectStorage()` 的读写路径直接按整对象处理，`Validate()` 也因此提前返回、跳过 `shard_capacity` / `alignment` / 淘汰水位这些文件系统专属校验。
+- **接入成本最低**。oss / s3 / kvcs-lowlevel 已经走通 `ObjectStorageAdapter`，新增介质只需实现它的 8 个纯虚方法（`Put`/`PutV`/`Get`/`Exists`/`Delete`/`ListKeys`/`Init`/`GetName`），批量接口有默认实现、可按需覆盖。
 
+代价也要说清：对象存储形态只按整对象读写，**不支持 range read**；读也不能直接落到任意 host 内存（`SupportsArbitraryHostReadBuffers()` 返回 false），必须经适配器注册缓冲区。这两点由 KVClient 的接口形态决定，换来的是跨 Client 共享与容量弹性。
 ---
 
 ## 第一部分：功能、结构与类图
