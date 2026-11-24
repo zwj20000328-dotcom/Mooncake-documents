@@ -1,6 +1,6 @@
 # Mooncake + KVClient L3 接入（Kvcs）— PR1 串讲文档
 
-版本：v1.1　日期：2026-11-23
+版本：v1.2　日期：2026-11-24
 
 ---
 
@@ -15,6 +15,36 @@
 | 目标 SDK | `tmp_pr1641/ucm-pr`，分支 `feat/kvclient-typed-keys-namespaces`，tip `0149f2b` |
 
 链接约定：两个适配器文件指向 `8af2fc10` 的 GitHub 永久链接（工作区含未提交的 PR2 改动）；其余 13 个文件指向工作区。
+
+---
+
+## 背景
+
+### KvClient 接入 Mooncake L3
+
+Mooncake Store 是分层 KV cache：热数据驻留在 DRAM 内存池（L2，本机或远端），冷数据下沉到容量更大、成本更低的 L3。现有 L3 有两条路线——本机 SSD 卸载（`local_disk` / FileStorage），以及分布式文件与对象存储（`DistributedStorageBackend`，`fs_adapter_type` 支持 `hf3fs` / `posix` / `oss` / `s3` / `kvcs-lowlevel`）。
+
+本方案接入的是第三种介质：**远端 KV 存储**。它由 KVClient SDK 经 Host RDMA 直连，设备侧自己负责 CacheKey → value 的定位、物理空间与内部冗余。目标是把它接成**共享 L3**——对象写入后，任一 Client 都能在内存副本淘汰后读回，而不是像本机盘那样只服务单个进程。
+
+其中对象存储类后端（oss / s3 / kvcs-lowlevel）已经完成了适配器抽象：数据面只依赖 `UsesObjectStorage()`，通过 `ObjectStorageAdapter` 按逻辑 key 读写，Master 只维护「key → 逻辑 DFS 副本」的目录。kvclient 复用这条通道，PR1 新增的只是一个 `fs_adapter_type` 取值和一个适配器实现。
+
+### 为什么用 ObjectStorage 形态的 DFS
+
+| 维度 | 本机 SSD（FileStorage / `local_disk`） | ObjectStorage 形态的 DFS（kvclient） |
+| --- | --- | --- |
+| 可见范围 | 本机进程私有 | 经 Master 目录跨 Client 共享 |
+| 容量 | 受本机盘容量约束 | 远端弹性，随设备扩容 |
+| 数据路径 | 本地 O_DIRECT 文件 I/O，配合预注册 staging buffer | SDK RDMA 直连 KV，不需要 POSIX 文件语义 |
+| Master 元数据 | 只记录 `LOCAL_DISK` 副本归属 | 维护 key → 逻辑 DFS 副本目录，不做字节级 offset 分配 |
+| 冗余 | 单盘，无副本 | 由 KvClient 设备侧负责 |
+| 淘汰 | 本机盘水位 LRU | Master 目录 + 远端自主 |
+| 接入改动 | 改 FileStorage / offload 子系统 | 新增一个 `fs_adapter_type` + 一个 `ObjectStorageAdapter` 实现；数据分支与 oss / s3 / kvcs-lowlevel 完全共用 |
+
+表里的 `local_disk` 与 FileStorage 是同一层的两种称呼：FileStorage 是客户端侧的 SSD 卸载子系统，`LOCAL_DISK` 是它在 Master 侧对应的副本类型——Master 为每个 client 维护一个 `LOCAL_DISK` segment（[file_storage.cpp:1319](mooncake-store/src/file_storage.cpp#L1319)）；其下按文件布局又分 `kFilePerKey` / `kBucket` / `kOffsetAllocator` 三种后端。
+
+本机 SSD 解决的是「单机内存不够」，容量上限仍是本机磁盘，且其他 Client 读不到；远端 KV 存储解决的是「多机共享一份更大的冷数据池」。选 DFS 形态而非新写一条存储链路，是因为对象存储的数据分支已经通用化：新增介质只需实现 `ObjectStorageAdapter` 的 8 个纯虚方法（`Put`/`PutV`/`Get`/`Exists`/`Delete`/`ListKeys`/`Init`/`GetName`），批量接口有默认实现、可按需覆盖。
+
+代价也要说清：对象存储形态下 `SupportsArbitraryHostReadBuffers()` 返回 false，读必须经适配器、需要注册缓冲区；且不做字节级 offset，只按整对象读写。这两点由 KVClient 的接口形态决定，换来的是跨 Client 共享与容量弹性。
 
 ---
 
